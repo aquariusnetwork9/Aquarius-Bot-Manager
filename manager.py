@@ -32,6 +32,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -589,6 +590,173 @@ def _launch_command(inst):
     quoted = " ".join(shlex.quote(x) for x in props)
     inner = shlex.quote("exec " + launch)
     return (f"exec systemd-run --user --scope --quiet --collect {quoted} bash -lc {inner}", "")
+
+
+# ---------------------------------------------------------------------------
+# file manager  (jailed to an allowlist of roots; realpath + symlink-escape guards)
+# ---------------------------------------------------------------------------
+
+_FS_MAX_READ = 1024 * 1024   # 1 MB editable-file ceiling
+
+
+def _base_dir(cfg):
+    """Best guess at where proxies live: settings.base_dir, else the common parent
+    of instance dirs, else the manager dir. Also used as the default deploy target."""
+    s = cfg["raw"].get("settings", {}).get("base_dir")
+    if s:
+        return os.path.abspath(os.path.expanduser(s))
+    dirs = [os.path.abspath(i["dir"]) for i in cfg["instances"] if i.get("dir")]
+    if len(dirs) >= 2:
+        try:
+            return os.path.commonpath(dirs)
+        except ValueError:
+            pass
+    if dirs:
+        return os.path.dirname(dirs[0])
+    return SCRIPT_DIR
+
+
+def file_roots(cfg):
+    """Allowlist of directories the file manager may touch (realpath'd, existing)."""
+    roots = cfg["raw"].get("settings", {}).get("file_roots")
+    cand = ([os.path.abspath(os.path.expanduser(r)) for r in roots if r]
+            if isinstance(roots, list) and roots else [_base_dir(cfg), SCRIPT_DIR])
+    out, seen = [], set()
+    for r in cand:
+        try:
+            rr = os.path.realpath(r)
+        except OSError:
+            continue
+        if rr not in seen and os.path.isdir(rr):
+            seen.add(rr)
+            out.append(rr)
+    return out or [os.path.realpath(SCRIPT_DIR)]
+
+
+def _resolve_in_roots(path, roots):
+    """Realpath `path` and assert it sits inside one of `roots` (blocks .. and symlink
+    escapes). Returns the resolved absolute path; raises ValueError otherwise."""
+    if not path:
+        raise ValueError("path required")
+    rp = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    for root in roots:
+        rr = os.path.realpath(root)
+        if rp == rr or rp.startswith(rr + os.sep):
+            return rp
+    raise ValueError("path is outside the allowed roots")
+
+
+def _safe_name(name):
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError("invalid name")
+    return name
+
+
+def _is_root(p, roots):
+    real = {os.path.realpath(r) for r in roots}
+    return os.path.realpath(p) in real
+
+
+def fs_list(cfg, path):
+    roots = file_roots(cfg)
+    p = _resolve_in_roots(path, roots) if path else roots[0]
+    if not os.path.isdir(p):
+        raise ValueError("not a directory")
+    entries = []
+    for name in os.listdir(p):
+        full = os.path.join(p, name)
+        try:
+            is_dir = os.path.isdir(full)
+            st = os.stat(full)
+            entries.append({"name": name, "path": full, "type": "dir" if is_dir else "file",
+                            "size": None if is_dir else st.st_size, "mtime": int(st.st_mtime)})
+        except OSError:
+            continue
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    parent = None
+    if not _is_root(p, roots):
+        try:
+            parent = _resolve_in_roots(os.path.dirname(p), roots)
+        except ValueError:
+            parent = None
+    return {"path": p, "parent": parent, "entries": entries, "roots": roots}
+
+
+def fs_read(cfg, path):
+    p = _resolve_in_roots(path, file_roots(cfg))
+    if not os.path.isfile(p):
+        raise ValueError("not a file")
+    size = os.path.getsize(p)
+    if size > _FS_MAX_READ:
+        raise ValueError(f"file too large to edit ({size // 1024} KB; limit {_FS_MAX_READ // 1024} KB)")
+    with open(p, "rb") as f:
+        raw = f.read()
+    if b"\x00" in raw:
+        raise ValueError("binary file — not editable here")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("not a UTF-8 text file — not editable here")
+    return {"path": p, "content": text, "size": size}
+
+
+def fs_write(cfg, path, content):
+    roots = file_roots(cfg)
+    p = _resolve_in_roots(path, roots)
+    _resolve_in_roots(os.path.dirname(p), roots)     # parent must be inside roots too
+    if os.path.isdir(p):
+        raise ValueError("path is a directory")
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(content if content is not None else "")
+    return {"path": p, "size": os.path.getsize(p)}
+
+
+def fs_mkdir(cfg, parent, name, is_file=False):
+    roots = file_roots(cfg)
+    base = _resolve_in_roots(parent, roots)
+    if not os.path.isdir(base):
+        raise ValueError("parent is not a directory")
+    target = os.path.join(base, _safe_name(name))
+    _resolve_in_roots(target, roots)
+    if os.path.exists(target):
+        raise ValueError("already exists")
+    if is_file:
+        open(target, "w").close()
+    else:
+        os.makedirs(target)
+    return {"path": target}
+
+
+def fs_rename(cfg, path, name):
+    roots = file_roots(cfg)
+    p = _resolve_in_roots(path, roots)
+    if _is_root(p, roots):
+        raise ValueError("can't rename a root directory")
+    target = os.path.join(os.path.dirname(p), _safe_name(name))
+    _resolve_in_roots(target, roots)
+    if os.path.exists(target):
+        raise ValueError("target already exists")
+    os.rename(p, target)
+    return {"path": target}
+
+
+def fs_delete(cfg, path, recursive=False):
+    roots = file_roots(cfg)
+    p = _resolve_in_roots(path, roots)
+    if _is_root(p, roots):
+        raise ValueError("can't delete a root directory")
+    if os.path.isdir(p):
+        if recursive:
+            shutil.rmtree(p)
+        else:
+            try:
+                os.rmdir(p)
+            except OSError:
+                raise ValueError("directory not empty (use recursive delete)")
+    else:
+        os.remove(p)
+    return {"deleted": p}
 
 
 # ---------------------------------------------------------------------------
@@ -1312,6 +1480,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/proxies":
             return self._json({"proxies": list_proxies(self._cfg())})
 
+        if path == "/api/files":
+            try:
+                return self._json(fs_list(self._cfg(), q.get("path", [""])[0]))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
+        if path == "/api/files/read":
+            try:
+                return self._json(fs_read(self._cfg(), q.get("path", [""])[0]))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
         if path == "/api/schema":
             return self._json({"schema": ZENITH_SCHEMA})
 
@@ -1570,6 +1750,26 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
 
+        # file manager (jailed) — create / edit / rename / delete
+        if path.startswith("/api/files/"):
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                if path == "/api/files/write":
+                    return self._json({"ok": True, **fs_write(cfg, p.get("path"), p.get("content", ""))})
+                if path == "/api/files/mkdir":
+                    return self._json({"ok": True, **fs_mkdir(cfg, p.get("dir"), p.get("name"))})
+                if path == "/api/files/newfile":
+                    return self._json({"ok": True, **fs_mkdir(cfg, p.get("dir"), p.get("name"), is_file=True)})
+                if path == "/api/files/rename":
+                    return self._json({"ok": True, **fs_rename(cfg, p.get("path"), p.get("name"))})
+                if path == "/api/files/delete":
+                    return self._json({"ok": True, **fs_delete(cfg, p.get("path"), bool(p.get("recursive")))})
+                return self._json({"error": "not found"}, 404)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
         return self._json({"error": "not found"}, 404)
 
 
@@ -1684,6 +1884,9 @@ def main():
     p.add_argument("--memory", default=None, help='hard memory cap, e.g. 2G or 512M ("" to clear)')
     p.add_argument("--cpu", default=None, help="CPU cap as percent of one core, e.g. 200 (0 to clear)")
     p.add_argument("--clear", action="store_true", help="remove all limits")
+
+    p = sub.add_parser("files", help="list files under the allowed roots (jailed)")
+    p.add_argument("path", nargs="?", default=None, help="directory to list (default: first root)")
 
     p = sub.add_parser("adopt")
     p.add_argument("session", help="existing tmux session name")
@@ -1826,6 +2029,16 @@ def main():
             die(str(e))
         enf = "" if _supports_cgroup_limits() or not res else "   (NOTE: not enforced here — see README)"
         print(f"{args.name}: " + (", ".join(f"{k}={v}" for k, v in res.items()) if res else "no limits") + enf)
+    elif args.cmd == "files":
+        try:
+            d = fs_list(cfg, args.path or "")
+        except ValueError as e:
+            die(str(e))
+        print(d["path"])
+        for e in d["entries"]:
+            tag = "d" if e["type"] == "dir" else "-"
+            sz = "" if e["size"] is None else str(e["size"])
+            print(f"  {tag} {e['name']}\t{sz}")
     elif args.cmd == "adopt":
         sk = [s for s in args.stop_keys.split(",") if s.strip()] if args.stop_keys else None
         try:
@@ -2153,6 +2366,16 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .gauge .b i{display:block;height:100%;background:var(--acc);transition:width .4s}
 .gauge.warn .b i{background:var(--warn)} .gauge.warn .v{color:var(--warn)}
 .gauge.crit .b i{background:var(--crash)} .gauge.crit .v{color:var(--crash)}
+/* file manager */
+.fbbar{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin-bottom:.5rem}
+.fbbar select{font-family:var(--mono);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.4rem .5rem;max-width:50%}
+.fbpath{font-family:var(--mono);font-size:.7rem;color:var(--dim);margin-bottom:.5rem;word-break:break-all}
+.frow2{display:flex;align-items:center;gap:.55rem;padding:.4rem .55rem;border:1px solid var(--line);border-radius:8px;margin-bottom:.3rem;background:var(--panel-2)}
+.frow2:hover{border-color:var(--acc-dim)}
+.frow2 .ficon{width:1.1rem;text-align:center}
+.frow2 .fn{flex:1;cursor:pointer;font-size:.85rem;word-break:break-all}
+.frow2 .fmeta{font-family:var(--mono);font-size:.62rem;color:#586675;white-space:nowrap}
+.frow2 button{padding:.25rem .5rem;font-size:.72rem}
 /* per-card resource bars */
 .cstats{display:flex;gap:.6rem;margin:.1rem 0 .75rem}
 .cstats .cs{flex:1}
@@ -2167,6 +2390,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small id="clock"></small></div>
   <div class="bulk">
     <button onclick="openSettings()">⚙ Settings</button>
+    <button onclick="openFiles()">📁 Files</button>
     <button onclick="openProxies()">🌐 Proxies</button>
     <button onclick="openScan()">⟲ Scan existing</button>
     <button onclick="openAdd()">+ New instance</button>
@@ -2212,6 +2436,33 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <div class="mbar"><span class="msg" id="proxMsg" style="color:var(--dim)"></span>
       <button onclick="loadProxies()">Refresh</button>
       <button onclick="closeProxies()">Close</button></div>
+  </div>
+</div>
+
+<div class="scrim" id="filesScrim" onclick="closeFiles(event)">
+  <div class="modal" style="width:min(840px,96vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Files</div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Jailed to the manager's allowed roots. Create, edit, rename and delete files &amp; folders.</div>
+    <div id="fbBrowse">
+      <div class="fbbar">
+        <select id="fbRoot" onchange="fbGotoRoot()" title="jump to a root"></select>
+        <button onclick="fbUp()">⬆ Up</button>
+        <button onclick="fbMkdir()">+ Folder</button>
+        <button onclick="fbNewFile()">+ File</button>
+        <button onclick="fbReload()">⟳</button>
+      </div>
+      <div class="fbpath" id="fbPath"></div>
+      <div id="fbList" style="max-height:54vh;overflow:auto">loading…</div>
+      <div class="mbar"><span class="msg" id="fbMsg" style="flex:1;color:var(--dim)"></span>
+        <button onclick="closeFiles()">Close</button></div>
+    </div>
+    <div id="fbEdit" style="display:none">
+      <div class="fbpath" id="fbEditPath"></div>
+      <textarea id="fbContent" spellcheck="false" style="min-height:48vh"></textarea>
+      <div class="mbar"><span class="msg" id="fbEditMsg" style="flex:1;color:var(--dim)"></span>
+        <button onclick="fbBack()">← Back</button>
+        <button class="go" onclick="fbSave()">Save</button></div>
+    </div>
   </div>
 </div>
 
@@ -2906,6 +3157,75 @@ async function applyBulkProxies(btn){
   loadProxies(); if(restart)refresh();
 }
 
+let FBCWD=null, FBPARENT=null, FBEDIT=null;
+function openFiles(){ $('filesScrim').classList.add('open'); fbBack(); fbNav(''); }
+function closeFiles(e){ if(e&&e.target!==$('filesScrim'))return; $('filesScrim').classList.remove('open'); }
+function fbBack(){ $('fbEdit').style.display='none'; $('fbBrowse').style.display=''; }
+async function fbNav(path){
+  $('fbMsg').style.color='var(--dim)'; $('fbMsg').textContent='';
+  const d=await api('/api/files?path='+encodeURIComponent(path||''));
+  if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
+  FBCWD=d.path; FBPARENT=d.parent; fbRender(d);
+}
+function fbReload(){ fbNav(FBCWD||''); }
+function fbGotoRoot(){ fbNav($('fbRoot').value); }
+function fbUp(){ if(FBPARENT) fbNav(FBPARENT); }
+function fbRender(d){
+  const sel=$('fbRoot');
+  sel.innerHTML=(d.roots||[]).map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('');
+  const cont=(d.roots||[]).filter(r=>d.path===r||d.path.startsWith(r)).sort((a,b)=>b.length-a.length)[0];
+  if(cont) sel.value=cont;
+  $('fbPath').textContent=d.path;
+  if(!d.entries.length){ $('fbList').innerHTML='<div class="hint">empty folder</div>'; return; }
+  $('fbList').innerHTML=d.entries.map(e=>{
+    const open=e.type==='dir'?`fbNav('${jsq(e.path)}')`:`fbOpen('${jsq(e.path)}')`;
+    return `<div class="frow2">
+      <span class="ficon">${e.type==='dir'?'📁':'📄'}</span>
+      <span class="fn" onclick="${open}">${esc(e.name)}</span>
+      <span class="fmeta">${e.type==='dir'?'':fmtBytes(e.size)}</span>
+      <button title="rename" onclick="fbRename('${jsq(e.path)}','${jsq(e.name)}')">✎</button>
+      <button class="danger" title="delete" onclick="fbDelete('${jsq(e.path)}',${e.type==='dir'})">🗑</button>
+    </div>`;
+  }).join('');
+}
+async function fbOpen(path){
+  $('fbMsg').textContent='opening…';
+  const d=await api('/api/files/read?path='+encodeURIComponent(path));
+  if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
+  FBEDIT=d.path; $('fbEditPath').textContent=d.path; $('fbContent').value=d.content;
+  $('fbEditMsg').style.color='var(--dim)'; $('fbEditMsg').textContent=fmtBytes(d.size);
+  $('fbBrowse').style.display='none'; $('fbEdit').style.display='';
+}
+async function fbSave(){
+  $('fbEditMsg').style.color='var(--dim)'; $('fbEditMsg').textContent='saving…';
+  const d=await api('/api/files/write','POST',{path:FBEDIT,content:$('fbContent').value});
+  $('fbEditMsg').style.color=d.error?'var(--crash)':'var(--dim)';
+  $('fbEditMsg').textContent=d.error?('✗ '+d.error):('✓ saved '+fmtBytes(d.size));
+}
+async function fbMkdir(){
+  const name=prompt('New folder name:'); if(!name)return;
+  const d=await api('/api/files/mkdir','POST',{dir:FBCWD,name});
+  if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
+  fbReload();
+}
+async function fbNewFile(){
+  const name=prompt('New file name:'); if(!name)return;
+  const d=await api('/api/files/newfile','POST',{dir:FBCWD,name});
+  if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
+  fbOpen(d.path);
+}
+async function fbRename(path,cur){
+  const name=prompt('Rename to:',cur); if(!name||name===cur)return;
+  const d=await api('/api/files/rename','POST',{path,name});
+  if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
+  fbReload();
+}
+async function fbDelete(path,isdir){
+  if(!confirm('Delete '+(isdir?'folder + contents':'file')+'?\n'+path))return;
+  const d=await api('/api/files/delete','POST',{path,recursive:isdir});
+  if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
+  fbReload();
+}
 function openSettings(){
   $('settingsScrim').classList.add('open');
   setTab('ap');
