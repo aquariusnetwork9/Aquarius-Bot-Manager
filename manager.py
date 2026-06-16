@@ -40,6 +40,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+__version__ = "1.0.0"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
                   or os.path.join(SCRIPT_DIR, "instances.json"))
@@ -1600,7 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "unauthorized"}, 401)
 
         if path == "/" or path == "/index.html":
-            return self._html(PAGE)
+            return self._html(PAGE.replace("__ABM_VERSION__", __version__))
 
         if path == "/logout":
             tok = self._cookie_token()
@@ -1937,7 +1939,7 @@ def serve(cfg_path, host, port):
         auth = "ON (basic auth env)"
     else:
         auth = "OFF — run `manager.py setpassword`, or keep this bound to 127.0.0.1"
-    print(f"AquariusBotManager serving http://{host}:{port}   auth: {auth}")
+    print(f"Aquarius Bot Manager {__version__} serving http://{host}:{port}   auth: {auth}")
     if host not in ("127.0.0.1", "localhost", "::1") and auth.startswith("OFF"):
         print("WARNING: listening on a non-local address with NO auth. Anyone who can reach "
               f"{host}:{port} has full control. Set a password or bind to 127.0.0.1.")
@@ -1974,6 +1976,7 @@ def cli_status(cfg):
 
 def main():
     ap = argparse.ArgumentParser(prog="manager.py")
+    ap.add_argument("--version", action="version", version=f"Aquarius Bot Manager {__version__}")
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -2567,7 +2570,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small id="clock"></small></div>
+  <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small class="ver">v__ABM_VERSION__</small> <small id="clock"></small></div>
   <div class="bulk">
     <button onclick="openSettings()">⚙ Settings</button>
     <button onclick="openFiles()">📁 Files</button>
