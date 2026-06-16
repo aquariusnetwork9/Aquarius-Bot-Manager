@@ -31,6 +31,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import time
@@ -129,11 +130,11 @@ def start(inst):
     d = inst["dir"]
     if not os.path.isdir(d):
         return f"error: dir not found: {d}"
-    cmd = inst["launch_cmd"]
-    tmux("new-session", "-d", "-s", s, "-c", d, "bash", "-lc", f"exec {cmd}", check=True)
+    outer, note = _launch_command(inst)
+    tmux("new-session", "-d", "-s", s, "-c", d, "bash", "-lc", outer, check=True)
     # keep crash output visible after the process exits
     tmux("set-option", "-t", s, "remain-on-exit", "on")
-    return "started"
+    return "started" + note
 
 
 def stop(inst):
@@ -460,6 +461,137 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
 
 
 # ---------------------------------------------------------------------------
+# per-instance resource limits  (enforced via systemd-run --user --scope cgroups)
+# ---------------------------------------------------------------------------
+
+_MEM_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT])?\s*$", re.I)
+_MEM_MULT = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+_CGROUP_OK = None   # cached result of the capability probe
+
+
+def parse_mem_to_bytes(s):
+    """'2G' / '512M' / 1073741824 -> bytes (int), or None if unparseable."""
+    if s is None or s == "":
+        return None
+    if isinstance(s, (int, float)):
+        return int(s)
+    m = _MEM_RE.match(str(s))
+    if not m:
+        return None
+    return int(float(m.group(1)) * _MEM_MULT[(m.group(2) or "").upper()])
+
+
+def _mem_high(memstr):
+    """Soft throttle a touch below the hard cap (systemd accepts a raw byte count)."""
+    b = parse_mem_to_bytes(memstr)
+    return str(int(b * 0.9)) if b else None
+
+
+def _clean_limits(raw):
+    """Validate a {memory, cpu} dict -> normalized dict (drops empty); raises on bad input."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    mem = raw.get("memory")
+    if mem not in (None, "", 0):
+        if parse_mem_to_bytes(mem) is None:
+            raise ValueError("memory must look like 512M, 2G, or a byte count")
+        out["memory"] = str(mem).strip()
+    cpu = raw.get("cpu")
+    if cpu not in (None, "", 0, "0"):
+        try:
+            c = int(cpu)
+        except (TypeError, ValueError):
+            raise ValueError("cpu must be a number (percent of one core)")
+        if c > 0:
+            out["cpu"] = c
+    return out
+
+
+def limits_view(inst):
+    """API shape for an instance's limits: {memory, memory_bytes, cpu} (only set fields)."""
+    lim = inst.get("limits") or {}
+    out = {}
+    if lim.get("memory"):
+        out["memory"] = lim["memory"]
+        out["memory_bytes"] = parse_mem_to_bytes(lim["memory"])
+    if lim.get("cpu"):
+        out["cpu"] = lim["cpu"]
+    return out
+
+
+def set_limits(cfg, name, memory=None, cpu=None):
+    """Set/clear an instance's resource caps. memory/cpu == None leaves that field
+    unchanged; "" (or 0 for cpu) clears it. Returns the resulting limits dict."""
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError(f"no such instance: {name}")
+    cur = dict(inst.get("limits") or {})
+    if memory is not None:
+        if str(memory).strip() == "":
+            cur.pop("memory", None)
+        elif parse_mem_to_bytes(memory) is None:
+            raise ValueError("memory must look like 512M, 2G, or a byte count")
+        else:
+            cur["memory"] = str(memory).strip()
+    if cpu is not None:
+        if cpu in ("", 0, "0"):
+            cur.pop("cpu", None)
+        else:
+            try:
+                c = int(cpu)
+            except (TypeError, ValueError):
+                raise ValueError("cpu must be a number (percent of one core)")
+            cur["cpu"] = c if c > 0 else cur.pop("cpu", None)
+            if not c > 0:
+                cur.pop("cpu", None)
+    if cur:
+        inst["limits"] = cur
+    else:
+        inst.pop("limits", None)
+    save_config(cfg)
+    return inst.get("limits") or {}
+
+
+def _supports_cgroup_limits():
+    """True if `systemd-run --user --scope` can set resource controls here. Cached.
+    Probes once by running 'true' in a throwaway transient user scope."""
+    global _CGROUP_OK
+    if _CGROUP_OK is None:
+        try:
+            r = subprocess.run(
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"],
+                capture_output=True, text=True, timeout=8)
+            _CGROUP_OK = (r.returncode == 0)
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            _CGROUP_OK = False
+    return _CGROUP_OK
+
+
+def _launch_command(inst):
+    """Shell string for the tmux pane. With resource limits (and cgroup support) the
+    launch is wrapped in a transient systemd user scope; otherwise it's the bare command
+    (byte-identical to the historical behavior). Returns (outer_cmd, note)."""
+    launch = inst["launch_cmd"]
+    lim = _clean_limits(inst.get("limits"))
+    if not lim:
+        return f"exec {launch}", ""
+    if not _supports_cgroup_limits():
+        return f"exec {launch}", " (limits not enforced — see README)"
+    props = []
+    if lim.get("memory"):
+        props += ["-p", f"MemoryMax={lim['memory']}"]
+        hi = _mem_high(lim["memory"])
+        if hi:
+            props += ["-p", f"MemoryHigh={hi}"]
+    if lim.get("cpu"):
+        props += ["-p", f"CPUQuota={int(lim['cpu'])}%"]
+    quoted = " ".join(shlex.quote(x) for x in props)
+    inner = shlex.quote("exec " + launch)
+    return (f"exec systemd-run --user --scope --quiet --collect {quoted} bash -lc {inner}", "")
+
+
+# ---------------------------------------------------------------------------
 # discover
 # ---------------------------------------------------------------------------
 
@@ -517,7 +649,7 @@ VALID_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def add_instance(cfg, name, directory, launch_cmd=None, config_file=None,
-                 stop_keys=None, stop_timeout=None, autostart=False):
+                 stop_keys=None, stop_timeout=None, autostart=False, limits=None):
     """Add a new instance to the config. Returns the new instance dict.
     Raises ValueError on bad input or duplicate name."""
     name = (name or "").strip()
@@ -541,6 +673,9 @@ def add_instance(cfg, name, directory, launch_cmd=None, config_file=None,
         "stop_timeout": int(stop_timeout) if stop_timeout else 15,
         "autostart": bool(autostart),
     }
+    cl = _clean_limits(limits)
+    if cl:
+        inst["limits"] = cl
     cfg["raw"].setdefault("instances", []).append(inst)
     cfg["instances"] = cfg["raw"]["instances"]
     cfg["by_name"][name] = inst
@@ -880,6 +1015,7 @@ def _sysinfo():
     except Exception:
         pass
     info["tmux_sessions"] = len(list_tmux_sessions())
+    info["cgroup_limits"] = _supports_cgroup_limits()
     return info
 
 
@@ -1199,6 +1335,7 @@ class Handler(BaseHTTPRequestHandler):
                     "launch_cmd": i["launch_cmd"],
                     "status": st,
                     "autostart": bool(i.get("autostart")),
+                    "limits": limits_view(i),
                 }
                 if st == "running":
                     try:
@@ -1315,7 +1452,7 @@ class Handler(BaseHTTPRequestHandler):
                 inst = add_instance(
                     cfg, p.get("name"), p.get("dir"),
                     launch_cmd=p.get("launch_cmd"), config_file=p.get("config_file"),
-                    stop_keys=sk, stop_timeout=p.get("stop_timeout"),
+                    stop_keys=sk, stop_timeout=p.get("stop_timeout"), limits=p.get("limits"),
                 )
                 return self._json({"ok": True, "instance": {
                     "name": inst["name"], "dir": inst["dir"],
@@ -1391,6 +1528,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "result": send_command(inst, p.get("command", ""))})
             except ValueError as e:
                 return self._json({"error": str(e)}, 409)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # set / clear per-instance resource limits
+        m = re.match(r"^/api/instances/([^/]+)/limits$", path)
+        if m:
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                res = set_limits(cfg, m.group(1), memory=p.get("memory"), cpu=p.get("cpu"))
+                return self._json({"ok": True, "limits": res})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 404 if str(e).startswith("no such") else 400)
             except json.JSONDecodeError as e:
                 return self._json({"error": f"invalid request: {e}"}, 400)
 
@@ -1530,6 +1679,12 @@ def main():
     p.add_argument("field", choices=SETTABLE_FIELDS)
     p.add_argument("value")
 
+    p = sub.add_parser("limits", help="view/set/clear an instance's resource caps")
+    p.add_argument("name")
+    p.add_argument("--memory", default=None, help='hard memory cap, e.g. 2G or 512M ("" to clear)')
+    p.add_argument("--cpu", default=None, help="CPU cap as percent of one core, e.g. 200 (0 to clear)")
+    p.add_argument("--clear", action="store_true", help="remove all limits")
+
     p = sub.add_parser("adopt")
     p.add_argument("session", help="existing tmux session name")
     p.add_argument("--name", default=None, help="instance name (default: session name)")
@@ -1658,6 +1813,19 @@ def main():
                 print(f"{nm}: {args.field} = {val}")
         except ValueError as e:
             die(str(e))
+    elif args.cmd == "limits":
+        inst = cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}")
+        try:
+            if args.clear:
+                res = set_limits(cfg, args.name, memory="", cpu=0)
+            elif args.memory is None and args.cpu is None:
+                res = inst.get("limits") or {}
+            else:
+                res = set_limits(cfg, args.name, memory=args.memory, cpu=args.cpu)
+        except ValueError as e:
+            die(str(e))
+        enf = "" if _supports_cgroup_limits() or not res else "   (NOTE: not enforced here — see README)"
+        print(f"{args.name}: " + (", ".join(f"{k}={v}" for k, v in res.items()) if res else "no limits") + enf)
     elif args.cmd == "adopt":
         sk = [s for s in args.stop_keys.split(",") if s.strip()] if args.stop_keys else None
         try:
@@ -2136,6 +2304,12 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
       <label style="flex:1">Stop timeout
         <input id="f_to" type="number" placeholder="15" autocomplete="off"></label>
     </div>
+    <div class="mrow">
+      <label style="flex:1">Memory cap <span class="hint">e.g. 2G — blank = none</span>
+        <input id="f_mem" placeholder="2G" autocomplete="off"></label>
+      <label style="flex:1">CPU cap % <span class="hint">100 = one core</span>
+        <input id="f_cpu" type="number" placeholder="200" autocomplete="off"></label>
+    </div>
     <div class="mbar">
       <span class="msg" id="addMsg"></span>
       <button onclick="closeAdd()">Cancel</button>
@@ -2153,6 +2327,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   <div class="tabs">
     <div class="tab active" id="tabLogsBtn" onclick="showTab('logs')">Console</div>
     <div class="tab" id="tabCfgBtn" onclick="showTab('cfg')">Config</div>
+    <div class="tab" id="tabLimBtn" onclick="showTab('lim')">Limits</div>
   </div>
   <div class="body">
     <div id="tabLogs">
@@ -2164,6 +2339,17 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
           onkeydown="cmdKey(event)">
         <button class="go" onclick="sendCmd()">Send</button>
       </div>
+    </div>
+    <div id="tabLim" style="display:none">
+      <div class="hint" id="limCap" style="margin-bottom:.8rem"></div>
+      <div class="frow"><div class="flabel">Memory cap <span class="unit">hard</span></div>
+        <div class="fctrl"><input type="text" id="lim_mem" placeholder="e.g. 2G (blank = none)"></div></div>
+      <div class="frow"><div class="flabel">CPU cap <span class="unit">% / core</span></div>
+        <div class="fctrl"><input type="text" id="lim_cpu" placeholder="e.g. 200 (blank = none)"></div></div>
+      <div class="hint" style="margin-top:.8rem">Enforced via a transient systemd user scope (cgroups). Memory over the cap is OOM-killed inside the scope; CPU is throttled. Takes effect on next start/restart.</div>
+      <div class="mbar" style="margin-top:.8rem"><span class="msg" id="limMsg" style="color:var(--dim);flex:1"></span>
+        <button onclick="saveLimits(false)">Save</button>
+        <button class="warn" onclick="saveLimits(true)">Save &amp; Restart</button></div>
     </div>
     <div id="tabCfg" style="display:none">
       <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.7rem">
@@ -2184,7 +2370,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 </aside>
 
 <script>
-let CUR=null, TAB='logs', logTimer=null;
+let CUR=null, TAB='logs', logTimer=null, INSTMAP={};
 const $=id=>document.getElementById(id);
 
 async function api(path,method='GET',body){
@@ -2215,13 +2401,20 @@ function renderHost(){
     gauge('Memory',HOST.mem_total?100*HOST.mem_used/HOST.mem_total:0,fmtGB(HOST.mem_used)+' / '+fmtGB(HOST.mem_total),t.mem_pct)+
     gauge('Disk',HOST.disk_total?100*HOST.disk_used/HOST.disk_total:0,fmtGB(HOST.disk_used)+' / '+fmtGB(HOST.disk_total),t.disk_pct);
 }
-function statBars(s){
+function statBars(s,limits){
   const t=thr(), cores=(HOST&&HOST.cpus)||1, memTotal=(HOST&&HOST.mem_total)||0;
-  const cpuShare=s.cpu_pct==null?0:Math.min(100,100*s.cpu_pct/(cores*100));
-  const memPct=memTotal?Math.min(100,100*s.rss/memTotal):0;
+  limits=limits||{};
+  // CPU bar: relative to the instance's cpu cap if set, else to all cores
+  const cpuCeil=limits.cpu||cores*100;
+  const cpuShare=s.cpu_pct==null?0:Math.min(100,100*s.cpu_pct/cpuCeil);
+  // RAM bar: relative to the memory cap if set, else to host total
+  const memCeil=limits.memory_bytes||memTotal;
+  const memPct=memCeil?Math.min(100,100*s.rss/memCeil):0;
+  const cpuTxt=(s.cpu_pct==null?'…':s.cpu_pct+'%')+(limits.cpu?(' / '+limits.cpu+'%'):'');
+  const memTxt=fmtBytes(s.rss)+(limits.memory?(' / '+limits.memory):'');
   return `<div class="cstats">
-    <div class="cs ${lvl(cpuShare,t.cpu_pct)}"><div class="cl"><span>CPU</span><span>${s.cpu_pct==null?'…':s.cpu_pct+'%'}</span></div><div class="b"><i style="width:${cpuShare}%"></i></div></div>
-    <div class="cs ${lvl(memPct,t.mem_pct)}"><div class="cl"><span>RAM</span><span>${fmtBytes(s.rss)}</span></div><div class="b"><i style="width:${memPct}%"></i></div></div>
+    <div class="cs ${lvl(cpuShare,t.cpu_pct)}"><div class="cl"><span>CPU</span><span>${cpuTxt}</span></div><div class="b"><i style="width:${cpuShare}%"></i></div></div>
+    <div class="cs ${lvl(memPct,t.mem_pct)}"><div class="cl"><span>RAM</span><span>${memTxt}</span></div><div class="b"><i style="width:${memPct}%"></i></div></div>
   </div>`;
 }
 function renderThresholds(){
@@ -2242,6 +2435,7 @@ async function refresh(){
   let d;
   try{ d=await api('/api/instances'); }catch(e){ $('meta').textContent='connection lost'; return; }
   const list=d.instances||[];
+  INSTMAP=Object.fromEntries(list.map(i=>[i.name,i]));
   const run=list.filter(i=>i.status==='running').length;
   const cr=list.filter(i=>i.status==='crashed').length;
   $('meta').textContent=`${list.length} instances · ${run} running`+(cr?` · ${cr} crashed`:'');
@@ -2258,7 +2452,7 @@ async function refresh(){
       </div>
       <div class="path">${esc(i.dir)}</div>
       <div class="cmd">$ ${esc(i.launch_cmd)}</div>
-      ${i.status==='running'&&i.stats?statBars(i.stats):''}
+      ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
       <div class="row">
         <button class="go" onclick="act('${jsq(i.name)}','start',this)">▶ Start</button>
         <button class="warn" onclick="act('${jsq(i.name)}','restart',this)">⟳ Restart</button>
@@ -2297,14 +2491,17 @@ function showTab(t){
   TAB=t;
   $('tabLogsBtn').classList.toggle('active',t==='logs');
   $('tabCfgBtn').classList.toggle('active',t==='cfg');
+  $('tabLimBtn').classList.toggle('active',t==='lim');
   $('tabLogs').style.display=t==='logs'?'':'none';
   $('tabCfg').style.display=t==='cfg'?'':'none';
+  $('tabLim').style.display=t==='lim'?'':'none';
   $('logRefresh').style.display=t==='logs'?'':'none';
   $('cfgSave').style.display=t==='cfg'?'':'none';
   $('cfgSaveRestart').style.display=t==='cfg'?'':'none';
   if(logTimer){clearInterval(logTimer);logTimer=null;}
   if(t==='logs'){renderPresetBar();loadLogs();logTimer=setInterval(loadLogs,3000);}
-  else loadCfg();
+  else if(t==='cfg'){loadCfg();}
+  else if(t==='lim'){renderLimits();}
 }
 function renderPresetBar(){
   const bar=$('presetBar'); if(!bar)return;
@@ -2569,6 +2766,30 @@ async function saveAndRestart(){
   else{ $('drawerMsg').textContent='✓ saved & restarted ('+r.status+')'; }
   refresh();           // update card status in the grid
   setTimeout(loadLogs,600);  // surface fresh boot output if on Console tab
+}
+
+function renderLimits(){
+  const lim=(INSTMAP[CUR]&&INSTMAP[CUR].limits)||{};
+  $('lim_mem').value=lim.memory||'';
+  $('lim_cpu').value=lim.cpu||'';
+  const supported=!HOST||HOST.cgroup_limits!==false;
+  $('limCap').innerHTML=supported
+    ? 'Leave a field blank for no cap on that resource.'
+    : '⚠ This host can\'t enforce limits yet (needs <code>loginctl enable-linger</code> / systemd user scopes — the installer sets this up). Caps are saved but won\'t apply.';
+  $('limMsg').textContent='';
+}
+async function saveLimits(restart){
+  const memory=$('lim_mem').value.trim(), cpu=$('lim_cpu').value.trim();
+  $('limMsg').style.color='var(--dim)'; $('limMsg').textContent='saving…';
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/limits`,'POST',{memory,cpu});
+  if(d.error){ $('limMsg').style.color='var(--crash)'; $('limMsg').textContent='✗ '+d.error; return; }
+  let extra='';
+  if(restart){
+    const r=await api(`/api/instances/${encodeURIComponent(CUR)}/restart`,'POST');
+    extra=r.error?(' — restart failed: '+r.error):(' — restarted ('+r.status+')');
+  }
+  $('limMsg').textContent='✓ saved'+extra;
+  refresh();
 }
 
 async function del(name,status){
@@ -2839,7 +3060,7 @@ async function adopt(session,btn){
 }
 
 function openAdd(){
-  ['f_name','f_dir','f_launch','f_cfg','f_keys','f_to'].forEach(id=>$(id).value='');
+  ['f_name','f_dir','f_launch','f_cfg','f_keys','f_to','f_mem','f_cpu'].forEach(id=>$(id).value='');
   $('addMsg').textContent='';
   $('addScrim').classList.add('open');
   setTimeout(()=>$('f_name').focus(),50);
@@ -2856,6 +3077,7 @@ async function submitAdd(){
     config_file:$('f_cfg').value.trim()||null,
     stop_keys:$('f_keys').value.trim()||null,
     stop_timeout:$('f_to').value.trim()||null,
+    limits:{memory:$('f_mem').value.trim(),cpu:$('f_cpu').value.trim()},
   };
   $('addMsg').textContent='';
   $('addBtn').disabled=true;
