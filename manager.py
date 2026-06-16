@@ -29,6 +29,7 @@ import hmac
 import html
 import json
 import os
+import platform
 import re
 import secrets
 import shlex
@@ -1037,6 +1038,143 @@ def adopt_session(cfg, session, name=None, launch_cmd=None, config_file=None,
 
 
 # ---------------------------------------------------------------------------
+# proxy deployer  (download a fork's launcher-v3 release, register a new instance)
+# ---------------------------------------------------------------------------
+
+DEPLOY_SOURCES = {"aquarius": "aquariusnetwork9/AquariusProxy", "zenith": "rfresh2/ZenithProxy"}
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+class DeployJob:
+    """The single in-flight deploy, with captured log for polling (mirrors SystemJob)."""
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.name = None
+        self.status = "idle"      # idle | running | done | error
+        self.lines = []
+        self.started = self.finished = None
+
+    def snapshot(self, tail=400):
+        with self.lock:
+            return {"name": self.name, "status": self.status, "started": self.started,
+                    "finished": self.finished, "output": "".join(self.lines[-tail:])}
+
+    def log(self, msg):
+        with self.lock:
+            self.lines.append(msg if msg.endswith("\n") else msg + "\n")
+
+    def start(self, name, target):
+        import threading
+        with self.lock:
+            if self.status == "running":
+                raise ValueError("a deploy is already running")
+            self.name, self.status, self.lines = name, "running", []
+            self.started, self.finished = time.time(), None
+        threading.Thread(target=self._run, args=(target,), daemon=True).start()
+
+    def _run(self, target):
+        try:
+            target(self.log)
+            with self.lock:
+                self.status, self.finished = "done", time.time()
+        except Exception as e:
+            with self.lock:
+                self.lines.append(f"\n[error] {e}\n")
+                self.status, self.finished = "error", time.time()
+
+
+DEPLOY_JOB = DeployJob()
+
+
+def _resolve_repo(source, owner_repo=None):
+    if source in DEPLOY_SOURCES:
+        return DEPLOY_SOURCES[source]
+    if source == "custom":
+        r = (owner_repo or "").strip()
+        if not _REPO_RE.match(r):
+            raise ValueError("custom source needs an owner/repo like youruser/YourProxyFork")
+        return r
+    raise ValueError(f"unknown source: {source!r} (use aquarius, zenith, or custom)")
+
+
+def _detect_platform():
+    m = platform.machine().lower()
+    arch = "aarch64" if m in ("aarch64", "arm64") else "amd64"
+    osname = "alpine" if os.path.exists("/etc/alpine-release") else "linux"
+    return osname, arch
+
+
+def _launcher_asset(repo, osname, arch, log):
+    """Find the launcher zip for this platform in <repo>@launcher-v3. Returns (name, url)."""
+    import urllib.request
+    api = f"https://api.github.com/repos/{repo}/releases/tags/launcher-v3"
+    log(f"querying {api}")
+    req = urllib.request.Request(api, headers={"User-Agent": "aquarius-bot-manager",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode())
+    assets = data.get("assets", [])
+    for suffix in (f"-launcher-{osname}-{arch}.zip", f"-launcher-linux-{arch}.zip"):
+        for a in assets:
+            if a.get("name", "").endswith(suffix):
+                return a["name"], a["browser_download_url"]
+    have = ", ".join(a.get("name", "?") for a in assets) or "(no assets)"
+    raise ValueError(f"no launcher for {osname}-{arch} in {repo}@launcher-v3 (have: {have})")
+
+
+def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None):
+    """Start a background deploy: download the fork's launcher, unzip into `directory`,
+    register the instance. Returns immediately; poll DEPLOY_JOB for progress."""
+    name = (name or "").strip()
+    if not VALID_NAME.match(name):
+        raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
+    cfg = load_config(cfg_path)
+    if name in cfg["by_name"]:
+        raise ValueError(f"instance '{name}' already exists")
+    repo = _resolve_repo(source, owner_repo)
+    directory = os.path.abspath(os.path.expanduser(
+        directory.strip() if directory and directory.strip() else os.path.join(_base_dir(cfg), name)))
+    clean_lim = _clean_limits(limits)
+
+    def target(log):
+        import urllib.request, zipfile
+        osname, arch = _detect_platform()
+        log(f"deploying '{name}' from {repo}  ({osname}-{arch})")
+        log(f"install dir: {directory}")
+        asset, url = _launcher_asset(repo, osname, arch, log)
+        os.makedirs(directory, exist_ok=True)
+        zpath = os.path.join(directory, asset)
+        log(f"downloading {asset} …")
+        req = urllib.request.Request(url, headers={"User-Agent": "aquarius-bot-manager"})
+        with urllib.request.urlopen(req, timeout=300) as r, open(zpath, "wb") as f:
+            shutil.copyfileobj(r, f)
+        log(f"downloaded {os.path.getsize(zpath) // 1024} KB; extracting")
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(directory)
+        os.remove(zpath)
+        launch_cmd = guess_launch_cmd(directory) or "./launch"
+        base = launch_cmd[2:] if launch_cmd.startswith("./") else None
+        if base and os.path.isfile(os.path.join(directory, base)):
+            try:
+                os.chmod(os.path.join(directory, base), 0o755)
+            except OSError:
+                pass
+        log(f"launch command: {launch_cmd}")
+        fresh = load_config(cfg_path)
+        if name in fresh["by_name"]:
+            log(f"'{name}' already registered — files are in place, left config as-is")
+        else:
+            add_instance(fresh, name, directory, launch_cmd=launch_cmd, limits=clean_lim or None)
+            log(f"registered instance '{name}'" + (f" with limits {clean_lim}" if clean_lim else ""))
+        log("✓ deploy complete — start it from the dashboard "
+            "(the launcher fetches Java + the proxy jar on first run).")
+
+    DEPLOY_JOB.start(name, target)
+    return {"ok": True, "name": name, "dir": directory, "repo": repo}
+
+
+# ---------------------------------------------------------------------------
 # settings
 # ---------------------------------------------------------------------------
 
@@ -1078,6 +1216,7 @@ def get_settings(cfg):
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
+        "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
     }
 
@@ -1504,6 +1643,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/system/job":
             return self._json(SYS_JOB.snapshot())
 
+        if path == "/api/deploy/job":
+            return self._json(DEPLOY_JOB.snapshot())
+
         if path == "/api/instances":
             cfg = self._cfg()
             out = []
@@ -1600,6 +1742,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(e)}, 403)
             except ValueError as e:
                 return self._json({"error": str(e)}, 409)
+
+        # deploy a new proxy (download a fork's launcher, register it) — background job
+        if path == "/api/deploy":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                return self._json(deploy_proxy(self.cfg_path, p.get("name"), p.get("dir"),
+                                               p.get("source"), owner_repo=p.get("owner_repo"),
+                                               limits=p.get("limits")))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
 
         # adopt an existing tmux session
         if path == "/api/adopt":
@@ -1888,6 +2042,14 @@ def main():
     p = sub.add_parser("files", help="list files under the allowed roots (jailed)")
     p.add_argument("path", nargs="?", default=None, help="directory to list (default: first root)")
 
+    p = sub.add_parser("deploy", help="download a fork's launcher and register a new instance")
+    p.add_argument("name")
+    p.add_argument("--source", choices=["aquarius", "zenith", "custom"], default="aquarius")
+    p.add_argument("--repo", default=None, help="owner/repo for --source custom")
+    p.add_argument("--dir", default=None, help="install dir (default: <base>/<name>)")
+    p.add_argument("--memory", default=None, help="optional memory cap, e.g. 2G")
+    p.add_argument("--cpu", default=None, help="optional CPU cap, percent of one core")
+
     p = sub.add_parser("adopt")
     p.add_argument("session", help="existing tmux session name")
     p.add_argument("--name", default=None, help="instance name (default: session name)")
@@ -2039,6 +2201,24 @@ def main():
             tag = "d" if e["type"] == "dir" else "-"
             sz = "" if e["size"] is None else str(e["size"])
             print(f"  {tag} {e['name']}\t{sz}")
+    elif args.cmd == "deploy":
+        lim = {"memory": args.memory, "cpu": args.cpu} if (args.memory or args.cpu) else None
+        try:
+            deploy_proxy(args.config, args.name, args.dir, args.source,
+                         owner_repo=args.repo, limits=lim)
+        except ValueError as e:
+            die(str(e))
+        seen = 0                       # stream the background job's log to stdout
+        while True:
+            snap = DEPLOY_JOB.snapshot()
+            if len(snap["output"]) > seen:
+                sys.stdout.write(snap["output"][seen:]); sys.stdout.flush()
+                seen = len(snap["output"])
+            if snap["status"] in ("done", "error"):
+                break
+            time.sleep(0.3)
+        if DEPLOY_JOB.snapshot()["status"] == "error":
+            sys.exit(1)
     elif args.cmd == "adopt":
         sk = [s for s in args.stop_keys.split(",") if s.strip()] if args.stop_keys else None
         try:
@@ -2393,6 +2573,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <button onclick="openFiles()">📁 Files</button>
     <button onclick="openProxies()">🌐 Proxies</button>
     <button onclick="openScan()">⟲ Scan existing</button>
+    <button class="go" onclick="openDeploy()">🚀 Deploy</button>
     <button onclick="openAdd()">+ New instance</button>
     <button class="go" onclick="bulk('start')">▶ Start all</button>
     <button class="warn" onclick="bulk('restart')">⟳ Restart all</button>
@@ -2436,6 +2617,36 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <div class="mbar"><span class="msg" id="proxMsg" style="color:var(--dim)"></span>
       <button onclick="loadProxies()">Refresh</button>
       <button onclick="closeProxies()">Close</button></div>
+  </div>
+</div>
+
+<div class="scrim" id="deployScrim" onclick="closeDeploy(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="mhead">Deploy a proxy</div>
+    <div class="hint" style="margin:-.3rem 0 .4rem">Downloads the chosen fork's launcher and registers a new instance. The launcher fetches Java + the jar on first start.</div>
+    <label>Source
+      <div id="depSrc" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">
+        <div class="chip sel" data-s="aquarius" onclick="pickSrc('aquarius',this)">AquariusProxy</div>
+        <div class="chip" data-s="zenith" onclick="pickSrc('zenith',this)">ZenithProxy</div>
+        <div class="chip" data-s="custom" onclick="pickSrc('custom',this)">Custom fork</div>
+      </div>
+    </label>
+    <label id="depRepoWrap" style="display:none">Custom repo <span class="hint">owner/repo on GitHub — must publish a launcher-v3 release</span>
+      <input id="dep_repo" placeholder="youruser/YourProxyFork" autocomplete="off"></label>
+    <label>Name <span class="hint">letters, digits, . _ -</span>
+      <input id="dep_name" placeholder="bot1" autocomplete="off" oninput="depAutoDir()"></label>
+    <label>Directory <span class="hint">where to install (auto-filled from base dir)</span>
+      <input id="dep_dir" placeholder="/home/ubuntu/zenith/bot1" autocomplete="off" oninput="depDirEdited=true"></label>
+    <div class="mrow">
+      <label style="flex:1">Memory cap <span class="hint">e.g. 2G — optional</span>
+        <input id="dep_mem" placeholder="2G" autocomplete="off"></label>
+      <label style="flex:1">CPU cap % <span class="hint">100 = one core</span>
+        <input id="dep_cpu" type="number" placeholder="200" autocomplete="off"></label>
+    </div>
+    <pre class="log" id="depLog" style="display:none;min-height:120px;max-height:32vh">…</pre>
+    <div class="mbar"><span class="msg" id="depMsg" style="flex:1;color:var(--dim)"></span>
+      <button onclick="closeDeploy()">Close</button>
+      <button class="go" id="depBtn" onclick="startDeploy()">Deploy</button></div>
   </div>
 </div>
 
@@ -3157,6 +3368,46 @@ async function applyBulkProxies(btn){
   loadProxies(); if(restart)refresh();
 }
 
+let depSrc='aquarius', depTimer=null, depDirEdited=false;
+function openDeploy(){
+  depDirEdited=false; depSrc='aquarius';
+  document.querySelectorAll('#depSrc .chip').forEach(c=>c.classList.toggle('sel',c.dataset.s==='aquarius'));
+  $('depRepoWrap').style.display='none';
+  ['dep_name','dep_dir','dep_repo','dep_mem','dep_cpu'].forEach(id=>$(id).value='');
+  $('depLog').style.display='none'; $('depLog').textContent='';
+  $('depMsg').textContent=''; $('depBtn').disabled=false;
+  $('deployScrim').classList.add('open'); setTimeout(()=>$('dep_name').focus(),50);
+}
+function closeDeploy(e){ if(e&&e.target!==$('deployScrim'))return; if(depTimer){clearInterval(depTimer);depTimer=null;} $('deployScrim').classList.remove('open'); }
+function pickSrc(s,el){ depSrc=s; document.querySelectorAll('#depSrc .chip').forEach(c=>c.classList.toggle('sel',c.dataset.s===s)); $('depRepoWrap').style.display=s==='custom'?'':'none'; }
+function depAutoDir(){
+  if(depDirEdited)return;
+  const base=(SETTINGS&&SETTINGS.base_dir)||'', n=$('dep_name').value.trim();
+  $('dep_dir').value=(n&&base)?(base.replace(/[\/\\]+$/,'')+'/'+n):'';
+}
+async function startDeploy(){
+  const name=$('dep_name').value.trim();
+  if(!name){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='name required'; return; }
+  const body={name,dir:$('dep_dir').value.trim(),source:depSrc,owner_repo:$('dep_repo').value.trim(),
+              limits:{memory:$('dep_mem').value.trim(),cpu:$('dep_cpu').value.trim()}};
+  $('depMsg').style.color='var(--dim)'; $('depMsg').textContent='starting…'; $('depBtn').disabled=true;
+  const d=await api('/api/deploy','POST',body);
+  if(d.error){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='✗ '+d.error; $('depBtn').disabled=false; return; }
+  $('depLog').style.display=''; $('depMsg').textContent='deploying…';
+  if(depTimer)clearInterval(depTimer);
+  depTimer=setInterval(pollDeploy,700); pollDeploy();
+}
+async function pollDeploy(){
+  const j=await api('/api/deploy/job');
+  $('depLog').textContent=j.output||'…';
+  $('depLog').scrollTop=$('depLog').scrollHeight;
+  if(j.status==='done'||j.status==='error'){
+    clearInterval(depTimer); depTimer=null; $('depBtn').disabled=false;
+    $('depMsg').style.color=j.status==='done'?'var(--dim)':'var(--crash)';
+    $('depMsg').textContent=j.status==='done'?'✓ deployed — start it from the dashboard':'✗ deploy failed';
+    refresh();
+  }
+}
 let FBCWD=null, FBPARENT=null, FBEDIT=null;
 function openFiles(){ $('filesScrim').classList.add('open'); fbBack(); fbNav(''); }
 function closeFiles(e){ if(e&&e.target!==$('filesScrim'))return; $('filesScrim').classList.remove('open'); }
