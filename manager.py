@@ -90,7 +90,14 @@ def session_name(inst):
 
 
 def tmux(*args, check=False):
-    p = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    try:
+        p = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        # tmux not installed / not on PATH: degrade gracefully (no sessions) instead of
+        # 500-ing every endpoint. check=True callers (start) still get a clear error.
+        if check:
+            raise RuntimeError("tmux not found on PATH (install it: sudo apt install tmux)")
+        return subprocess.CompletedProcess(args, 1, "", "tmux not found")
     if check and p.returncode != 0:
         raise RuntimeError(f"tmux {' '.join(args)} failed: {p.stderr.strip()}")
     return p
@@ -158,6 +165,99 @@ def logs(inst, lines=300):
         return "(not running)"
     p = tmux("capture-pane", "-t", s, "-p", "-J", "-S", f"-{int(lines)}")
     return p.stdout if p.returncode == 0 else f"(error reading logs: {p.stderr})"
+
+
+# ---------------------------------------------------------------------------
+# per-instance resource stats  (Linux /proc; degrades to None elsewhere)
+# ---------------------------------------------------------------------------
+
+try:
+    _CLK_TCK = os.sysconf("SC_CLK_TCK")
+except (ValueError, OSError, AttributeError):
+    _CLK_TCK = 100
+try:
+    _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+except (ValueError, OSError, AttributeError):
+    _PAGE_SIZE = 4096
+
+_CPU_SAMPLES = {}   # session -> (total_jiffies, ts) for CPU% deltas between polls
+
+
+def _pane_pid(session):
+    p = tmux("display-message", "-p", "-t", session, "#{pane_pid}")
+    if p.returncode != 0:
+        return None
+    try:
+        return int(p.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _read_proc_stat(pid):
+    """(/proc/<pid>/stat) -> (ppid, utime+stime jiffies, rss_pages) or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    rp = data.rfind(")")           # comm (field 2) is parenthesized and may contain spaces
+    if rp < 0:
+        return None
+    after = data[rp + 2:].split()  # after[0] == field 3 (state)
+    try:
+        return int(after[1]), int(after[11]) + int(after[12]), int(after[21])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_tree_stats(root_pid):
+    """Sum CPU jiffies / RSS bytes / process count for root_pid and its descendants."""
+    entries = {}
+    for d in os.listdir("/proc"):          # raises OSError on non-Linux -> caller handles
+        if d.isdigit():
+            r = _read_proc_stat(int(d))
+            if r:
+                entries[int(d)] = r
+    children = {}
+    for pid, (ppid, _, _) in entries.items():
+        children.setdefault(ppid, []).append(pid)
+    total_j = total_rss = 0
+    seen, stack = set(), [root_pid]
+    while stack:
+        pid = stack.pop()
+        if pid in seen or pid not in entries:
+            continue
+        seen.add(pid)
+        _, j, rss = entries[pid]
+        total_j += j
+        total_rss += rss
+        stack.extend(children.get(pid, []))
+    return total_j, total_rss * _PAGE_SIZE, len(seen)
+
+
+def instance_stats(inst):
+    """Live CPU%/RSS for a running instance, or None. CPU% is normalized to one
+    core (100 = a full core; can exceed 100 up to cores*100), sampled between polls."""
+    s = session_name(inst)
+    if not session_exists(s) or pane_dead(s):
+        _CPU_SAMPLES.pop(s, None)
+        return None
+    pid = _pane_pid(s)
+    if not pid:
+        return None
+    try:
+        total_j, rss_bytes, nproc = _proc_tree_stats(pid)
+    except OSError:
+        return None                         # no /proc (e.g. Windows dev box)
+    now = time.time()
+    prev = _CPU_SAMPLES.get(s)
+    _CPU_SAMPLES[s] = (total_j, now)
+    cpu_pct = None
+    if prev:
+        dj, dt = total_j - prev[0], now - prev[1]
+        if dt > 0 and dj >= 0:
+            cpu_pct = round(100.0 * dj / (dt * _CLK_TCK), 1)
+    return {"pid": pid, "cpu_pct": cpu_pct, "rss": rss_bytes, "procs": nproc}
 
 
 def send_command(inst, command):
@@ -659,6 +759,10 @@ DEFAULT_CONSOLE_PRESETS = [
     {"label": "Status", "command": "info"},
 ]
 
+# Alert thresholds (percent). The dashboard flags a host gauge / instance card warn-colored
+# once usage crosses these. Stored under settings.thresholds.
+DEFAULT_THRESHOLDS = {"cpu_pct": 85, "mem_pct": 85, "disk_pct": 90}
+
 
 def get_settings(cfg):
     s = cfg["raw"].get("settings", {})
@@ -670,11 +774,13 @@ def get_settings(cfg):
         },
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
+        "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
         "presets": THEME_PRESETS,
     }
 
 
-def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None):
+def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None,
+                  thresholds=None):
     s = cfg["raw"].setdefault("settings", {})
     if theme is not None:
         t = s.setdefault("theme", {})
@@ -702,6 +808,18 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             if label and command:          # silently drop blank rows
                 cleaned.append({"label": label, "command": command})
         s["console_presets"] = cleaned
+    if thresholds is not None:
+        if not isinstance(thresholds, dict):
+            raise ValueError("thresholds must be an object")
+        cur = dict(s.get("thresholds") or {})
+        for k in ("cpu_pct", "mem_pct", "disk_pct"):
+            if k in thresholds and thresholds[k] is not None:
+                try:
+                    v = int(thresholds[k])
+                except (TypeError, ValueError):
+                    raise ValueError(f"{k} must be a number")
+                cur[k] = max(1, min(100, v))
+        s["thresholds"] = cur
     save_config(cfg)
     return get_settings(cfg)
 
@@ -1074,13 +1192,20 @@ class Handler(BaseHTTPRequestHandler):
             cfg = self._cfg()
             out = []
             for i in cfg["instances"]:
-                out.append({
+                st = instance_status(i)
+                row = {
                     "name": i["name"],
                     "dir": i["dir"],
                     "launch_cmd": i["launch_cmd"],
-                    "status": instance_status(i),
+                    "status": st,
                     "autostart": bool(i.get("autostart")),
-                })
+                }
+                if st == "running":
+                    try:
+                        row["stats"] = instance_stats(i)
+                    except Exception:
+                        row["stats"] = None
+                out.append(row)
             return self._json({"instances": out})
 
         m = re.match(r"^/api/instances/([^/]+)/logs$", path)
@@ -1141,7 +1266,8 @@ class Handler(BaseHTTPRequestHandler):
                 p = json.loads(self._read_body() or b"{}")
                 out = save_settings(cfg, theme=p.get("theme"),
                                     system_actions_enabled=p.get("system_actions_enabled"),
-                                    console_presets=p.get("console_presets"))
+                                    console_presets=p.get("console_presets"),
+                                    thresholds=p.get("thresholds"))
                 return self._json({"ok": True, "settings": out})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
@@ -1850,6 +1976,22 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .sysgrid .s .v{font-weight:700;font-size:1rem;margin-top:.15rem}
 .sysgrid .s .b{height:4px;border-radius:3px;background:#ffffff14;margin-top:.4rem;overflow:hidden}
 .sysgrid .s .b i{display:block;height:100%;background:var(--acc)}
+/* host gauge strip */
+.hoststrip{display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem}
+.gauge{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:.5rem .7rem}
+.gauge .k{font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);display:flex;justify-content:space-between}
+.gauge .v{font-weight:700;font-size:.88rem;margin:.15rem 0 .35rem}
+.gauge .b{height:5px;border-radius:3px;background:#ffffff14;overflow:hidden}
+.gauge .b i{display:block;height:100%;background:var(--acc);transition:width .4s}
+.gauge.warn .b i{background:var(--warn)} .gauge.warn .v{color:var(--warn)}
+.gauge.crit .b i{background:var(--crash)} .gauge.crit .v{color:var(--crash)}
+/* per-card resource bars */
+.cstats{display:flex;gap:.6rem;margin:.1rem 0 .75rem}
+.cstats .cs{flex:1}
+.cstats .cs .cl{font-family:var(--mono);font-size:.62rem;color:var(--dim);display:flex;justify-content:space-between}
+.cstats .cs .b{height:4px;border-radius:3px;background:#ffffff14;margin-top:.25rem;overflow:hidden}
+.cstats .cs .b i{display:block;height:100%;background:var(--acc);transition:width .4s}
+.cstats .cs.warn .b i{background:var(--warn)} .cstats .cs.crit .b i{background:var(--crash)}
 </style>
 </head>
 <body>
@@ -1868,6 +2010,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 </header>
 <main>
   <div class="meta" id="meta">loading…</div>
+  <div class="hoststrip" id="hostStrip"></div>
   <div class="grid" id="grid"></div>
 </main>
 
@@ -1910,6 +2053,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <div class="tabs" style="padding:0;margin-bottom:.6rem">
       <div class="tab active" id="stApBtn" onclick="setTab('ap')">Appearance</div>
       <div class="tab" id="stPreBtn" onclick="setTab('pre')">Console</div>
+      <div class="tab" id="stMonBtn" onclick="setTab('mon')">Monitoring</div>
       <div class="tab" id="stSysBtn" onclick="setTab('sys')">System</div>
     </div>
 
@@ -1935,6 +2079,13 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
       <button onclick="addPreset()" style="width:auto;margin-top:.6rem">+ Add preset</button>
       <div class="mbar"><span class="msg" id="preMsg" style="color:var(--dim);flex:1"></span>
         <button class="go" onclick="savePresets()">Save presets</button></div>
+    </div>
+
+    <div id="stMon" style="display:none">
+      <div class="hint" style="margin-bottom:.6rem">Warn-color a host gauge / instance bar once usage crosses these (percent of capacity).</div>
+      <div id="thrRows"></div>
+      <div class="mbar"><span class="msg" id="monMsg" style="color:var(--dim);flex:1"></span>
+        <button class="go" onclick="saveThresholds()">Save thresholds</button></div>
     </div>
 
     <div id="stSys" style="display:none">
@@ -2047,8 +2198,47 @@ async function toggleAuto(name,enabled){
   await api(`/api/instances/${encodeURIComponent(name)}/autostart`,'POST',{enabled});
   refresh();
 }
+function fmtBytes(n){ if(!n)return'0'; if(n>=1e9)return (n/1e9).toFixed(1)+' GB'; if(n>=1e6)return Math.round(n/1e6)+' MB'; return Math.max(1,Math.round(n/1e3))+' KB'; }
+function thr(){ return (SETTINGS&&SETTINGS.thresholds)||{cpu_pct:85,mem_pct:85,disk_pct:90}; }
+function lvl(pct,t){ return pct>=Math.min(100,t+10)?'crit':(pct>=t?'warn':''); }
+let HOST=null;
+async function loadHost(){ try{ HOST=await api('/api/system/info'); }catch(e){ return; } renderHost(); }
+function gauge(label,pct,valstr,t){
+  pct=Math.max(0,Math.min(100,Math.round(pct||0)));
+  return `<div class="gauge ${lvl(pct,t)}"><div class="k"><span>${label}</span><span>${pct}%</span></div><div class="v">${valstr}</div><div class="b"><i style="width:${pct}%"></i></div></div>`;
+}
+function renderHost(){
+  const el=$('hostStrip'); if(!el||!HOST)return;
+  const t=thr(), cores=HOST.cpus||1, load0=HOST.load?HOST.load[0]:0;
+  el.innerHTML=
+    gauge('CPU load',100*load0/cores,(HOST.load?HOST.load[0].toFixed(2):'?')+' / '+cores+' cores',t.cpu_pct)+
+    gauge('Memory',HOST.mem_total?100*HOST.mem_used/HOST.mem_total:0,fmtGB(HOST.mem_used)+' / '+fmtGB(HOST.mem_total),t.mem_pct)+
+    gauge('Disk',HOST.disk_total?100*HOST.disk_used/HOST.disk_total:0,fmtGB(HOST.disk_used)+' / '+fmtGB(HOST.disk_total),t.disk_pct);
+}
+function statBars(s){
+  const t=thr(), cores=(HOST&&HOST.cpus)||1, memTotal=(HOST&&HOST.mem_total)||0;
+  const cpuShare=s.cpu_pct==null?0:Math.min(100,100*s.cpu_pct/(cores*100));
+  const memPct=memTotal?Math.min(100,100*s.rss/memTotal):0;
+  return `<div class="cstats">
+    <div class="cs ${lvl(cpuShare,t.cpu_pct)}"><div class="cl"><span>CPU</span><span>${s.cpu_pct==null?'…':s.cpu_pct+'%'}</span></div><div class="b"><i style="width:${cpuShare}%"></i></div></div>
+    <div class="cs ${lvl(memPct,t.mem_pct)}"><div class="cl"><span>RAM</span><span>${fmtBytes(s.rss)}</span></div><div class="b"><i style="width:${memPct}%"></i></div></div>
+  </div>`;
+}
+function renderThresholds(){
+  const t=thr();
+  $('thrRows').innerHTML=[['cpu_pct','CPU load'],['mem_pct','Memory'],['disk_pct','Disk']].map(([k,lbl])=>
+    `<div class="frow"><div class="flabel">${lbl} <span class="unit">%</span></div><div class="fctrl"><input type="number" min="1" max="100" id="thr_${k}" value="${t[k]}" class="snum wide"></div></div>`).join('');
+}
+async function saveThresholds(){
+  const thresholds={cpu_pct:+$('thr_cpu_pct').value,mem_pct:+$('thr_mem_pct').value,disk_pct:+$('thr_disk_pct').value};
+  $('monMsg').style.color='var(--dim)'; $('monMsg').textContent='saving…';
+  const d=await api('/api/settings','POST',{thresholds});
+  if(d.error){ $('monMsg').style.color='var(--crash)'; $('monMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; renderHost(); $('monMsg').textContent='✓ saved';
+}
 
 async function refresh(){
+  loadHost();
   let d;
   try{ d=await api('/api/instances'); }catch(e){ $('meta').textContent='connection lost'; return; }
   const list=d.instances||[];
@@ -2068,6 +2258,7 @@ async function refresh(){
       </div>
       <div class="path">${esc(i.dir)}</div>
       <div class="cmd">$ ${esc(i.launch_cmd)}</div>
+      ${i.status==='running'&&i.stats?statBars(i.stats):''}
       <div class="row">
         <button class="go" onclick="act('${jsq(i.name)}','start',this)">▶ Start</button>
         <button class="warn" onclick="act('${jsq(i.name)}','restart',this)">⟳ Restart</button>
@@ -2508,12 +2699,15 @@ function closeSettings(e){
 function setTab(t){
   $('stApBtn').classList.toggle('active',t==='ap');
   $('stPreBtn').classList.toggle('active',t==='pre');
+  $('stMonBtn').classList.toggle('active',t==='mon');
   $('stSysBtn').classList.toggle('active',t==='sys');
   $('stAp').style.display=t==='ap'?'':'none';
   $('stPre').style.display=t==='pre'?'':'none';
+  $('stMon').style.display=t==='mon'?'':'none';
   $('stSys').style.display=t==='sys'?'':'none';
   if(sysTimer){clearInterval(sysTimer);sysTimer=null;}
   if(t==='pre'){renderPresetEditor();}
+  if(t==='mon'){renderThresholds();}
   if(t==='sys'){loadSysInfo();loadSysJob();renderSysToggle();sysTimer=setInterval(()=>{loadSysInfo();loadSysJob();},4000);}
 }
 function presetRow(label,command){
