@@ -1,13 +1,17 @@
 # Aquarius Bot Manager
 
-Control many **AquariusProxy** and **ZenithProxy** bot instances — each in its own tmux session — from a CLI and a web UI. Pure Python stdlib + tmux. No pip installs, no Docker.
+A control plane for a whole VPS of **AquariusProxy** and **ZenithProxy** bots — each in its own tmux session — from a CLI and a web UI. Spin up a fresh box, install the manager, deploy proxies, then monitor and operate them. Pure Python stdlib + tmux. No pip installs, no Docker.
 
-AquariusProxy is a ZenithProxy fork, so they share the same launch model and config structure; this manager drives either (or a mix) on the same host.
+AquariusProxy is a ZenithProxy fork, so they share the same launch model and config structure; this manager drives either (or a custom fork) on the same host.
+
+**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer.
 
 ## Files
 - `manager.py` — the program (CLI + web server, single source of truth)
 - `schema.py` — curated AquariusProxy/ZenithProxy config schema for the structured editor
 - `abm` — short CLI wrapper (`abm restart bot1`)
+- `install.sh` — fresh-VPS installer (curl | sudo bash)
+- `cloud-init.yaml` — first-boot provisioning template for cloud providers
 - `aquarius-bot-manager.service` — systemd unit for the web UI
 - `aquarius-bot-manager-boot.service` — systemd oneshot unit that starts autostart instances on boot
 - `instances.example.json` — config schema example
@@ -15,7 +19,20 @@ AquariusProxy is a ZenithProxy fork, so they share the same launch model and con
 ## Requirements
 - `python3` (3.8+) and `tmux`: `sudo apt install tmux`
 
-## Install
+## Provision a fresh VPS (recommended)
+On a new Ubuntu box, one command installs everything (deps, the manager, systemd units, lingering for resource caps) and starts the web UI on localhost:
+```bash
+curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Aquarius-Bot-Manager/main/install.sh | sudo bash
+# override defaults: sudo ABM_RUN_USER=ubuntu ABM_PORT=8765 ABM_BASE_DIR=/home/ubuntu/zenith bash install.sh
+```
+Then:
+1. `sudo -u ubuntu abm setpassword` — set the web login.
+2. From your computer: `ssh -L 8765:127.0.0.1:8765 ubuntu@<vps-ip>`, open `http://localhost:8765`.
+3. Click **🚀 Deploy** to add proxies.
+
+To provision at boot, paste `cloud-init.yaml` into your provider's user-data field (edit `ABM_RUN_USER` if not `ubuntu`).
+
+## Manual install
 ```bash
 sudo mkdir -p /opt/aquarius-bot-manager
 sudo cp manager.py schema.py abm /opt/aquarius-bot-manager/
@@ -70,6 +87,11 @@ abm proxy   bot1 --host 1.2.3.4 --port 1080   # set proxy (view if no flags)
 abm proxybulk --list "1.2.3.4:1080,5.6.7.8:1080" [--targets a,b,c|all] [--mode roundrobin|same] [--restart]
                                           # assign/rotate proxies across many instances at once
 
+# deploy / limits / files
+abm deploy  bot1 --source aquarius        # or zenith, or custom --repo owner/repo; [--dir ...] [--memory 2G] [--cpu 200]
+abm limits  bot1 --memory 2G --cpu 200    # enforce caps (--clear to remove; no flags to view)
+abm files   [path]                        # list files under the allowed roots (jailed)
+
 # host / settings / auth
 abm sysinfo
 abm settings [--theme ember] [--accent "#ff7a45"] [--enable-system | --disable-system]
@@ -84,12 +106,15 @@ abm logout-all                            # invalidate active web sessions
 abm serve --host 127.0.0.1 --port 8765
 ```
 Browse to http://127.0.0.1:8765.
-- Cards per instance: start / stop / restart, live console (tmux capture), JSON config editor (validates on save), delete. Bulk start/stop/restart-all.
-- **+ New instance** — add via a form.
+- Cards per instance: start / stop / restart, live console (tmux capture), JSON config editor (validates on save), delete, plus live CPU/RAM bars (warn-colored past thresholds, scaled to caps when limited). Bulk start/stop/restart-all.
+- A sticky **host gauge strip** (CPU load / memory / disk vs capacity).
+- **🚀 Deploy** — download a fork's launcher (AquariusProxy / ZenithProxy / a custom `owner/repo`) into a new dir and register it, with a live deploy log; optional memory/CPU caps.
+- **📁 Files** — a jailed file manager (browse/create/edit/rename/delete) over the allowed roots.
+- **+ New instance** — register an existing dir via a form (incl. optional resource caps).
 - **⟲ Scan existing** — detect unmanaged tmux sessions and adopt them.
 - **⚙ Settings** — Appearance (theme presets + accent) and System (host dashboard + reboot/update).
 - **🌐 Proxies** — quick host/port editor for instances using `client.connection.proxy`. Each row has **Save** and **⟳** (save **& restart**). A **Bulk assign / rotate** panel lets you paste a list of `host:port` proxies and apply them across selected instances — **round-robin** (cycle the list across targets) or **same to all** — with an optional restart-after.
-- Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin) plus **quick-command preset buttons**; **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback and **Save** / **Save & Restart**. The ★ on each card toggles autostart.
+- Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin) plus **quick-command preset buttons**; **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback and **Save** / **Save & Restart**; **Limits** tab sets the memory/CPU caps. The ★ on each card toggles autostart.
 
 ### Console presets
 The buttons above the console command bar are editable in **Settings → Console** (label + the command it types). They're stored under `settings.console_presets` in `instances.json`. Defaults are `Reconnect` (`connect`), `Disconnect` (`disconnect`), and `Status` (`info`) — adjust them to your proxy's commands.
@@ -104,6 +129,18 @@ Your manually-started sessions have arbitrary names, so scan inspects every live
 - a launcher (`launch.sh`/`start.sh`/`run.sh`) or `.jar` in the session's directory
 
 **Adopt = bind, don't restart.** Adopting writes an instance with a `session` field pinned to the live session, so it shows `running` immediately and stop/restart/logs act on it. `dir` and `launch_cmd` are auto-filled from the live session. Already-managed sessions are excluded from scans.
+
+## Monitoring & alerts
+The dashboard polls a host gauge strip (CPU load vs cores, memory, disk) and per-instance CPU% / RAM (read from `/proc` of each tmux pane's process tree). Bars turn warn/crit colored once usage crosses the thresholds in **Settings → Monitoring** (`settings.thresholds`, defaults 85/85/90 %).
+
+## Resource limits (cgroups)
+Give an instance a memory and/or CPU cap (New-instance form, the drawer's **Limits** tab, or `abm limits`). When set, the instance launches inside a transient systemd **user scope** (`systemd-run --user --scope` with `MemoryMax`/`MemoryHigh`/`CPUQuota`) so a runaway bot can't OOM the box or hog the cores. Takes effect on next start/restart. This needs systemd user lingering — the installer runs `loginctl enable-linger`; if a host can't enforce, caps are saved but the UI flags them as not enforced and the proxy still starts normally.
+
+## File manager
+**📁 Files** browses, creates, edits, renames and deletes files/folders — **jailed** to an allowlist of roots (`settings.file_roots`, defaulting to the proxy base dir + the manager dir). Paths are realpath-checked against the roots, so `..` and symlink escapes are blocked; root dirs can't be deleted; only UTF-8 text files under ~1 MB open in the editor.
+
+## Deploy proxies
+**🚀 Deploy** stands up a new proxy from scratch: pick **AquariusProxy**, **ZenithProxy**, or a **custom** GitHub `owner/repo` (any fork that publishes a `launcher-v3` release), give it a name and dir, and the manager downloads that fork's platform launcher, unzips it, and registers the instance. The launcher self-bootstraps Java and the proxy jar on first start — so deploying needs nothing pre-installed. Same headless: `abm deploy <name> --source aquarius|zenith|custom [--repo owner/repo]`.
 
 ## Settings — appearance
 Theme presets: `midnight` (default), `ember`, `ice`, `amethyst`, `paper`. Optional accent override (any hex). Persisted in `instances.json`, applied on load.

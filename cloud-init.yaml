@@ -1,0 +1,16 @@
+#cloud-config
+# Provision a fresh Ubuntu VPS with Aquarius Bot Manager on first boot.
+# Paste this into your provider's "user data" / cloud-init field when creating the box.
+# Adjust ABM_RUN_USER to the box's login user (Ubuntu cloud images: "ubuntu").
+package_update: true
+package_upgrade: true
+packages:
+  - python3
+  - tmux
+  - unzip
+  - wget
+  - git
+  - curl
+runcmd:
+  - 'curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Aquarius-Bot-Manager/main/install.sh | ABM_RUN_USER=ubuntu bash'
+final_message: "Aquarius Bot Manager installed. SSH-tunnel to 127.0.0.1:8765, run `sudo -u ubuntu abm setpassword`, then Deploy proxies."
