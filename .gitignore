@@ -1,0 +1,6 @@
+# Runtime config (contains instance roster, theme, and the PBKDF2 password hash)
+instances.json
+
+# Python
+__pycache__/
+*.py[cod]

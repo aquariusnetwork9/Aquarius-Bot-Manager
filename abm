@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper around manager.py so you can run e.g. `abm restart bot1`.
+# Install:  sudo ln -s /opt/aquarius-bot-manager/abm /usr/local/bin/abm
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$DIR/manager.py" "$@"

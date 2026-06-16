@@ -1,0 +1,26 @@
+{
+  "instances": [
+    {
+      "name": "aquarius-bot1",
+      "dir": "/home/ubuntu/zenith/aquarius-bot1",
+      "launch_cmd": "./launch.sh",
+      "config_file": "config.json",
+      "stop_keys": ["C-c"],
+      "stop_timeout": 15,
+      "autostart": true
+    },
+    {
+      "name": "zenith-tpa-helper",
+      "dir": "/home/ubuntu/zenith/zenith-tpa-helper",
+      "launch_cmd": "java -jar ZenithProxy.jar nogui",
+      "config_file": "config.json",
+      "stop_keys": ["stop", "Enter"],
+      "stop_timeout": 20,
+      "session": "zenith-tpa-helper"
+    }
+  ],
+  "settings": {
+    "theme": { "preset": "midnight", "accent": "" },
+    "system_actions_enabled": false
+  }
+}

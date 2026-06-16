@@ -1,0 +1,17 @@
+[Unit]
+Description=Start autostart Aquarius/Zenith proxy instances
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --- edit these ---
+User=ubuntu
+WorkingDirectory=/opt/aquarius-bot-manager
+ExecStart=/usr/bin/python3 /opt/aquarius-bot-manager/manager.py boot
+RemainAfterExit=yes
+# Where instances.json lives (if not next to manager.py):
+# Environment=ABM_CONFIG=/opt/aquarius-bot-manager/instances.json
+
+[Install]
+WantedBy=multi-user.target

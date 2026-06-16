@@ -1,0 +1,29 @@
+[Unit]
+Description=Aquarius Bot Manager web UI
+After=network.target
+
+[Service]
+Type=simple
+# --- edit these ---
+User=ubuntu
+WorkingDirectory=/opt/aquarius-bot-manager
+ExecStart=/usr/bin/python3 /opt/aquarius-bot-manager/manager.py serve --host 127.0.0.1 --port 8765
+# Bind 127.0.0.1 and reach it via SSH tunnel, OR set --host 0.0.0.0 WITH auth below.
+
+# Legacy basic auth (optional; prefer `abm setpassword`). ZP_USER/ZP_PASS also accepted:
+# Environment=ABM_USER=admin
+# Environment=ABM_PASS=change-me
+
+# Where instances.json lives (defaults to next to manager.py):
+# Environment=ABM_CONFIG=/opt/aquarius-bot-manager/instances.json
+
+# System actions (reboot / OS update) are OFF by default; enable in Settings.
+# They need passwordless sudo for the running User — see README:
+#   sudo visudo -f /etc/sudoers.d/aquarius-bot-manager
+#   ubuntu ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/apt-get
+
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

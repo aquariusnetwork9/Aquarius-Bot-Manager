@@ -1,0 +1,2443 @@
+#!/usr/bin/env python3
+"""
+Aquarius Bot Manager
+--------------------
+Single-file controller for many AquariusProxy / ZenithProxy bot instances
+running in tmux on a headless Ubuntu server. Provides a CLI and a stdlib-only
+web UI.
+
+No third-party dependencies. Requires: python3, tmux.
+
+Usage:
+  python3 manager.py serve [--host H] [--port P]
+  python3 manager.py list
+  python3 manager.py status
+  python3 manager.py start   <name|all>
+  python3 manager.py stop    <name|all>
+  python3 manager.py restart <name|all>
+  python3 manager.py logs    <name> [--lines N]
+  python3 manager.py discover <basedir>   # bootstrap instances.json
+
+Config file (instances.json) is looked up next to this script, or via
+$ABM_CONFIG, or --config PATH.
+"""
+
+import argparse
+import base64
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
+                  or os.path.join(SCRIPT_DIR, "instances.json"))
+SESSION_PREFIX = os.environ.get("ABM_PREFIX") or os.environ.get("ZP_PREFIX") or "abm_"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def load_config(path):
+    if not os.path.exists(path):
+        die(f"config not found: {path}\nRun:  python3 manager.py discover <basedir>  to create one.")
+    with open(path) as f:
+        data = json.load(f)
+    insts = data.get("instances", [])
+    by_name = {}
+    for i in insts:
+        name = i["name"]
+        i.setdefault("launch_cmd", "./launch.sh")
+        i.setdefault("config_file", "config.json")
+        # stop_keys: list of tmux send-keys args. Default: Ctrl-C.
+        i.setdefault("stop_keys", ["C-c"])
+        i.setdefault("stop_timeout", 15)
+        i.setdefault("autostart", False)
+        by_name[name] = i
+    # settings block (theme + system-action gating)
+    s = data.setdefault("settings", {})
+    theme = s.setdefault("theme", {})
+    theme.setdefault("preset", "midnight")
+    theme.setdefault("accent", "")          # "" = use the preset's accent
+    s.setdefault("system_actions_enabled", False)
+    return {"raw": data, "instances": insts, "by_name": by_name, "path": path}
+
+
+def save_config(cfg):
+    with open(cfg["path"], "w") as f:
+        json.dump(cfg["raw"], f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# tmux helpers
+# ---------------------------------------------------------------------------
+
+def session_name(inst):
+    # Adopted instances pin to an existing tmux session via "session".
+    if inst.get("session"):
+        return inst["session"]
+    # tmux session names may contain hyphens; '.' and ':' are target separators.
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", inst["name"])
+    return SESSION_PREFIX + safe
+
+
+def tmux(*args, check=False):
+    p = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"tmux {' '.join(args)} failed: {p.stderr.strip()}")
+    return p
+
+
+def session_exists(s):
+    return tmux("has-session", "-t", s).returncode == 0
+
+
+def pane_dead(s):
+    p = tmux("list-panes", "-t", s, "-F", "#{pane_dead}")
+    return p.returncode == 0 and "1" in p.stdout.split()
+
+
+def instance_status(inst):
+    s = session_name(inst)
+    if not session_exists(s):
+        return "stopped"
+    return "crashed" if pane_dead(s) else "running"
+
+
+def start(inst):
+    s = session_name(inst)
+    if session_exists(s):
+        if pane_dead(s):
+            tmux("kill-session", "-t", s)
+        else:
+            return "already running"
+    d = inst["dir"]
+    if not os.path.isdir(d):
+        return f"error: dir not found: {d}"
+    cmd = inst["launch_cmd"]
+    tmux("new-session", "-d", "-s", s, "-c", d, "bash", "-lc", f"exec {cmd}", check=True)
+    # keep crash output visible after the process exits
+    tmux("set-option", "-t", s, "remain-on-exit", "on")
+    return "started"
+
+
+def stop(inst):
+    s = session_name(inst)
+    if not session_exists(s):
+        return "not running"
+    if not pane_dead(s):
+        for k in inst.get("stop_keys", ["C-c"]):
+            tmux("send-keys", "-t", s, k)
+        deadline = time.time() + int(inst.get("stop_timeout", 15))
+        while time.time() < deadline:
+            if not session_exists(s) or pane_dead(s):
+                break
+            time.sleep(0.4)
+    if session_exists(s):
+        tmux("kill-session", "-t", s)
+    return "stopped"
+
+
+def restart(inst):
+    stop(inst)
+    time.sleep(0.5)
+    return start(inst)
+
+
+def logs(inst, lines=300):
+    s = session_name(inst)
+    if not session_exists(s):
+        return "(not running)"
+    p = tmux("capture-pane", "-t", s, "-p", "-J", "-S", f"-{int(lines)}")
+    return p.stdout if p.returncode == 0 else f"(error reading logs: {p.stderr})"
+
+
+def send_command(inst, command):
+    """Type a command into the instance's live console (tmux pane stdin) and press Enter.
+    Returns a status string. Raises ValueError if not running."""
+    s = session_name(inst)
+    if not session_exists(s):
+        raise ValueError("instance is not running")
+    if pane_dead(s):
+        raise ValueError("instance has crashed; restart it before sending commands")
+    command = (command or "").rstrip("\n")
+    if command == "":
+        raise ValueError("empty command")
+    # -l sends the text literally (so 'C-c', spaces, etc. aren't read as key names);
+    # '--' stops option parsing so commands starting with '-' work; then Enter submits.
+    tmux("send-keys", "-t", s, "-l", "--", command)
+    tmux("send-keys", "-t", s, "Enter")
+    return "sent"
+
+
+def read_instance_config(inst):
+    path = os.path.join(inst["dir"], inst["config_file"])
+    if not os.path.exists(path):
+        return None, path
+    with open(path) as f:
+        return f.read(), path
+
+
+def write_instance_config(inst, text):
+    path = os.path.join(inst["dir"], inst["config_file"])
+    # validate JSON only if the target is a .json file
+    if path.endswith(".json"):
+        json.loads(text)
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# proxy quick-edit  (find host/port fields for IP-proxy instances)
+# ---------------------------------------------------------------------------
+
+_HOST_KEYS = ("host", "address", "ip", "server", "hostname")
+_PORT_KEYS = ("port",)
+
+
+def _find_proxy_paths(obj, base=None):
+    """Locate proxy host/port (and optional enabled/type) paths in a config object.
+    Returns dict of {host:[path], port:[path], enabled?:[path], type?:[path]} or None."""
+    base = base or []
+    if not isinstance(obj, dict):
+        return None
+    # 1) a nested object under a key containing 'proxy'
+    for k, v in obj.items():
+        if "proxy" in k.lower() and isinstance(v, dict):
+            host = next((kk for kk in v if kk.lower() in _HOST_KEYS), None)
+            port = next((kk for kk in v if kk.lower() in _PORT_KEYS), None)
+            if host and port:
+                out = {"host": base + [k, host], "port": base + [k, port]}
+                en = next((kk for kk in v if kk.lower() in ("enabled", "enable", "use")), None)
+                ty = next((kk for kk in v if kk.lower() in ("type", "kind", "protocol")), None)
+                if en: out["enabled"] = base + [k, en]
+                if ty: out["type"] = base + [k, ty]
+                return out
+    # 2) flat keys like proxyHost / proxyPort
+    fh = next((k for k in obj if "proxy" in k.lower() and any(h in k.lower() for h in _HOST_KEYS)), None)
+    fp = next((k for k in obj if "proxy" in k.lower() and "port" in k.lower()), None)
+    if fh and fp:
+        return {"host": base + [fh], "port": base + [fp]}
+    # 3) recurse into nested objects
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            r = _find_proxy_paths(v, base + [k])
+            if r:
+                return r
+    return None
+
+
+def _dig(obj, path):
+    for k in path:
+        obj = obj[k]
+    return obj
+
+
+def _set(obj, path, val):
+    for k in path[:-1]:
+        obj = obj[k]
+    obj[path[-1]] = val
+
+
+def get_proxy(inst):
+    """Return {found, host, port, enabled?, path?} for an instance, or {found:False}."""
+    text, _ = read_instance_config(inst)
+    if not text:
+        return {"found": False, "reason": "no config file"}
+    try:
+        cfg = json.loads(text)
+    except json.JSONDecodeError:
+        return {"found": False, "reason": "config not valid JSON"}
+    paths = _find_proxy_paths(cfg)
+    if not paths:
+        return {"found": False, "reason": "no proxy field"}
+    out = {"found": True,
+           "host": _dig(cfg, paths["host"]),
+           "port": _dig(cfg, paths["port"]),
+           "host_key": ".".join(map(str, paths["host"]))}
+    if "enabled" in paths:
+        out["enabled"] = bool(_dig(cfg, paths["enabled"]))
+    return out
+
+
+def set_proxy(inst, host=None, port=None, enabled=None):
+    """Update the proxy host/port/enabled in an instance's config. Returns updated values."""
+    text, _ = read_instance_config(inst)
+    if not text:
+        raise ValueError("no config file to edit")
+    cfg = json.loads(text)
+    paths = _find_proxy_paths(cfg)
+    if not paths:
+        raise ValueError("no proxy field found in this config")
+    if host is not None:
+        _set(cfg, paths["host"], str(host))
+    if port is not None:
+        _set(cfg, paths["port"], int(port))
+    if enabled is not None and "enabled" in paths:
+        _set(cfg, paths["enabled"], bool(enabled))
+    write_instance_config(inst, json.dumps(cfg, indent=2))
+    return get_proxy(inst)
+
+
+def list_proxies(cfg):
+    """Per-instance proxy summary for the quick-edit view."""
+    rows = []
+    for i in cfg["instances"]:
+        p = get_proxy(i)
+        rows.append({"name": i["name"], **p})
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# discover
+# ---------------------------------------------------------------------------
+
+def guess_launch_cmd(d):
+    """Best guess at a launch command for a directory, or None."""
+    if not os.path.isdir(d):
+        return None
+    for cand in ("launch", "launch.sh", "start.sh", "run.sh", "start", "run"):
+        if os.path.exists(os.path.join(d, cand)):
+            return f"./{cand}"
+    try:
+        jars = [f for f in os.listdir(d) if f.endswith(".jar")]
+    except OSError:
+        jars = []
+    if jars:
+        # prefer a jar that looks like AquariusProxy / ZenithProxy
+        jars.sort(key=lambda j: (0 if any(k in j.lower() for k in ("aquarius", "zenith")) else 1, j))
+        return f"java -jar {jars[0]} nogui"
+    return None
+
+
+def discover(basedir, out_path):
+    basedir = os.path.abspath(basedir)
+    found = []
+    for name in sorted(os.listdir(basedir)):
+        d = os.path.join(basedir, name)
+        if not os.path.isdir(d):
+            continue
+        launch = guess_launch_cmd(d)
+        if not launch:
+            continue
+        found.append({
+            "name": name,
+            "dir": d,
+            "launch_cmd": launch,
+            "config_file": "config.json",
+            "stop_keys": ["C-c"],
+            "stop_timeout": 15,
+        })
+    data = {"instances": found}
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Discovered {len(found)} instance(s) -> {out_path}")
+    for i in found:
+        print(f"  - {i['name']}  ({i['launch_cmd']})")
+    if not found:
+        print("Nothing found. Add instances manually to instances.json.")
+
+
+# ---------------------------------------------------------------------------
+# add / delete
+# ---------------------------------------------------------------------------
+
+VALID_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def add_instance(cfg, name, directory, launch_cmd=None, config_file=None,
+                 stop_keys=None, stop_timeout=None, autostart=False):
+    """Add a new instance to the config. Returns the new instance dict.
+    Raises ValueError on bad input or duplicate name."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    if not VALID_NAME.match(name):
+        raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
+    if name in cfg["by_name"]:
+        raise ValueError(f"instance '{name}' already exists")
+    directory = (directory or "").strip()
+    if not directory:
+        raise ValueError("dir is required")
+    directory = os.path.abspath(os.path.expanduser(directory))
+
+    inst = {
+        "name": name,
+        "dir": directory,
+        "launch_cmd": (launch_cmd or "./launch.sh").strip() or "./launch.sh",
+        "config_file": (config_file or "config.json").strip() or "config.json",
+        "stop_keys": stop_keys if stop_keys else ["C-c"],
+        "stop_timeout": int(stop_timeout) if stop_timeout else 15,
+        "autostart": bool(autostart),
+    }
+    cfg["raw"].setdefault("instances", []).append(inst)
+    cfg["instances"] = cfg["raw"]["instances"]
+    cfg["by_name"][name] = inst
+    save_config(cfg)
+    return inst
+
+
+def delete_instance(cfg, name, force=False):
+    """Remove an instance from the config. Stops it first if running.
+    Does NOT touch the instance's files on disk. Returns a status string."""
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError(f"no such instance: {name}")
+    st = instance_status(inst)
+    if st in ("running", "crashed"):
+        if not force:
+            raise ValueError(f"instance '{name}' is {st}; stop it first or use force")
+        stop(inst)
+    cfg["raw"]["instances"] = [i for i in cfg["raw"].get("instances", []) if i.get("name") != name]
+    cfg["instances"] = cfg["raw"]["instances"]
+    cfg["by_name"].pop(name, None)
+    save_config(cfg)
+    return f"deleted (was {st})"
+
+
+def set_autostart(cfg, name, enabled):
+    """Toggle whether an instance is launched by `boot`. Returns the new value."""
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError(f"no such instance: {name}")
+    inst["autostart"] = bool(enabled)
+    save_config(cfg)
+    return inst["autostart"]
+
+
+SETTABLE_FIELDS = ("launch_cmd", "dir", "config_file", "stop_timeout")
+
+
+def set_field(cfg, name, field, value):
+    """Edit one editable attribute of an instance. Applies to all if name=='all'."""
+    if field not in SETTABLE_FIELDS:
+        raise ValueError(f"field must be one of: {', '.join(SETTABLE_FIELDS)}")
+    targets = cfg["instances"] if name == "all" else (
+        [cfg["by_name"][name]] if name in cfg["by_name"] else None)
+    if targets is None:
+        raise ValueError(f"no such instance: {name}")
+    if field == "stop_timeout":
+        value = int(value)
+    elif field == "dir":
+        value = os.path.abspath(os.path.expanduser(str(value)))
+    else:
+        value = str(value)
+    for inst in targets:
+        inst[field] = value
+    save_config(cfg)
+    return [(i["name"], i[field]) for i in targets]
+
+
+def boot(cfg):
+    """Start every instance flagged autostart=true. Idempotent (skips running ones).
+    Intended to be run once at host boot via a systemd oneshot unit.
+    Returns a dict of name -> result."""
+    results = {}
+    for inst in cfg["instances"]:
+        if not inst.get("autostart"):
+            continue
+        st = instance_status(inst)
+        if st == "running":
+            results[inst["name"]] = "already running"
+        else:
+            results[inst["name"]] = start(inst)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# scan / adopt  (detect already-running tmux sessions)
+# ---------------------------------------------------------------------------
+
+def _proc_args(pid):
+    """Full command line of pid and its immediate children, best-effort."""
+    out = []
+    try:
+        r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                           capture_output=True, text=True)
+        if r.stdout.strip():
+            out.append(r.stdout.strip())
+        r = subprocess.run(["ps", "-o", "args=", "--ppid", str(pid)],
+                           capture_output=True, text=True)
+        out.extend(l.strip() for l in r.stdout.splitlines() if l.strip())
+    except Exception:
+        pass
+    return " ".join(out)
+
+
+def list_tmux_sessions():
+    """All live tmux sessions with the active pane's path/command/pid."""
+    sessions = []
+    r = tmux("list-sessions", "-F", "#{session_name}")
+    if r.returncode != 0:
+        return sessions  # no server / no sessions
+    for s in (l for l in r.stdout.splitlines() if l):
+        info = tmux("display-message", "-p", "-t", s,
+                    "#{pane_current_path}\t#{pane_current_command}\t#{pane_pid}")
+        path = cmd = ""
+        pid = None
+        if info.returncode == 0 and "\t" in info.stdout:
+            parts = info.stdout.strip("\n").split("\t")
+            path = parts[0] if len(parts) > 0 else ""
+            cmd = parts[1] if len(parts) > 1 else ""
+            try:
+                pid = int(parts[2]) if len(parts) > 2 else None
+            except ValueError:
+                pid = None
+        sessions.append({"session": s, "path": path, "command": cmd, "pid": pid})
+    return sessions
+
+
+def _looks_like_proxy(sess):
+    """Heuristic: is this tmux session likely an Aquarius/Zenith proxy? -> (bool, reason)."""
+    cmd = (sess.get("command") or "").lower()
+    path = (sess.get("path") or "")
+    args = _proc_args(sess["pid"]).lower() if sess.get("pid") else ""
+    if any(k in path.lower() or k in args for k in ("aquarius", "zenith")):
+        return True, "aquarius/zenith in path/args"
+    if cmd == "java" or " -jar " in args or args.startswith("java"):
+        return True, "java process"
+    if guess_launch_cmd(path):
+        return True, "launcher/jar in dir"
+    return False, "no proxy signal"
+
+
+def managed_sessions(cfg):
+    return {session_name(i) for i in cfg["instances"]}
+
+
+def scan(cfg):
+    """Return unmanaged tmux sessions, flagged by likelihood of being a proxy."""
+    managed = managed_sessions(cfg)
+    out = []
+    for s in list_tmux_sessions():
+        if s["session"] in managed:
+            continue
+        likely, reason = _looks_like_proxy(s)
+        out.append({
+            "session": s["session"],
+            "path": s["path"],
+            "command": s["command"],
+            "likely_proxy": likely,
+            "reason": reason,
+            "suggested_launch": guess_launch_cmd(s["path"]) or "./launch.sh",
+        })
+    # likely proxies first
+    out.sort(key=lambda x: (not x["likely_proxy"], x["session"]))
+    return out
+
+
+def adopt_session(cfg, session, name=None, launch_cmd=None, config_file=None,
+                  stop_keys=None, stop_timeout=None, autostart=False):
+    """Adopt an existing tmux session as a managed instance pinned to it."""
+    session = (session or "").strip()
+    if not session:
+        raise ValueError("session is required")
+    live = {s["session"]: s for s in list_tmux_sessions()}
+    if session not in live:
+        raise ValueError(f"no live tmux session named '{session}'")
+    if session in managed_sessions(cfg):
+        raise ValueError(f"session '{session}' is already managed")
+
+    name = (name or session).strip()
+    if not VALID_NAME.match(name):
+        raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
+    if name in cfg["by_name"]:
+        raise ValueError(f"instance name '{name}' already exists")
+
+    path = live[session]["path"] or ""
+    inst = {
+        "name": name,
+        "dir": os.path.abspath(path) if path else "",
+        "launch_cmd": (launch_cmd or "").strip() or guess_launch_cmd(path) or "./launch.sh",
+        "config_file": (config_file or "config.json").strip() or "config.json",
+        "stop_keys": stop_keys if stop_keys else ["C-c"],
+        "stop_timeout": int(stop_timeout) if stop_timeout else 15,
+        "session": session,
+        "autostart": bool(autostart),
+    }
+    cfg["raw"].setdefault("instances", []).append(inst)
+    cfg["instances"] = cfg["raw"]["instances"]
+    cfg["by_name"][name] = inst
+    save_config(cfg)
+    return inst
+
+
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+
+# AquariusProxy / ZenithProxy config schema (baseline for the hybrid editor; see schema.py source)
+ZENITH_SCHEMA = {'Connection': {'client.connection': {'_label': 'Client Connection', 'autoConnect': {'type': 'bool'}, 'proxy.enabled': {'type': 'bool', 'label': 'Proxy enabled'}, 'proxy.type': {'type': 'enum', 'options': ['SOCKS5', 'SOCKS4', 'HTTP']}, 'proxy.host': {'type': 'string'}, 'proxy.port': {'type': 'int', 'min': 0, 'max': 65535}, 'proxy.user': {'type': 'string'}, 'proxy.password': {'type': 'string', 'secret': True}, 'timeout': {'type': 'int', 'unit': 's'}}, 'server': {'_label': 'Destination Server', 'address': {'type': 'string'}, 'port': {'type': 'int', 'min': 0, 'max': 65535}}}, 'Core Modules': {'autoReconnect': {'enabled': {'type': 'bool'}, 'delay': {'type': 'int', 'unit': 's', 'min': 0, 'max': 300}, 'maxAttempts': {'type': 'int', 'min': 0, 'max': 999}}, 'autoEat': {'enabled': {'type': 'bool'}, 'health': {'type': 'int', 'min': 0, 'max': 20}, 'hunger': {'type': 'int', 'min': 0, 'max': 20}, 'warning': {'type': 'bool'}, 'allowUnsafeFood': {'type': 'bool'}, 'mode': {'type': 'enum', 'options': ['all', 'whitelist', 'blacklist']}}, 'autoTotem': {'enabled': {'type': 'bool'}, 'inGame': {'type': 'bool'}, 'health': {'type': 'int', 'min': 0, 'max': 20}, 'popAlert': {'type': 'bool'}, 'noTotemsAlert': {'type': 'bool'}}, 'autoRespawn': {'enabled': {'type': 'bool'}, 'delay': {'type': 'int', 'unit': 'ms', 'min': 0, 'max': 10000}}, 'autoArmor': {'enabled': {'type': 'bool'}}, 'autoMend': {'enabled': {'type': 'bool'}}}, 'AFK & Anti-Kick': {'antiAFK': {'enabled': {'type': 'bool'}, 'rotate': {'type': 'bool'}, 'swing': {'type': 'bool'}, 'walk': {'type': 'bool'}, 'safeWalk': {'type': 'bool'}, 'jump': {'type': 'bool'}, 'sneak': {'type': 'bool'}, 'walkDistance': {'type': 'int', 'unit': 'ticks', 'min': 0, 'max': 100}}, 'antiKick': {'enabled': {'type': 'bool'}, 'playerInactivityKickMins': {'type': 'int', 'unit': 'min', 'min': 0, 'max': 120}, 'minWalkDistance': {'type': 'int', 'unit': 'blocks', 'min': 0, 'max': 50}}, 'sessionTimeLimit': {'enabled': {'type': 'bool'}}}, 'Combat': {'killAura': {'enabled': {'type': 'bool'}, 'attackDelay': {'type': 'int', 'unit': 'ticks', 'min': 0, 'max': 100}, 'tpsSync': {'type': 'bool'}, 'targetPlayers': {'type': 'bool'}, 'targetHostileMobs': {'type': 'bool'}, 'targetNeutralMobs': {'type': 'bool'}, 'targetCustom': {'type': 'bool'}, 'weaponSwitch': {'type': 'bool'}, 'weaponType': {'type': 'enum', 'options': ['any', 'sword', 'axe']}, 'weaponMaterial': {'type': 'enum', 'options': ['any', 'diamond', 'netherite']}, 'raycast': {'type': 'bool'}, 'priority': {'type': 'enum', 'options': ['none', 'nearest']}}, 'spawnPatrol': {'enabled': {'type': 'bool'}, 'maxPatrolRange': {'type': 'int', 'unit': 'blocks', 'min': 0, 'max': 5000}, 'targetOnlyNakeds': {'type': 'bool'}, 'targetAttackers': {'type': 'bool'}, 'nether': {'type': 'bool'}}, 'spook': {'enabled': {'type': 'bool'}, 'mode': {'type': 'enum', 'options': ['visualRange', 'nearest']}}}, 'Auto Disconnect': {'autoDisconnect': {'enabled': {'type': 'bool'}, 'health': {'type': 'int', 'min': 0, 'max': 20}, 'thunder': {'type': 'bool'}, 'unknownPlayer': {'type': 'bool'}, 'totemPop': {'type': 'bool'}, 'whilePlayerConnected': {'type': 'bool'}, 'autoClientDisconnect': {'type': 'bool'}, 'cancelAutoReconnect': {'type': 'bool'}}}, 'Chat & Spam': {'spammer': {'enabled': {'type': 'bool'}, 'whisper': {'type': 'bool'}, 'whilePlayerConnected': {'type': 'bool'}, 'delayTicks': {'type': 'int', 'unit': 'ticks', 'min': 0, 'max': 2000}, 'randomOrder': {'type': 'bool'}, 'appendRandom': {'type': 'bool'}, 'messages': {'type': 'list'}}, 'autoReply': {'enabled': {'type': 'bool'}, 'cooldown': {'type': 'int', 'unit': 's', 'min': 0, 'max': 600}, 'message': {'type': 'string'}}, 'extraChat': {'enabled': {'type': 'bool'}, 'hideChat': {'type': 'bool'}, 'hideWhispers': {'type': 'bool'}, 'hideDeathMessages': {'type': 'bool'}, 'insertClickableLinks': {'type': 'bool'}}, 'chatRelay': {'enabled': {'type': 'bool'}, 'channel': {'type': 'string', 'label': 'Channel ID'}, 'connectionMessages': {'type': 'bool'}, 'whispers': {'type': 'bool'}, 'publicChat': {'type': 'bool'}, 'deathMessages': {'type': 'bool'}, 'whisperMentions': {'type': 'bool'}, 'nameMentions': {'type': 'bool'}, 'sendMessages': {'type': 'bool'}}}, 'Visual Range': {'visualRange': {'enabled': {'type': 'bool'}, 'enter': {'type': 'bool'}, 'leave': {'type': 'bool'}, 'logout': {'type': 'bool'}, 'ignoreFriends': {'type': 'bool'}, 'replayRecording': {'type': 'bool'}}, 'stalk': {'enabled': {'type': 'bool'}}}, 'Discord': {'discord': {'enabled': {'type': 'bool'}, 'channel': {'type': 'string', 'label': 'Channel ID'}, 'token': {'type': 'string', 'secret': True}, 'role': {'type': 'string', 'label': 'Role ID'}, 'manageProfileImage': {'type': 'bool'}, 'manageNickname': {'type': 'bool'}, 'manageDescription': {'type': 'bool'}, 'managePresence': {'type': 'bool'}, 'ignoreOtherBots': {'type': 'bool'}}}, 'Advanced': {'tickRate': {'rate': {'type': 'float', 'min': 0.1, 'max': 5.0, 'step': 0.1}}, 'actionLimiter': {'enabled': {'type': 'bool'}, 'allowMovement': {'type': 'bool'}, 'movementDistance': {'type': 'int', 'unit': 'blocks', 'min': 0, 'max': 1000}, 'allowInventory': {'type': 'bool'}, 'allowBlockBreaking': {'type': 'bool'}, 'allowChat': {'type': 'bool'}}, 'rateLimiter': {'login': {'type': 'bool'}, 'packet': {'type': 'bool'}}}}
+
+
+THEME_PRESETS = {
+    "midnight":  {"bg": "#0a0e12", "panel": "#11171e", "accent": "#3ddc97"},
+    "ember":     {"bg": "#120c0a", "panel": "#1d1411", "accent": "#ff7a45"},
+    "ice":       {"bg": "#0a0f14", "panel": "#101820", "accent": "#5cc8ff"},
+    "amethyst":  {"bg": "#0e0a14", "panel": "#17111f", "accent": "#b388ff"},
+    "paper":     {"bg": "#f4f1ea", "panel": "#fffdf7", "accent": "#1f7a55"},
+}
+HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def get_settings(cfg):
+    s = cfg["raw"].get("settings", {})
+    return {
+        "theme": {
+            "preset": s.get("theme", {}).get("preset", "midnight"),
+            "accent": s.get("theme", {}).get("accent", ""),
+        },
+        "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
+        "presets": THEME_PRESETS,
+    }
+
+
+def save_settings(cfg, theme=None, system_actions_enabled=None):
+    s = cfg["raw"].setdefault("settings", {})
+    if theme is not None:
+        t = s.setdefault("theme", {})
+        if "preset" in theme:
+            p = theme["preset"]
+            if p not in THEME_PRESETS:
+                raise ValueError(f"unknown theme preset: {p}")
+            t["preset"] = p
+        if "accent" in theme:
+            a = (theme["accent"] or "").strip()
+            if a and not HEX_RE.match(a):
+                raise ValueError("accent must be a hex color like #3ddc97")
+            t["accent"] = a
+    if system_actions_enabled is not None:
+        s["system_actions_enabled"] = bool(system_actions_enabled)
+    save_config(cfg)
+    return get_settings(cfg)
+
+
+# ---------------------------------------------------------------------------
+# system actions  (run locally on the VPS via sudo; off by default)
+# ---------------------------------------------------------------------------
+
+SYSTEM_COMMANDS = {
+    "update": ["sudo", "-n", "sh", "-c",
+               "DEBIAN_FRONTEND=noninteractive apt-get update "
+               "&& DEBIAN_FRONTEND=noninteractive apt-get -y upgrade"],
+}
+SYSTEM_COMMANDS_OVERRIDE = {}  # for testing without touching the box
+
+
+def _sysinfo():
+    """Read-only snapshot of the host. Best-effort; missing pieces -> None."""
+    info = {}
+    try:
+        info["cpus"] = os.cpu_count()
+    except Exception:
+        info["cpus"] = None
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mem[k.strip()] = int(v.strip().split()[0]) * 1024
+        total = mem.get("MemTotal")
+        avail = mem.get("MemAvailable")
+        info["mem_total"] = total
+        info["mem_used"] = (total - avail) if (total and avail) else None
+    except Exception:
+        info["mem_total"] = info["mem_used"] = None
+    try:
+        st = os.statvfs("/")
+        info["disk_total"] = st.f_blocks * st.f_frsize
+        info["disk_used"] = (st.f_blocks - st.f_bfree) * st.f_frsize
+    except Exception:
+        info["disk_total"] = info["disk_used"] = None
+    try:
+        info["load"] = list(os.getloadavg())
+    except Exception:
+        info["load"] = None
+    try:
+        with open("/proc/uptime") as f:
+            info["uptime_sec"] = int(float(f.read().split()[0]))
+    except Exception:
+        info["uptime_sec"] = None
+    info["os"] = None
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    info["os"] = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except Exception:
+        pass
+    info["tmux_sessions"] = len(list_tmux_sessions())
+    return info
+
+
+class SystemJob:
+    """Tracks the single in-flight system job (e.g. OS update)."""
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.name = None
+        self.status = "idle"      # idle | running | done | error
+        self.lines = []
+        self.started = None
+        self.finished = None
+
+    def snapshot(self, tail=400):
+        with self.lock:
+            return {
+                "name": self.name, "status": self.status,
+                "started": self.started, "finished": self.finished,
+                "output": "".join(self.lines[-tail:]),
+            }
+
+    def start(self, name, argv):
+        import threading
+        with self.lock:
+            if self.status == "running":
+                raise ValueError(f"a system job ({self.name}) is already running")
+            self.name = name
+            self.status = "running"
+            self.lines = []
+            self.started = time.time()
+            self.finished = None
+        threading.Thread(target=self._run, args=(argv,), daemon=True).start()
+
+    def _run(self, argv):
+        try:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in p.stdout:
+                with self.lock:
+                    self.lines.append(line)
+            p.wait()
+            with self.lock:
+                self.status = "done" if p.returncode == 0 else "error"
+                self.lines.append(f"\n[exit code {p.returncode}]\n")
+                self.finished = time.time()
+        except Exception as e:
+            with self.lock:
+                self.status = "error"
+                self.lines.append(f"\n[failed to run: {e}]\n")
+                self.finished = time.time()
+
+
+SYS_JOB = SystemJob()
+
+
+def run_system_action(cfg, action):
+    if not get_settings(cfg)["system_actions_enabled"]:
+        raise PermissionError("system actions are disabled (enable them in Settings)")
+    if action == "reboot":
+        cmd = SYSTEM_COMMANDS_OVERRIDE.get("reboot", ["sudo", "-n", "reboot"])
+        delayed = ["sh", "-c", f"sleep 2; {' '.join(cmd)}"]
+        subprocess.Popen(delayed, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True, "action": "reboot",
+                "note": "rebooting in ~2s; the manager goes down with the host"}
+    if action == "update":
+        cmd = SYSTEM_COMMANDS_OVERRIDE.get("update", SYSTEM_COMMANDS["update"])
+        SYS_JOB.start("update", cmd)
+        return {"ok": True, "action": "update",
+                "note": "OS update started; poll /api/system/job for output"}
+    raise ValueError(f"unknown system action: {action}")
+
+
+# ---------------------------------------------------------------------------
+# auth: password hashing + sessions
+# ---------------------------------------------------------------------------
+# Password is stored in settings.auth as {user, salt, hash} where
+# hash = PBKDF2-HMAC-SHA256(password, salt). Never plaintext.
+# Sessions are in-memory: token -> expiry epoch. Cookie is HttpOnly.
+
+_SESSIONS = {}                       # token -> {"exp": epoch, "gen": session_epoch}
+SESSION_TTL = 7 * 24 * 3600          # 7 days
+_LOGIN_FAILS = {}                    # ip -> [timestamps] for rate limiting
+PBKDF2_ROUNDS = 200_000
+
+
+def _hash_password(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt),
+                               PBKDF2_ROUNDS).hex()
+
+
+def session_epoch(cfg):
+    """Generation counter; bumping it invalidates all existing sessions across processes."""
+    return int(cfg["raw"].get("settings", {}).get("session_epoch", 0))
+
+
+def bump_session_epoch(cfg):
+    s = cfg["raw"].setdefault("settings", {})
+    s["session_epoch"] = session_epoch(cfg) + 1
+    save_config(cfg)
+    return s["session_epoch"]
+
+
+def set_password(cfg, username, password):
+    if not username or not password:
+        raise ValueError("username and password are required")
+    if len(password) < 6:
+        raise ValueError("password must be at least 6 characters")
+    salt = secrets.token_hex(16)
+    cfg["raw"].setdefault("settings", {})["auth"] = {
+        "user": username,
+        "salt": salt,
+        "hash": _hash_password(password, salt),
+    }
+    # invalidate all sessions everywhere (including a separate running server)
+    cfg["raw"]["settings"]["session_epoch"] = session_epoch(cfg) + 1
+    save_config(cfg)
+    _SESSIONS.clear()
+
+
+def auth_configured(cfg):
+    a = cfg["raw"].get("settings", {}).get("auth")
+    return bool(a and a.get("hash") and a.get("salt"))
+
+
+def verify_password(cfg, username, password):
+    a = cfg["raw"].get("settings", {}).get("auth")
+    if not a:
+        return False
+    if username != a.get("user"):
+        return False
+    calc = _hash_password(password, a["salt"])
+    return hmac.compare_digest(calc, a["hash"])
+
+
+def _new_session(gen=0):
+    tok = secrets.token_urlsafe(32)
+    _SESSIONS[tok] = {"exp": time.time() + SESSION_TTL, "gen": gen}
+    return tok
+
+
+def _session_valid(tok, gen=0):
+    s = _SESSIONS.get(tok)
+    if not s:
+        return False
+    if time.time() > s["exp"] or s.get("gen", 0) != gen:
+        _SESSIONS.pop(tok, None)
+        return False
+    return True
+
+
+def _rate_limited(ip):
+    """Allow at most 5 failed logins per 5 minutes per ip."""
+    now = time.time()
+    fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < 300]
+    _LOGIN_FAILS[ip] = fails
+    return len(fails) >= 5
+
+
+def _record_fail(ip):
+    _LOGIN_FAILS.setdefault(ip, []).append(time.time())
+
+
+# ---------------------------------------------------------------------------
+# Web server
+# ---------------------------------------------------------------------------
+
+# Legacy basic-auth env vars (still honored as a fallback if no password set).
+# ZP_USER / ZP_PASS are also accepted for backward compatibility.
+ABM_USER = os.environ.get("ABM_USER") or os.environ.get("ZP_USER")
+ABM_PASS = os.environ.get("ABM_PASS") or os.environ.get("ZP_PASS")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "AquariusBotManager"
+    cfg_path = DEFAULT_CONFIG
+
+    def log_message(self, *a):
+        pass  # quiet
+
+    # ---- auth ----
+    def _cookie_token(self):
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            part = part.strip()
+            if part.startswith("abm_session="):
+                return part[len("abm_session="):]
+        return None
+
+    def _auth_required(self, cfg):
+        # Auth is enforced if a password has been set, or legacy env creds exist.
+        return auth_configured(cfg) or bool(ABM_USER and ABM_PASS)
+
+    def _auth_ok(self, cfg):
+        if not self._auth_required(cfg):
+            return True
+        tok = self._cookie_token()
+        if tok and _session_valid(tok, session_epoch(cfg)):
+            return True
+        # legacy basic-auth fallback (e.g. behind a tunnel without a set password)
+        if ABM_USER and ABM_PASS:
+            h = self.headers.get("Authorization", "")
+            if h.startswith("Basic "):
+                try:
+                    u, p = base64.b64decode(h[6:]).decode().split(":", 1)
+                    if u == ABM_USER and p == ABM_PASS:
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _client_ip(self):
+        return self.client_address[0] if self.client_address else "?"
+
+    def _set_session_cookie(self, token, clear=False):
+        if clear:
+            self.send_header("Set-Cookie",
+                             "abm_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+        else:
+            self.send_header("Set-Cookie",
+                             f"abm_session={token}; Path=/; HttpOnly; SameSite=Strict; "
+                             f"Max-Age={SESSION_TTL}")
+
+    # ---- helpers ----
+    def _json(self, obj, code=200, cookie=None, clear_cookie=False):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if cookie is not None or clear_cookie:
+            self._set_session_cookie(cookie, clear=clear_cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, text, code=200):
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(n) if n else b""
+
+    def _cfg(self):
+        return load_config(self.cfg_path)
+
+    def _find(self, cfg, name):
+        return cfg["by_name"].get(name)
+
+    # ---- routing ----
+    def do_GET(self):
+        u = urlparse(self.path)
+        path = u.path
+        q = parse_qs(u.query)
+        cfg = self._cfg()
+
+        # whether auth is on, expose it so the login page can decide what to show
+        if path == "/api/authstatus":
+            return self._json({"required": self._auth_required(cfg),
+                               "authed": self._auth_ok(cfg)})
+
+        if not self._auth_ok(cfg):
+            # unauthenticated: only the login page and its check are reachable
+            if path in ("/", "/index.html", "/login"):
+                return self._html(LOGIN_PAGE)
+            return self._json({"error": "unauthorized"}, 401)
+
+        if path == "/" or path == "/index.html":
+            return self._html(PAGE)
+
+        if path == "/logout":
+            tok = self._cookie_token()
+            if tok:
+                _SESSIONS.pop(tok, None)
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self._set_session_cookie(None, clear=True)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if path == "/api/scan":
+            return self._json({"sessions": scan(self._cfg())})
+
+        if path == "/api/proxies":
+            return self._json({"proxies": list_proxies(self._cfg())})
+
+        if path == "/api/schema":
+            return self._json({"schema": ZENITH_SCHEMA})
+
+        if path == "/api/settings":
+            return self._json(get_settings(self._cfg()))
+
+        if path == "/api/system/info":
+            return self._json(_sysinfo())
+
+        if path == "/api/system/job":
+            return self._json(SYS_JOB.snapshot())
+
+        if path == "/api/instances":
+            cfg = self._cfg()
+            out = []
+            for i in cfg["instances"]:
+                out.append({
+                    "name": i["name"],
+                    "dir": i["dir"],
+                    "launch_cmd": i["launch_cmd"],
+                    "status": instance_status(i),
+                    "autostart": bool(i.get("autostart")),
+                })
+            return self._json({"instances": out})
+
+        m = re.match(r"^/api/instances/([^/]+)/logs$", path)
+        if m:
+            cfg = self._cfg()
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            lines = int(q.get("lines", ["300"])[0])
+            return self._json({"logs": logs(inst, lines)})
+
+        m = re.match(r"^/api/instances/([^/]+)/config$", path)
+        if m:
+            cfg = self._cfg()
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            text, p = read_instance_config(inst)
+            return self._json({"path": p, "exists": text is not None, "config": text or ""})
+
+        return self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        cfg = self._cfg()
+
+        # login is the one POST reachable without a session
+        if path == "/api/login":
+            ip = self._client_ip()
+            if _rate_limited(ip):
+                return self._json({"error": "too many attempts, wait a few minutes"}, 429)
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            user = p.get("username", "")
+            pw = p.get("password", "")
+            ok = verify_password(cfg, user, pw) if auth_configured(cfg) else (
+                bool(ABM_USER) and user == ABM_USER and pw == ABM_PASS)
+            if not ok:
+                _record_fail(ip)
+                return self._json({"error": "invalid credentials"}, 401)
+            return self._json({"ok": True}, cookie=_new_session(session_epoch(cfg)))
+
+        if not self._auth_ok(cfg):
+            return self._json({"error": "unauthorized"}, 401)
+
+        # bulk actions
+        m = re.match(r"^/api/(start|stop|restart)_all$", path)
+        if m:
+            action = {"start": start, "stop": stop, "restart": restart}[m.group(1)]
+            results = {i["name"]: action(i) for i in cfg["instances"]}
+            return self._json({"results": results})
+
+        # save settings (theme / system toggle)
+        if path == "/api/settings":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                out = save_settings(cfg, theme=p.get("theme"),
+                                    system_actions_enabled=p.get("system_actions_enabled"))
+                return self._json({"ok": True, "settings": out})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # system actions (reboot / update) — gated by settings + auth
+        m = re.match(r"^/api/system/(reboot|update)$", path)
+        if m:
+            try:
+                return self._json(run_system_action(cfg, m.group(1)))
+            except PermissionError as e:
+                return self._json({"error": str(e)}, 403)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 409)
+
+        # adopt an existing tmux session
+        if path == "/api/adopt":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                sk = p.get("stop_keys")
+                if isinstance(sk, str):
+                    sk = [s for s in sk.split(",") if s.strip()]
+                inst = adopt_session(
+                    cfg, p.get("session"), name=p.get("name"),
+                    launch_cmd=p.get("launch_cmd"), config_file=p.get("config_file"),
+                    stop_keys=sk, stop_timeout=p.get("stop_timeout"),
+                )
+                return self._json({"ok": True, "instance": {
+                    "name": inst["name"], "dir": inst["dir"],
+                    "launch_cmd": inst["launch_cmd"], "status": instance_status(inst),
+                }})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # add a new instance
+        if path == "/api/instances/add":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                sk = p.get("stop_keys")
+                if isinstance(sk, str):
+                    sk = [s for s in sk.split(",") if s.strip()]
+                inst = add_instance(
+                    cfg, p.get("name"), p.get("dir"),
+                    launch_cmd=p.get("launch_cmd"), config_file=p.get("config_file"),
+                    stop_keys=sk, stop_timeout=p.get("stop_timeout"),
+                )
+                return self._json({"ok": True, "instance": {
+                    "name": inst["name"], "dir": inst["dir"],
+                    "launch_cmd": inst["launch_cmd"], "status": instance_status(inst),
+                }})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # delete an instance
+        m = re.match(r"^/api/instances/([^/]+)/delete$", path)
+        if m:
+            try:
+                body = self._read_body()
+                force = bool(json.loads(body).get("force")) if body else False
+            except Exception:
+                force = False
+            try:
+                result = delete_instance(cfg, m.group(1), force=force)
+                return self._json({"ok": True, "result": result})
+            except ValueError as e:
+                # 409 = conflict (running, needs force); 404 = missing
+                code = 404 if str(e).startswith("no such") else 409
+                return self._json({"error": str(e)}, code)
+
+        # per-instance action
+        m = re.match(r"^/api/instances/([^/]+)/(start|stop|restart)$", path)
+        if m:
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            action = {"start": start, "stop": stop, "restart": restart}[m.group(2)]
+            return self._json({"result": action(inst), "status": instance_status(inst)})
+
+        # update proxy host/port
+        m = re.match(r"^/api/instances/([^/]+)/proxy$", path)
+        if m:
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                res = set_proxy(inst, host=p.get("host"), port=p.get("port"),
+                                enabled=p.get("enabled"))
+                return self._json({"ok": True, "proxy": res})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 409)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # send a command into the live console
+        m = re.match(r"^/api/instances/([^/]+)/command$", path)
+        if m:
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                return self._json({"ok": True, "result": send_command(inst, p.get("command", ""))})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 409)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # toggle autostart
+        m = re.match(r"^/api/instances/([^/]+)/autostart$", path)
+        if m:
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                val = set_autostart(cfg, m.group(1), bool(p.get("enabled")))
+                return self._json({"ok": True, "autostart": val})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 404)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # save instance config
+        m = re.match(r"^/api/instances/([^/]+)/config$", path)
+        if m:
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            try:
+                payload = json.loads(self._read_body() or b"{}")
+                p = write_instance_config(inst, payload.get("config", ""))
+                return self._json({"ok": True, "path": p})
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid JSON: {e}"}, 400)
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+
+        return self._json({"error": "not found"}, 404)
+
+
+def serve(cfg_path, host, port):
+    Handler.cfg_path = cfg_path
+    cfg = load_config(cfg_path)  # validate early
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    if auth_configured(cfg):
+        auth = "ON (login required)"
+    elif ABM_USER and ABM_PASS:
+        auth = "ON (basic auth env)"
+    else:
+        auth = "OFF — run `manager.py setpassword`, or keep this bound to 127.0.0.1"
+    print(f"AquariusBotManager serving http://{host}:{port}   auth: {auth}")
+    if host not in ("127.0.0.1", "localhost", "::1") and auth.startswith("OFF"):
+        print("WARNING: listening on a non-local address with NO auth. Anyone who can reach "
+              f"{host}:{port} has full control. Set a password or bind to 127.0.0.1.")
+    print(f"config: {cfg_path}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def targets(cfg, name):
+    if name == "all":
+        return cfg["instances"]
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        die(f"no such instance: {name}")
+    return [inst]
+
+
+def cli_status(cfg):
+    width = max((len(i["name"]) for i in cfg["instances"]), default=4)
+    for i in cfg["instances"]:
+        print(f"{i['name']:<{width}}  {instance_status(i)}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="manager.py")
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("serve")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8765)
+
+    sub.add_parser("list")
+    sub.add_parser("status")
+    for c in ("start", "stop", "restart"):
+        p = sub.add_parser(c)
+        p.add_argument("name")
+    p = sub.add_parser("logs")
+    p.add_argument("name")
+    p.add_argument("--lines", type=int, default=300)
+
+    p = sub.add_parser("send", help="send a command to an instance's live console")
+    p.add_argument("name")
+    p.add_argument("command", nargs="+", help="the command (quote it or pass as words)")
+    p = sub.add_parser("discover")
+    p.add_argument("basedir")
+
+    p = sub.add_parser("add")
+    p.add_argument("name")
+    p.add_argument("dir")
+    p.add_argument("--launch-cmd", default=None)
+    p.add_argument("--config-file", default=None)
+    p.add_argument("--stop-keys", default=None, help="comma-separated tmux keys, e.g. 'stop,Enter'")
+    p.add_argument("--stop-timeout", type=int, default=None)
+    p.add_argument("--autostart", action="store_true", help="launch on `boot`")
+
+    p = sub.add_parser("delete")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true", help="stop it first if running")
+
+    sub.add_parser("scan")
+
+    sub.add_parser("proxies", help="list each instance's proxy host:port")
+
+    p = sub.add_parser("proxy", help="view or set an instance's proxy host/port")
+    p.add_argument("name")
+    p.add_argument("--host", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--enable", dest="p_enable", action="store_true")
+    p.add_argument("--disable", dest="p_disable", action="store_true")
+
+    p = sub.add_parser("set", help="edit an instance field (name or 'all')")
+    p.add_argument("name")
+    p.add_argument("field", choices=SETTABLE_FIELDS)
+    p.add_argument("value")
+
+    p = sub.add_parser("adopt")
+    p.add_argument("session", help="existing tmux session name")
+    p.add_argument("--name", default=None, help="instance name (default: session name)")
+    p.add_argument("--launch-cmd", default=None)
+    p.add_argument("--config-file", default=None)
+    p.add_argument("--stop-keys", default=None, help="comma-separated tmux keys")
+    p.add_argument("--stop-timeout", type=int, default=None)
+    p.add_argument("--autostart", action="store_true", help="launch on `boot`")
+
+    p = sub.add_parser("autostart", help="enable/disable autostart for an instance")
+    p.add_argument("name")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--on", dest="on", action="store_true")
+    g.add_argument("--off", dest="off", action="store_true")
+
+    sub.add_parser("boot", help="start all autostart instances (run at host boot)")
+
+    sub.add_parser("sysinfo")
+
+    p = sub.add_parser("setpassword", help="set the web UI login (username + password)")
+    p.add_argument("--user", default=None, help="username (prompts if omitted)")
+    p.add_argument("--password", default=None, help="password (prompts if omitted; safer to omit)")
+
+    sub.add_parser("logout-all", help="invalidate all active web sessions")
+
+    p = sub.add_parser("settings")
+    p.add_argument("--theme", default=None, help="preset name: " + ", ".join(THEME_PRESETS))
+    p.add_argument("--accent", default=None, help="hex accent, e.g. #3ddc97")
+    p.add_argument("--enable-system", dest="enable_system", action="store_true")
+    p.add_argument("--disable-system", dest="disable_system", action="store_true")
+
+    sub.add_parser("update")   # OS update (requires system actions enabled)
+    sub.add_parser("reboot")   # reboot the host (requires system actions enabled)
+
+    args = ap.parse_args()
+
+    if args.cmd == "serve":
+        return serve(args.config, args.host, args.port)
+    if args.cmd == "discover":
+        return discover(args.basedir, args.config)
+
+    cfg = load_config(args.config)
+
+    if args.cmd == "list":
+        for i in cfg["instances"]:
+            print(f"{i['name']}\t{i['dir']}\t{i['launch_cmd']}")
+    elif args.cmd == "status":
+        cli_status(cfg)
+    elif args.cmd in ("start", "stop", "restart"):
+        action = {"start": start, "stop": stop, "restart": restart}[args.cmd]
+        for i in targets(cfg, args.name):
+            print(f"{i['name']}: {action(i)}")
+    elif args.cmd == "logs":
+        print(logs(cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}"), args.lines))
+    elif args.cmd == "send":
+        inst = cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}")
+        try:
+            send_command(inst, " ".join(args.command))
+            print(f"{args.name}: sent")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "add":
+        sk = [s for s in args.stop_keys.split(",") if s.strip()] if args.stop_keys else None
+        try:
+            inst = add_instance(cfg, args.name, args.dir, launch_cmd=args.launch_cmd,
+                                config_file=args.config_file, stop_keys=sk,
+                                stop_timeout=args.stop_timeout, autostart=args.autostart)
+            extra = "  [autostart]" if inst.get("autostart") else ""
+            print(f"added {inst['name']}  ({inst['dir']}){extra}")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "delete":
+        try:
+            print(f"{args.name}: {delete_instance(cfg, args.name, force=args.force)}")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "scan":
+        rows = scan(cfg)
+        if not rows:
+            print("No unmanaged tmux sessions found.")
+        else:
+            w = max((len(r["session"]) for r in rows), default=7)
+            for r in rows:
+                flag = "proxy?" if r["likely_proxy"] else "      "
+                print(f"{flag}  {r['session']:<{w}}  {r['path']}  [{r['command']}]  ({r['reason']})")
+            print("\nAdopt one with:  manager.py adopt <session> [--name NAME]")
+    elif args.cmd == "proxies":
+        rows = list_proxies(cfg)
+        w = max((len(r["name"]) for r in rows), default=4)
+        for r in rows:
+            if r.get("found"):
+                en = "" if "enabled" not in r else (" (on)" if r["enabled"] else " (off)")
+                print(f"{r['name']:<{w}}  {r['host']}:{r['port']}{en}")
+            else:
+                print(f"{r['name']:<{w}}  — {r.get('reason','no proxy')}")
+    elif args.cmd == "proxy":
+        inst = cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}")
+        en = True if args.p_enable else (False if args.p_disable else None)
+        if args.host is None and args.port is None and en is None:
+            p = get_proxy(inst)
+            print(f"{args.name}: {p['host']}:{p['port']}" if p.get("found") else f"{args.name}: {p.get('reason')}")
+        else:
+            try:
+                r = set_proxy(inst, host=args.host, port=args.port, enabled=en)
+                print(f"{args.name}: set to {r['host']}:{r['port']}")
+            except ValueError as e:
+                die(str(e))
+    elif args.cmd == "set":
+        try:
+            for nm, val in set_field(cfg, args.name, args.field, args.value):
+                print(f"{nm}: {args.field} = {val}")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "adopt":
+        sk = [s for s in args.stop_keys.split(",") if s.strip()] if args.stop_keys else None
+        try:
+            inst = adopt_session(cfg, args.session, name=args.name,
+                                 launch_cmd=args.launch_cmd, config_file=args.config_file,
+                                 stop_keys=sk, stop_timeout=args.stop_timeout,
+                                 autostart=args.autostart)
+            extra = "  [autostart]" if inst.get("autostart") else ""
+            print(f"adopted '{args.session}' as {inst['name']}  (dir={inst['dir']}, launch={inst['launch_cmd']}){extra}")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "autostart":
+        try:
+            val = set_autostart(cfg, args.name, args.on)
+            print(f"{args.name}: autostart {'enabled' if val else 'disabled'}")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "boot":
+        results = boot(cfg)
+        if not results:
+            print("No autostart instances configured.")
+        else:
+            for n, r in results.items():
+                print(f"{n}: {r}")
+    elif args.cmd == "setpassword":
+        import getpass
+        user = args.user or input("Username: ").strip()
+        pw = args.password or getpass.getpass("Password: ")
+        if not args.password:
+            pw2 = getpass.getpass("Confirm password: ")
+            if pw != pw2:
+                die("passwords do not match")
+        try:
+            set_password(cfg, user, pw)
+            print(f"web login set for user '{user}'. All existing sessions were cleared.")
+            print("Note: the running server (if any) picks this up immediately.")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd == "logout-all":
+        bump_session_epoch(cfg)
+        _SESSIONS.clear()
+        print("all web sessions invalidated (running server included)")
+    elif args.cmd == "sysinfo":
+        info = _sysinfo()
+        def gb(n): return f"{n/1e9:.1f} GB" if n else "?"
+        up = info.get("uptime_sec") or 0
+        print(f"os:      {info.get('os')}")
+        print(f"cpus:    {info.get('cpus')}")
+        print(f"memory:  {gb(info.get('mem_used'))} / {gb(info.get('mem_total'))} used")
+        print(f"disk:    {gb(info.get('disk_used'))} / {gb(info.get('disk_total'))} used")
+        load = info.get("load")
+        print(f"load:    {', '.join(f'{x:.2f}' for x in load)}" if load else "load:    ?")
+        print(f"uptime:  {up // 86400}d {(up % 86400) // 3600}h {(up % 3600) // 60}m")
+        print(f"tmux:    {info.get('tmux_sessions')} sessions")
+    elif args.cmd == "settings":
+        theme = {}
+        if args.theme is not None:
+            theme["preset"] = args.theme
+        if args.accent is not None:
+            theme["accent"] = args.accent
+        en = True if args.enable_system else (False if args.disable_system else None)
+        try:
+            out = save_settings(cfg, theme=theme or None, system_actions_enabled=en)
+            print(f"theme preset:   {out['theme']['preset']}")
+            print(f"theme accent:   {out['theme']['accent'] or '(preset default)'}")
+            print(f"system actions: {'enabled' if out['system_actions_enabled'] else 'disabled'}")
+        except ValueError as e:
+            die(str(e))
+    elif args.cmd in ("update", "reboot"):
+        try:
+            print(run_system_action(cfg, args.cmd).get("note", "ok"))
+        except PermissionError as e:
+            die(str(e) + "\n(enable with:  manager.py settings --enable-system)")
+        except ValueError as e:
+            die(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Web page (served as a single string)
+# ---------------------------------------------------------------------------
+
+LOGIN_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Bot Manager — Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0e12;--panel:#11171e;--line:#1d2730;--txt:#dfe7ee;--dim:#7b8a98;--acc:#3ddc97;--acc-dim:#1f7a55;--crash:#ff5d5d}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  font-family:'Sora',system-ui,sans-serif;color:var(--txt);
+  background:radial-gradient(900px 500px at 80% -10%,#12372a33,transparent 60%),
+   radial-gradient(700px 400px at 0% 0%,#10202e55,transparent 55%),var(--bg)}
+.card{width:min(380px,92vw);background:linear-gradient(180deg,var(--panel),#0d1319);
+  border:1px solid var(--line);border-radius:16px;padding:2rem 1.8rem;box-shadow:0 30px 80px #000a}
+.brand{display:flex;align-items:center;gap:.6rem;font-weight:800;font-size:1.2rem;letter-spacing:-.02em;margin-bottom:.3rem}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc)}
+.sub{color:var(--dim);font-size:.8rem;margin-bottom:1.4rem}
+label{display:block;font-size:.78rem;font-weight:600;color:var(--dim);margin:.8rem 0 .3rem}
+input{width:100%;font-family:'Space Mono',monospace;font-size:.85rem;background:#06090c;color:#cdd9e2;
+  border:1px solid var(--line);border-radius:9px;padding:.6rem .7rem}
+input:focus{outline:none;border-color:var(--acc)}
+button{width:100%;margin-top:1.3rem;cursor:pointer;border:1px solid var(--acc-dim);background:var(--panel);
+  color:var(--acc);font-weight:700;font-size:.9rem;padding:.65rem;border-radius:10px;font-family:inherit;transition:.15s}
+button:hover{background:#15201b}
+button:disabled{opacity:.5;cursor:not-allowed}
+.msg{margin-top:.9rem;font-family:'Space Mono',monospace;font-size:.74rem;color:var(--crash);min-height:1em;text-align:center}
+.hint{margin-top:1.2rem;font-size:.68rem;color:#586675;text-align:center;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand"><span class="dot"></span>Aquarius Bot Manager</div>
+  <div class="sub" id="sub">Sign in to continue</div>
+  <label for="u">Username</label>
+  <input id="u" autocomplete="username" autofocus onkeydown="k(event)">
+  <label for="p">Password</label>
+  <input id="p" type="password" autocomplete="current-password" onkeydown="k(event)">
+  <button id="btn" onclick="login()">Sign in</button>
+  <div class="msg" id="msg"></div>
+  <div class="hint" id="hint"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+async function init(){
+  try{
+    const r=await fetch('/api/authstatus'); const d=await r.json();
+    if(!d.required){ $('sub').textContent='No password set yet';
+      $('hint').innerHTML='No login is configured. Set one on the server with <b>abm setpassword</b>, or just open the app — access is currently open on this address.';
+      $('btn').textContent='Open app'; $('btn').onclick=()=>location.href='/'; }
+  }catch(e){}
+}
+function k(e){ if(e.key==='Enter') login(); }
+async function login(){
+  const username=$('u').value.trim(), password=$('p').value;
+  if(!username||!password){ $('msg').textContent='enter username and password'; return; }
+  $('btn').disabled=true; $('msg').style.color='var(--dim)'; $('msg').textContent='signing in…';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password})});
+    const d=await r.json();
+    if(r.ok&&d.ok){ location.href='/'; return; }
+    $('msg').style.color='var(--crash)'; $('msg').textContent='✗ '+(d.error||'login failed');
+  }catch(e){ $('msg').style.color='var(--crash)'; $('msg').textContent='✗ connection error'; }
+  $('btn').disabled=false;
+}
+init();
+</script>
+</body>
+</html>
+"""
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Bot Manager</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0a0e12; --panel:#11171e; --panel-2:#0d1319; --line:#1d2730;
+  --txt:#dfe7ee; --dim:#7b8a98; --acc:#3ddc97; --acc-dim:#1f7a55;
+  --run:#3ddc97; --stop:#5a6b78; --crash:#ff5d5d; --warn:#ffb454;
+  --mono:'Space Mono',ui-monospace,monospace; --sans:'Sora',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:
+   radial-gradient(900px 500px at 85% -10%, #12372a22, transparent 60%),
+   radial-gradient(700px 400px at 0% 0%, #10202e44, transparent 55%),
+   var(--bg);
+  color:var(--txt);font-family:var(--sans);min-height:100vh;}
+header{display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  padding:1.1rem 1.6rem;border-bottom:1px solid var(--line);
+  position:sticky;top:0;backdrop-filter:blur(8px);background:#0a0e12cc;z-index:5;}
+.brand{display:flex;align-items:center;gap:.7rem;font-weight:800;letter-spacing:-.02em;font-size:1.15rem}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc)}
+.brand small{font-family:var(--mono);font-weight:400;color:var(--dim);font-size:.7rem;letter-spacing:0}
+.bulk{display:flex;gap:.5rem;flex-wrap:wrap}
+button{font-family:var(--sans);cursor:pointer;border:1px solid var(--line);
+  background:var(--panel);color:var(--txt);padding:.5rem .85rem;border-radius:9px;
+  font-weight:600;font-size:.82rem;transition:.15s;}
+button:hover{border-color:var(--acc-dim);transform:translateY(-1px)}
+button:active{transform:translateY(0)}
+button.go{border-color:var(--acc-dim);color:var(--acc)}
+button.warn{border-color:#5a3b1f;color:var(--warn)}
+button.danger{border-color:#5a1f1f;color:var(--crash)}
+button:disabled{opacity:.4;cursor:not-allowed;transform:none}
+main{padding:1.6rem;max-width:1200px;margin:0 auto}
+.meta{font-family:var(--mono);font-size:.72rem;color:var(--dim);margin-bottom:1rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:1rem}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:14px;padding:1.05rem 1.1rem;
+  position:relative;overflow:hidden}
+.card::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--stop)}
+.card.running::before{background:var(--run);box-shadow:0 0 18px var(--run)}
+.card.crashed::before{background:var(--crash);box-shadow:0 0 18px var(--crash)}
+.card .top{display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem}
+.name{font-weight:700;font-size:1.05rem;letter-spacing:-.01em;word-break:break-all}
+.badge{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;letter-spacing:.08em;
+  padding:.25rem .5rem;border-radius:6px;border:1px solid var(--line);white-space:nowrap}
+.badge.running{color:var(--run);border-color:var(--acc-dim)}
+.badge.stopped{color:var(--stop)}
+.badge.crashed{color:var(--crash);border-color:#5a1f1f}
+.star{cursor:pointer;font-size:1rem;line-height:1;color:var(--stop);user-select:none;transition:.15s}
+.star:hover{transform:scale(1.2)}
+.star.on{color:var(--warn)}
+.path{font-family:var(--mono);font-size:.7rem;color:var(--dim);margin:.45rem 0 .15rem;word-break:break-all}
+.cmd{font-family:var(--mono);font-size:.7rem;color:#586675;margin-bottom:.85rem;word-break:break-all}
+.row{display:flex;gap:.4rem;flex-wrap:wrap}
+.row button{flex:1;min-width:64px}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid #ffffff33;border-top-color:var(--acc);
+  border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:.3rem}
+@keyframes sp{to{transform:rotate(360deg)}}
+.empty{color:var(--dim);font-family:var(--mono);font-size:.85rem;padding:2rem 0}
+/* drawer */
+.scrim{position:fixed;inset:0;background:#000a;backdrop-filter:blur(2px);display:none;z-index:20}
+.scrim.open{display:block}
+.drawer{position:fixed;top:0;right:0;height:100%;width:min(760px,94vw);background:var(--panel);
+  border-left:1px solid var(--line);transform:translateX(100%);transition:.22s;z-index:21;
+  display:flex;flex-direction:column}
+.drawer.open{transform:none}
+.drawer header{position:static;background:none;backdrop-filter:none}
+.tabs{display:flex;gap:.4rem;padding:0 1.2rem;border-bottom:1px solid var(--line)}
+.tab{padding:.6rem .2rem;margin-right:1rem;color:var(--dim);border-bottom:2px solid transparent;
+  cursor:pointer;font-weight:600;font-size:.85rem}
+.tab.active{color:var(--acc);border-color:var(--acc)}
+.drawer .body{flex:1;overflow:auto;padding:1.2rem}
+pre.log{font-family:var(--mono);font-size:.74rem;line-height:1.5;white-space:pre-wrap;word-break:break-word;
+  background:#06090c;border:1px solid var(--line);border-radius:10px;padding:.9rem;margin:0;color:#b9c7d2}
+textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;line-height:1.5;
+  background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:10px;padding:.9rem;resize:vertical}
+/* live command bar */
+.cmdbar{display:flex;align-items:center;gap:.5rem;margin-top:.6rem;
+  background:#06090c;border:1px solid var(--line);border-radius:10px;padding:.35rem .55rem}
+.cmdbar:focus-within{border-color:var(--acc-dim)}
+.cmdbar .prompt{font-family:var(--mono);color:var(--acc);font-weight:700}
+.cmdbar input{flex:1;background:none;border:none;color:#cdd9e2;font-family:var(--mono);font-size:.78rem;outline:none}
+.cmdbar button{padding:.35rem .7rem;font-size:.78rem}
+/* structured config form — schema cards */
+#cfgForm{display:flex;flex-direction:column;gap:1rem}
+.cfggroup{display:flex;flex-direction:column;gap:.5rem}
+.cfggroup .gh{font-family:var(--mono);font-size:.64rem;text-transform:uppercase;letter-spacing:.12em;
+  color:var(--acc);font-weight:700;padding:.1rem .2rem;opacity:.85}
+.modcard{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:linear-gradient(180deg,var(--panel),var(--panel-2));position:relative}
+.modcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:transparent;transition:.15s}
+.modcard.active::before{background:var(--acc);box-shadow:0 0 12px var(--acc)}
+.mhd{display:flex;align-items:center;gap:.6rem;cursor:pointer;padding:.6rem .8rem;user-select:none}
+.mhd:hover{background:#ffffff08}
+.mhd .caret{font-size:.65rem;color:var(--dim);transition:.18s}
+.modcard.open .mhd .caret{transform:rotate(90deg)}
+.mhd .mtitle{flex:1;font-weight:700;font-size:.9rem;letter-spacing:-.01em}
+.mbody{display:none;flex-direction:column;padding:.3rem .8rem .7rem;gap:.1rem;border-top:1px solid var(--line)}
+.modcard.open .mbody{display:flex}
+.frow{display:flex;align-items:center;gap:.7rem;min-height:34px;padding:.15rem 0}
+.frow+.frow{border-top:1px solid #ffffff08}
+.flabel{flex:1;font-size:.82rem;color:var(--txt);word-break:break-word}
+.flabel .unit{font-family:var(--mono);font-size:.6rem;color:#586675;margin-left:.3rem;padding:.05rem .3rem;border:1px solid var(--line);border-radius:5px}
+.fctrl{display:flex;align-items:center;gap:.5rem;justify-content:flex-end;min-width:46%}
+.fctrl input[type=text],.fctrl input[type=password]{font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.34rem .5rem;width:100%}
+.fctrl input:focus,.fctrl select:focus{outline:none;border-color:var(--acc)}
+.fctrl select{font-family:var(--sans);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.34rem .5rem;cursor:pointer}
+.snum{width:62px;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.34rem .4rem;text-align:right}
+.snum.wide{width:110px}
+.slider{-webkit-appearance:none;appearance:none;height:5px;border-radius:5px;background:#2a3640;flex:1;max-width:170px;cursor:pointer}
+.slider::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--acc);box-shadow:0 0 8px var(--acc);cursor:pointer}
+.slider::-moz-range-thumb{width:15px;height:15px;border:none;border-radius:50%;background:var(--acc);box-shadow:0 0 8px var(--acc);cursor:pointer}
+/* toggle */
+.tgl{position:relative;width:38px;height:20px;border-radius:20px;background:#2a3640;border:1px solid var(--line);cursor:pointer;transition:.15s;flex:none}
+.tgl::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#8696a3;transition:.15s}
+.tgl.on{background:var(--acc-dim);border-color:var(--acc)}
+.tgl.on::after{left:20px;background:var(--acc)}
+.arrlist{display:flex;flex-direction:column;gap:.3rem;width:100%}
+.arrlist .ai{display:flex;gap:.35rem}
+.arrlist .ai input{flex:1}
+.arrlist .ai button,.arrlist .add{padding:.2rem .5rem;font-size:.72rem}
+.bar{display:flex;gap:.5rem;align-items:center;padding:.8rem 1.2rem;border-top:1px solid var(--line)}
+.bar .msg{font-family:var(--mono);font-size:.74rem;color:var(--dim);flex:1}
+.close{font-size:1.2rem;line-height:1;padding:.2rem .55rem}
+/* modal */
+.modal{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  width:min(520px,92vw);background:var(--panel);border:1px solid var(--line);
+  border-radius:16px;padding:1.3rem 1.4rem;display:flex;flex-direction:column;gap:.7rem;
+  box-shadow:0 30px 80px #000a}
+.mhead{font-weight:800;font-size:1.15rem;letter-spacing:-.02em;margin-bottom:.2rem}
+.modal label{display:flex;flex-direction:column;gap:.3rem;font-size:.82rem;font-weight:600;color:var(--dim)}
+.modal .hint{font-weight:400;font-size:.68rem;color:#586675;font-family:var(--mono)}
+.modal input{font-family:var(--mono);font-size:.82rem;background:#06090c;color:#cdd9e2;
+  border:1px solid var(--line);border-radius:9px;padding:.55rem .6rem}
+.modal input:focus{outline:none;border-color:var(--acc-dim)}
+.mrow{display:flex;gap:.7rem}
+.mbar{display:flex;align-items:center;gap:.5rem;margin-top:.4rem}
+.mbar .msg{flex:1;font-family:var(--mono);font-size:.72rem;color:var(--crash)}
+.scand{border:1px solid var(--line);border-radius:10px;padding:.6rem .7rem;display:flex;
+  align-items:center;gap:.6rem;background:var(--panel-2)}
+.scand.likely{border-color:var(--acc-dim)}
+.scand .si{flex:1;min-width:0}
+.scand .sn{font-weight:700;font-size:.9rem;display:flex;align-items:center;gap:.4rem}
+.scand .tag{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.06em;
+  padding:.1rem .4rem;border-radius:5px;border:1px solid var(--acc-dim);color:var(--acc)}
+.scand .sp{font-family:var(--mono);font-size:.68rem;color:var(--dim);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scand .sr{font-family:var(--mono);font-size:.64rem;color:#586675}
+.chip{cursor:pointer;border:1px solid var(--line);background:var(--panel-2);border-radius:9px;
+  padding:.4rem .6rem;font-size:.78rem;font-weight:600;display:flex;align-items:center;gap:.4rem}
+.chip.sel{border-color:var(--acc);color:var(--acc)}
+.chip .sw{width:14px;height:14px;border-radius:50%;border:1px solid #fff3}
+.sysgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.6rem}
+.sysgrid .s{background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:.6rem .7rem}
+.sysgrid .s .k{font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.07em;color:var(--dim)}
+.sysgrid .s .v{font-weight:700;font-size:1rem;margin-top:.15rem}
+.sysgrid .s .b{height:4px;border-radius:3px;background:#ffffff14;margin-top:.4rem;overflow:hidden}
+.sysgrid .s .b i{display:block;height:100%;background:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small id="clock"></small></div>
+  <div class="bulk">
+    <button onclick="openSettings()">⚙ Settings</button>
+    <button onclick="openProxies()">🌐 Proxies</button>
+    <button onclick="openScan()">⟲ Scan existing</button>
+    <button onclick="openAdd()">+ New instance</button>
+    <button class="go" onclick="bulk('start')">▶ Start all</button>
+    <button class="warn" onclick="bulk('restart')">⟳ Restart all</button>
+    <button class="danger" onclick="bulk('stop')">■ Stop all</button>
+    <button class="danger" onclick="location.href='/logout'">⎋ Log out</button>
+  </div>
+</header>
+<main>
+  <div class="meta" id="meta">loading…</div>
+  <div class="grid" id="grid"></div>
+</main>
+
+<div class="scrim" id="proxScrim" onclick="closeProxies(event)">
+  <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Proxy host / port</div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Instances with a proxy field (client.connection.proxy). Edits write to config.json — restart the instance to apply.</div>
+    <div id="proxList" style="max-height:60vh;overflow:auto;display:flex;flex-direction:column;gap:.5rem">loading…</div>
+    <div class="mbar"><span class="msg" id="proxMsg" style="color:var(--dim)"></span>
+      <button onclick="loadProxies()">Refresh</button>
+      <button onclick="closeProxies()">Close</button></div>
+  </div>
+</div>
+
+<div class="scrim" id="settingsScrim" onclick="closeSettings(event)">
+  <div class="modal" style="width:min(620px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Settings</div>
+    <div class="tabs" style="padding:0;margin-bottom:.6rem">
+      <div class="tab active" id="stApBtn" onclick="setTab('ap')">Appearance</div>
+      <div class="tab" id="stSysBtn" onclick="setTab('sys')">System</div>
+    </div>
+
+    <div id="stAp">
+      <div class="hint" style="margin-bottom:.5rem">Theme preset</div>
+      <div id="presetRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.9rem"></div>
+      <label>Accent override <span class="hint">blank = preset default</span>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <input type="color" id="accentPick" style="width:48px;height:38px;padding:2px;background:#06090c;border:1px solid var(--line);border-radius:9px">
+          <input id="accentHex" placeholder="#3ddc97" style="flex:1" autocomplete="off">
+          <button onclick="document.getElementById('accentHex').value='';document.getElementById('accentPick').value='#3ddc97';previewTheme()">Clear</button>
+        </div>
+      </label>
+      <div class="mbar">
+        <span class="msg" id="apMsg" style="color:var(--dim)"></span>
+        <button class="go" onclick="saveAppearance()">Save appearance</button>
+      </div>
+    </div>
+
+    <div id="stSys" style="display:none">
+      <div id="sysInfo" class="sysgrid">loading…</div>
+      <div style="display:flex;align-items:center;gap:.6rem;margin:.9rem 0;padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
+        <input type="checkbox" id="sysEnable" onchange="toggleSystem()" style="width:18px;height:18px">
+        <label for="sysEnable" style="margin:0;color:var(--txt);font-size:.85rem">Enable system actions (reboot / OS update)</label>
+      </div>
+      <div id="sysDanger" style="opacity:.45;pointer-events:none">
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="warn" onclick="sysAction('update')">⟳ Update OS (apt upgrade)</button>
+          <button class="danger" onclick="sysAction('reboot')">⏻ Reboot VPS</button>
+        </div>
+        <pre class="log" id="sysJob" style="min-height:90px;max-height:30vh">(no system job run yet)</pre>
+      </div>
+      <div class="hint" style="margin-top:.6rem">Requires passwordless sudo for <code>reboot</code> and <code>apt-get</code>. See README. Your password is never stored.</div>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scanScrim" onclick="closeScan(event)">
+  <div class="modal" style="width:min(680px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Existing tmux sessions</div>
+    <div class="hint" style="margin:-.3rem 0 .4rem">Sessions not yet managed. Adopting binds the manager to the live session — nothing restarts.</div>
+    <div id="scanList" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column;gap:.5rem"></div>
+    <div class="mbar">
+      <span class="msg" id="scanMsg"></span>
+      <button onclick="loadScan()">Rescan</button>
+      <button onclick="closeScan()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="addScrim" onclick="closeAdd(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="mhead">New instance</div>
+    <label>Name <span class="hint">letters, digits, . _ -</span>
+      <input id="f_name" placeholder="bot3" autocomplete="off"></label>
+    <label>Directory
+      <input id="f_dir" placeholder="/home/youruser/zenith/bot3" autocomplete="off"></label>
+    <label>Launch command <span class="hint">default ./launch.sh</span>
+      <input id="f_launch" placeholder="./launch.sh" autocomplete="off"></label>
+    <label>Config file <span class="hint">default config.json</span>
+      <input id="f_cfg" placeholder="config.json" autocomplete="off"></label>
+    <div class="mrow">
+      <label style="flex:2">Stop keys <span class="hint">comma sep, default C-c</span>
+        <input id="f_keys" placeholder="C-c" autocomplete="off"></label>
+      <label style="flex:1">Stop timeout
+        <input id="f_to" type="number" placeholder="15" autocomplete="off"></label>
+    </div>
+    <div class="mbar">
+      <span class="msg" id="addMsg"></span>
+      <button onclick="closeAdd()">Cancel</button>
+      <button class="go" id="addBtn" onclick="submitAdd()">Add</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <header>
+    <div class="brand" id="drawerName" style="font-size:1rem"></div>
+    <button class="close" onclick="closeDrawer()">×</button>
+  </header>
+  <div class="tabs">
+    <div class="tab active" id="tabLogsBtn" onclick="showTab('logs')">Console</div>
+    <div class="tab" id="tabCfgBtn" onclick="showTab('cfg')">Config</div>
+  </div>
+  <div class="body">
+    <div id="tabLogs">
+      <pre class="log" id="logBox">…</pre>
+      <div class="cmdbar">
+        <span class="prompt">&gt;</span>
+        <input id="cmdInput" placeholder="send a console command, e.g. killAura on" autocomplete="off" spellcheck="false"
+          onkeydown="cmdKey(event)">
+        <button class="go" onclick="sendCmd()">Send</button>
+      </div>
+    </div>
+    <div id="tabCfg" style="display:none">
+      <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.7rem">
+        <input id="cfgFilter" placeholder="Filter settings…" oninput="renderForm()" autocomplete="off"
+          style="flex:1;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:9px;padding:.45rem .6rem">
+        <button id="cfgViewBtn" onclick="toggleCfgView()">Raw JSON</button>
+      </div>
+      <div id="cfgForm"></div>
+      <textarea id="cfgBox" spellcheck="false" style="display:none"></textarea>
+    </div>
+  </div>
+  <div class="bar">
+    <span class="msg" id="drawerMsg"></span>
+    <button id="logRefresh" onclick="loadLogs()">Refresh</button>
+    <button id="cfgSaveRestart" class="warn" style="display:none" onclick="saveAndRestart()">Save &amp; Restart</button>
+    <button id="cfgSave" class="go" style="display:none" onclick="saveCfg()">Save</button>
+  </div>
+</aside>
+
+<script>
+let CUR=null, TAB='logs', logTimer=null;
+const $=id=>document.getElementById(id);
+
+async function api(path,method='GET',body){
+  const o={method,headers:{}};
+  if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+  const r=await fetch(path,o);
+  return r.json();
+}
+function badge(s){return `<span class="badge ${s}">${s}</span>`;}
+async function toggleAuto(name,enabled){
+  await api(`/api/instances/${encodeURIComponent(name)}/autostart`,'POST',{enabled});
+  refresh();
+}
+
+async function refresh(){
+  let d;
+  try{ d=await api('/api/instances'); }catch(e){ $('meta').textContent='connection lost'; return; }
+  const list=d.instances||[];
+  const run=list.filter(i=>i.status==='running').length;
+  const cr=list.filter(i=>i.status==='crashed').length;
+  $('meta').textContent=`${list.length} instances · ${run} running`+(cr?` · ${cr} crashed`:'');
+  const g=$('grid');
+  if(!list.length){g.innerHTML='<div class="empty">No instances configured. Add them to instances.json.</div>';return;}
+  g.innerHTML=list.map(i=>`
+    <div class="card ${i.status}">
+      <div class="top">
+        <div class="name">${esc(i.name)}</div>
+        <div style="display:flex;align-items:center;gap:.4rem">
+          <span class="star ${i.autostart?'on':''}" title="${i.autostart?'Autostart on — launches on boot':'Autostart off'}" onclick="toggleAuto('${jsq(i.name)}',${!i.autostart})">${i.autostart?'★':'☆'}</span>
+          ${badge(i.status)}
+        </div>
+      </div>
+      <div class="path">${esc(i.dir)}</div>
+      <div class="cmd">$ ${esc(i.launch_cmd)}</div>
+      <div class="row">
+        <button class="go" onclick="act('${jsq(i.name)}','start',this)">▶ Start</button>
+        <button class="warn" onclick="act('${jsq(i.name)}','restart',this)">⟳ Restart</button>
+        <button class="danger" onclick="act('${jsq(i.name)}','stop',this)">■ Stop</button>
+        <button onclick="openDrawer('${jsq(i.name)}')">⋯</button>
+        <button class="danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
+      </div>
+    </div>`).join('');
+}
+
+async function act(name,action,btn){
+  const card=btn.closest('.card');
+  card.querySelectorAll('button').forEach(b=>b.disabled=true);
+  btn.innerHTML='<span class="spin"></span>'+btn.textContent.replace(/^\S+\s/,'');
+  await api(`/api/instances/${encodeURIComponent(name)}/${action}`,'POST');
+  await refresh();
+}
+async function bulk(action){
+  if(action==='stop'&&!confirm('Stop ALL instances?'))return;
+  document.querySelectorAll('.bulk button').forEach(b=>b.disabled=true);
+  await api(`/api/${action}_all`,'POST');
+  document.querySelectorAll('.bulk button').forEach(b=>b.disabled=false);
+  refresh();
+}
+
+function openDrawer(name){
+  CUR=name; $('drawerName').textContent=name;
+  $('scrim').classList.add('open'); $('drawer').classList.add('open');
+  showTab('logs');
+}
+function closeDrawer(){
+  $('scrim').classList.remove('open'); $('drawer').classList.remove('open');
+  CUR=null; if(logTimer){clearInterval(logTimer);logTimer=null;}
+}
+function showTab(t){
+  TAB=t;
+  $('tabLogsBtn').classList.toggle('active',t==='logs');
+  $('tabCfgBtn').classList.toggle('active',t==='cfg');
+  $('tabLogs').style.display=t==='logs'?'':'none';
+  $('tabCfg').style.display=t==='cfg'?'':'none';
+  $('logRefresh').style.display=t==='logs'?'':'none';
+  $('cfgSave').style.display=t==='cfg'?'':'none';
+  $('cfgSaveRestart').style.display=t==='cfg'?'':'none';
+  if(logTimer){clearInterval(logTimer);logTimer=null;}
+  if(t==='logs'){loadLogs();logTimer=setInterval(loadLogs,3000);}
+  else loadCfg();
+}
+async function loadLogs(){
+  if(!CUR)return;
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/logs?lines=400`);
+  const box=$('logBox');
+  const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;
+  box.textContent=d.logs||'(empty)';
+  if(atBottom)box.scrollTop=box.scrollHeight;
+}
+let CMDHIST=[], CMDIDX=-1;
+async function sendCmd(){
+  const inp=$('cmdInput'); const cmd=inp.value.trim();
+  if(!cmd)return;
+  inp.disabled=true;
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/command`,'POST',{command:cmd});
+  inp.disabled=false; inp.focus();
+  if(d.error){ $('drawerMsg').textContent='✗ '+d.error; return; }
+  CMDHIST.push(cmd); CMDIDX=CMDHIST.length; inp.value='';
+  $('drawerMsg').textContent='';
+  // surface the result quickly (log also auto-polls)
+  setTimeout(loadLogs,250); setTimeout(loadLogs,1200);
+}
+function cmdKey(e){
+  if(e.key==='Enter'){ e.preventDefault(); sendCmd(); }
+  else if(e.key==='ArrowUp'){ if(CMDHIST.length){ e.preventDefault(); CMDIDX=Math.max(0,CMDIDX-1); $('cmdInput').value=CMDHIST[CMDIDX]||''; } }
+  else if(e.key==='ArrowDown'){ if(CMDHIST.length){ e.preventDefault(); CMDIDX=Math.min(CMDHIST.length,CMDIDX+1); $('cmdInput').value=CMDHIST[CMDIDX]||''; } }
+}
+let CFGOBJ=null, CFGRAW=false, CFGPARSE_OK=true, SCHEMA=null;
+
+async function ensureSchema(){
+  if(SCHEMA)return SCHEMA;
+  const d=await api('/api/schema'); SCHEMA=d.schema||{}; return SCHEMA;
+}
+async function loadCfg(){
+  if(!CUR)return;
+  $('drawerMsg').textContent='loading…';
+  await ensureSchema();
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/config`);
+  $('cfgBox').value=d.config||'';
+  $('drawerMsg').textContent=d.exists?d.path:'(file will be created on save) '+d.path;
+  try{ CFGOBJ = d.config && d.config.trim() ? JSON.parse(d.config) : {}; CFGPARSE_OK=true; }
+  catch(e){ CFGOBJ=null; CFGPARSE_OK=false; }
+  if(!CFGPARSE_OK || CFGOBJ===null || typeof CFGOBJ!=='object' || Array.isArray(CFGOBJ)){
+    CFGRAW=true; applyCfgView();
+    if(!CFGPARSE_OK) $('drawerMsg').textContent='(not valid JSON — editing raw) '+(d.path||'');
+  }else{ CFGRAW=false; applyCfgView(); renderForm(); }
+}
+function toggleCfgView(){
+  if(!CFGRAW){ if(CFGOBJ!==null) $('cfgBox').value=JSON.stringify(CFGOBJ,null,2); }
+  else{ try{ CFGOBJ=JSON.parse($('cfgBox').value||'{}'); CFGPARSE_OK=true; }
+        catch(e){ $('drawerMsg').textContent='✗ raw JSON invalid, fix before switching'; return; } }
+  CFGRAW=!CFGRAW; applyCfgView(); if(!CFGRAW) renderForm();
+}
+function applyCfgView(){
+  $('cfgForm').style.display=CFGRAW?'none':'';
+  $('cfgBox').style.display=CFGRAW?'':'none';
+  $('cfgFilter').style.display=CFGRAW?'none':'';
+  $('cfgViewBtn').textContent=CFGRAW?'Form view':'Raw JSON';
+}
+// dotted-path helpers (path is an array of keys)
+function dget(obj,path){ let o=obj; for(const k of path){ if(o==null||typeof o!=='object')return undefined; o=o[k]; } return o; }
+function dset(obj,path,val){ let o=obj; for(let i=0;i<path.length-1;i++){ if(typeof o[path[i]]!=='object'||o[path[i]]===null)o[path[i]]={}; o=o[path[i]]; } o[path[path.length-1]]=val; }
+function dhas(obj,path){ return dget(obj,path)!==undefined; }
+const isScalar=v=> v===null||['string','number','boolean'].includes(typeof v);
+
+function renderForm(){
+  if(CFGRAW||CFGOBJ===null) return;
+  const filt=($('cfgFilter').value||'').trim().toLowerCase();
+  const root=$('cfgForm'); root.innerHTML='';
+  const usedModulePaths=new Set();
+  let shown=0;
+  // 1) schema-driven categories
+  for(const [cat,mods] of Object.entries(SCHEMA)){
+    const modCards=[];
+    for(const [modKey,fields] of Object.entries(mods)){
+      const modPath=modKey.split('.');
+      usedModulePaths.add(modKey);
+      const label=fields._label||modKey;
+      const fieldEntries=Object.entries(fields).filter(([k])=>!k.startsWith('_'));
+      // filter: match category, module label, or any field key
+      const fieldMatches=fieldEntries.filter(([fk])=> !filt || cat.toLowerCase().includes(filt) || label.toLowerCase().includes(filt) || fk.toLowerCase().includes(filt));
+      if(!fieldMatches.length) continue;
+      const card=buildModuleCard(label,modPath,fieldMatches);
+      modCards.push(card); shown+=fieldMatches.length;
+    }
+    if(!modCards.length) continue;
+    const grp=document.createElement('div'); grp.className='cfggroup';
+    const gh=document.createElement('div'); gh.className='gh'; gh.textContent=cat;
+    grp.appendChild(gh);
+    modCards.forEach(c=>grp.appendChild(c));
+    root.appendChild(grp);
+  }
+  // 2) leftover keys present in file but not in schema -> "Other (from file)"
+  const leftovers=collectLeftovers(CFGOBJ, usedModulePaths, filt);
+  if(leftovers.length){
+    const grp=document.createElement('div'); grp.className='cfggroup';
+    const gh=document.createElement('div'); gh.className='gh'; gh.textContent='Other (from your config)';
+    grp.appendChild(gh);
+    const card=document.createElement('div'); card.className='modcard open';
+    const body=document.createElement('div'); body.className='mbody';
+    leftovers.forEach(({label,path,val})=> body.appendChild(buildAutoRow(label,path,val)) );
+    card.appendChild(body); grp.appendChild(card); root.appendChild(grp);
+    shown+=leftovers.length;
+  }
+  if(!shown) root.innerHTML='<div class="hint">No settings match "'+esc(filt)+'".</div>';
+}
+
+function buildModuleCard(label,modPath,fieldEntries){
+  const card=document.createElement('div'); card.className='modcard';
+  // is there an 'enabled' field? show its toggle in the header
+  const enEntry=fieldEntries.find(([k])=>k==='enabled');
+  const head=document.createElement('div'); head.className='mhd';
+  const caret=document.createElement('span'); caret.className='caret'; caret.textContent='▶';
+  const title=document.createElement('span'); title.className='mtitle'; title.textContent=label;
+  head.appendChild(caret); head.appendChild(title);
+  if(enEntry){
+    const ep=modPath.concat('enabled');
+    const on=!!dget(CFGOBJ,ep);
+    const t=document.createElement('div'); t.className='tgl'+(on?' on':''); t.title='enabled';
+    t.onclick=(e)=>{ e.stopPropagation(); const nv=!t.classList.contains('on'); t.classList.toggle('on',nv); dset(CFGOBJ,ep,nv); card.classList.toggle('active',nv); };
+    head.appendChild(t);
+    if(on)card.classList.add('active');
+  }
+  const body=document.createElement('div'); body.className='mbody';
+  head.onclick=()=>card.classList.toggle('open');
+  for(const [fk,spec] of fieldEntries){
+    if(fk==='enabled') continue; // shown in header
+    body.appendChild(buildField(modPath.concat(fk.split('.')), fk, spec));
+  }
+  card.appendChild(head); card.appendChild(body);
+  return card;
+}
+
+function buildField(path,key,spec){
+  const row=document.createElement('div'); row.className='frow';
+  const lbl=document.createElement('div'); lbl.className='flabel';
+  const nm=key.split('.').pop();
+  lbl.innerHTML=esc(nm)+(spec.unit?` <span class="unit">${esc(spec.unit)}</span>`:'');
+  row.appendChild(lbl);
+  const cur=dget(CFGOBJ,path);
+  const ctrl=document.createElement('div'); ctrl.className='fctrl';
+
+  if(spec.type==='bool'){
+    const on=cur===true;
+    const t=document.createElement('div'); t.className='tgl'+(on?' on':'');
+    t.onclick=()=>{ const nv=!t.classList.contains('on'); t.classList.toggle('on',nv); dset(CFGOBJ,path,nv); };
+    ctrl.appendChild(t);
+  } else if(spec.type==='enum'){
+    const sel=document.createElement('select');
+    spec.options.forEach(o=>{ const op=document.createElement('option'); op.value=o; op.textContent=o; if(cur===o)op.selected=true; sel.appendChild(op); });
+    if(cur===undefined){ const op=document.createElement('option'); op.value=''; op.textContent='(default)'; op.selected=true; sel.insertBefore(op,sel.firstChild); }
+    sel.onchange=()=>dset(CFGOBJ,path,sel.value);
+    ctrl.appendChild(sel);
+  } else if(spec.type==='int'||spec.type==='float'){
+    const hasRange = spec.min!==undefined && spec.max!==undefined;
+    const def = cur!==undefined?cur:(spec.min!==undefined?spec.min:0);
+    if(hasRange){
+      const sl=document.createElement('input'); sl.type='range'; sl.min=spec.min; sl.max=spec.max;
+      sl.step=spec.step||(spec.type==='float'?0.1:1); sl.value=def; sl.className='slider';
+      const num=document.createElement('input'); num.type='number'; num.value=def; num.className='snum';
+      num.min=spec.min; num.max=spec.max; num.step=sl.step;
+      const commit=v=>{ let n=spec.type==='float'?parseFloat(v):parseInt(v,10); if(Number.isNaN(n))return; n=Math.max(spec.min,Math.min(spec.max,n)); sl.value=n; num.value=n; dset(CFGOBJ,path,n); };
+      sl.oninput=()=>commit(sl.value); num.oninput=()=>commit(num.value);
+      ctrl.appendChild(sl); ctrl.appendChild(num);
+    } else {
+      const num=document.createElement('input'); num.type='number'; num.value=def; num.className='snum wide'; num.step=spec.step||(spec.type==='float'?0.1:1);
+      num.oninput=()=>{ const n=spec.type==='float'?parseFloat(num.value):parseInt(num.value,10); if(!Number.isNaN(n))dset(CFGOBJ,path,n); };
+      ctrl.appendChild(num);
+    }
+  } else if(spec.type==='list'){
+    ctrl.appendChild(buildList(path, Array.isArray(cur)?cur:[]));
+  } else { // string
+    const inp=document.createElement('input'); inp.type=spec.secret?'password':'text';
+    inp.value=cur!==undefined&&cur!==null?cur:''; inp.placeholder=spec.secret?'••••••':'';
+    inp.oninput=()=>dset(CFGOBJ,path,inp.value);
+    ctrl.appendChild(inp);
+  }
+  row.appendChild(ctrl);
+  return row;
+}
+
+// auto-typed row for leftover/file-only values
+function buildAutoRow(label,path,val){
+  const spec = typeof val==='boolean'?{type:'bool'}
+    : typeof val==='number'?{type:(Number.isInteger(val)?'int':'float')}
+    : (Array.isArray(val)&&val.every(isScalar))?{type:'list'}
+    : {type:'string'};
+  if(val&&typeof val==='object'&&!Array.isArray(val)){
+    // nested object leftover -> recurse into a mini card
+    const card=document.createElement('div'); card.className='modcard';
+    const head=document.createElement('div'); head.className='mhd';
+    head.innerHTML='<span class="caret">▶</span><span class="mtitle">'+esc(label)+'</span>';
+    const body=document.createElement('div'); body.className='mbody';
+    head.onclick=()=>card.classList.toggle('open');
+    for(const k of Object.keys(val)) body.appendChild(buildAutoRow(k, path.concat(k), val[k]));
+    card.appendChild(head); card.appendChild(body); return card;
+  }
+  return buildField(path, label, spec);
+}
+function collectLeftovers(obj, usedModulePaths, filt, base){
+  base=base||[]; const out=[];
+  for(const k of Object.keys(obj)){
+    const full=base.concat(k); const dotted=full.join('.');
+    // skip if this exact path (or a parent) is covered by schema modules
+    let covered=false;
+    for(const mp of usedModulePaths){ if(mp===dotted||mp.startsWith(dotted+'.')||dotted.startsWith(mp+'.')||dotted===mp){ covered=true; break; } }
+    if(covered) continue;
+    if(filt && !dotted.toLowerCase().includes(filt)) continue;
+    out.push({label:dotted, path:full, val:obj[k]});
+  }
+  return out;
+}
+function buildList(path,arr){
+  const wrap=document.createElement('div'); wrap.className='arrlist';
+  function draw(){
+    wrap.innerHTML='';
+    let cur=dget(CFGOBJ,path); if(!Array.isArray(cur)){ cur=[]; dset(CFGOBJ,path,cur); }
+    cur.forEach((item,idx)=>{
+      const ai=document.createElement('div'); ai.className='ai';
+      const inp=document.createElement('input'); inp.type='text'; inp.value=item;
+      inp.oninput=()=>{ const c=dget(CFGOBJ,path); const n=Number(inp.value);
+        c[idx]=(typeof item==='number'&&inp.value!==''&&!Number.isNaN(n))?n:inp.value; };
+      const rm=document.createElement('button'); rm.className='danger'; rm.textContent='✕';
+      rm.onclick=()=>{ const c=dget(CFGOBJ,path); c.splice(idx,1); draw(); };
+      ai.appendChild(inp); ai.appendChild(rm); wrap.appendChild(ai);
+    });
+    const add=document.createElement('button'); add.className='add'; add.textContent='+ add';
+    add.onclick=()=>{ const c=dget(CFGOBJ,path); c.push(''); draw(); };
+    wrap.appendChild(add);
+  }
+  draw(); return wrap;
+}
+async function saveCfg(){
+  $('drawerMsg').textContent='saving…';
+  let payload;
+  if(CFGRAW){ payload=$('cfgBox').value; }
+  else{ payload=JSON.stringify(CFGOBJ,null,2); }
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/config`,'POST',{config:payload});
+  $('drawerMsg').textContent=d.error?('✗ '+d.error):('✓ saved '+d.path);
+  if(!d.error){ $('cfgBox').value=payload; }
+  return !d.error;
+}
+async function saveAndRestart(){
+  const ok=await saveCfg();
+  if(!ok) return;  // don't restart if the save failed
+  $('drawerMsg').textContent='✓ saved — restarting…';
+  const r=await api(`/api/instances/${encodeURIComponent(CUR)}/restart`,'POST');
+  if(r.error){ $('drawerMsg').textContent='saved, but restart failed: '+r.error; }
+  else{ $('drawerMsg').textContent='✓ saved & restarted ('+r.status+')'; }
+  refresh();           // update card status in the grid
+  setTimeout(loadLogs,600);  // surface fresh boot output if on Console tab
+}
+
+async function del(name,status){
+  let force=false;
+  if(status==='running'||status==='crashed'){
+    if(!confirm(`"${name}" is ${status}. Stop it and delete from the manager?\n(Files on disk are NOT removed.)`))return;
+    force=true;
+  }else{
+    if(!confirm(`Delete "${name}" from the manager?\n(Files on disk are NOT removed.)`))return;
+  }
+  const d=await api(`/api/instances/${encodeURIComponent(name)}/delete`,'POST',{force});
+  if(d.error)alert('Delete failed: '+d.error);
+  refresh();
+}
+
+let SETTINGS=null, sysTimer=null;
+
+function setVar(k,v){document.documentElement.style.setProperty(k,v);}
+function applyTheme(s){
+  const presets=s.presets||{};
+  const p=presets[s.theme.preset]||presets.midnight;
+  if(!p)return;
+  setVar('--bg',p.bg); setVar('--panel',p.panel);
+  // derive a slightly darker panel-2
+  setVar('--panel-2',p.panel);
+  const acc=(s.theme.accent&&s.theme.accent.trim())?s.theme.accent.trim():p.accent;
+  setVar('--acc',acc); setVar('--run',acc);
+  // light themes need darker text
+  const light=p.bg && parseInt(p.bg.slice(1,3),16)>140;
+  setVar('--txt', light?'#1a2026':'#dfe7ee');
+  setVar('--dim', light?'#5a6b78':'#7b8a98');
+}
+async function loadSettings(){
+  SETTINGS=await api('/api/settings');
+  applyTheme(SETTINGS);
+  return SETTINGS;
+}
+
+function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); }
+function closeProxies(e){ if(e&&e.target!==$('proxScrim'))return; $('proxScrim').classList.remove('open'); }
+async function loadProxies(){
+  $('proxMsg').textContent='';
+  const d=await api('/api/proxies');
+  const rows=d.proxies||[];
+  const box=$('proxList');
+  const have=rows.filter(r=>r.found);
+  if(!have.length){ box.innerHTML='<div class="hint">No instances have a proxy field.</div>'; return; }
+  box.innerHTML=rows.map((r,idx)=> r.found ? `
+    <div class="scand likely" style="gap:.5rem">
+      <div class="si"><div class="sn">${esc(r.name)}</div></div>
+      <input id="ph${idx}" value="${esc(String(r.host))}" placeholder="host" style="width:40%;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem">
+      <input id="pp${idx}" value="${esc(String(r.port))}" placeholder="port" style="width:22%;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem">
+      <button class="go" onclick="saveProxy('${jsq(r.name)}',${idx},this)">Save</button>
+    </div>` :
+    `<div class="scand" style="opacity:.5"><div class="si"><div class="sn">${esc(r.name)}</div><div class="sr">${esc(r.reason||'no proxy')}</div></div></div>`
+  ).join('');
+}
+async function saveProxy(name,idx,btn){
+  const host=$('ph'+idx).value.trim(), port=parseInt($('pp'+idx).value,10);
+  if(!host||!Number.isInteger(port)){ $('proxMsg').textContent='✗ host and numeric port required'; return; }
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
+  const d=await api(`/api/instances/${encodeURIComponent(name)}/proxy`,'POST',{host,port});
+  btn.disabled=false; btn.textContent='Save';
+  $('proxMsg').textContent=d.error?('✗ '+d.error):('✓ '+name+' → '+host+':'+port);
+}
+
+function openSettings(){
+  $('settingsScrim').classList.add('open');
+  setTab('ap');
+  renderPresets();
+}
+function closeSettings(e){
+  if(e&&e.target!==$('settingsScrim'))return;
+  $('settingsScrim').classList.remove('open');
+  if(sysTimer){clearInterval(sysTimer);sysTimer=null;}
+  applyTheme(SETTINGS); // revert any unsaved live preview
+}
+function setTab(t){
+  $('stApBtn').classList.toggle('active',t==='ap');
+  $('stSysBtn').classList.toggle('active',t==='sys');
+  $('stAp').style.display=t==='ap'?'':'none';
+  $('stSys').style.display=t==='sys'?'':'none';
+  if(sysTimer){clearInterval(sysTimer);sysTimer=null;}
+  if(t==='sys'){loadSysInfo();loadSysJob();renderSysToggle();sysTimer=setInterval(()=>{loadSysInfo();loadSysJob();},4000);}
+}
+let SELPRESET=null, SELACCENT='';
+function renderPresets(){
+  SELPRESET=SETTINGS.theme.preset; SELACCENT=SETTINGS.theme.accent||'';
+  const presets=SETTINGS.presets;
+  $('presetRow').innerHTML=Object.keys(presets).map(k=>`
+    <div class="chip ${k===SELPRESET?'sel':''}" data-k="${k}" onclick="pickPreset('${k}')">
+      <span class="sw" style="background:${presets[k].accent}"></span>${k}</div>`).join('');
+  $('accentHex').value=SELACCENT;
+  $('accentPick').value=SELACCENT||presets[SELPRESET].accent;
+  $('accentHex').oninput=()=>{SELACCENT=$('accentHex').value.trim();$('accentPick').value=SELACCENT||presets[SELPRESET].accent;previewTheme();};
+  $('accentPick').oninput=()=>{SELACCENT=$('accentPick').value;$('accentHex').value=SELACCENT;previewTheme();};
+}
+function pickPreset(k){
+  SELPRESET=k;
+  document.querySelectorAll('#presetRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.k===k));
+  previewTheme();
+}
+function previewTheme(){ applyTheme({presets:SETTINGS.presets,theme:{preset:SELPRESET,accent:SELACCENT}}); }
+async function saveAppearance(){
+  $('apMsg').textContent='saving…';
+  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT}});
+  if(d.error){$('apMsg').textContent='✗ '+d.error;return;}
+  SETTINGS=d.settings; applyTheme(SETTINGS);
+  $('apMsg').textContent='✓ saved';
+}
+
+function fmtGB(n){return n?(n/1e9).toFixed(1)+' GB':'?';}
+function fmtUp(s){if(!s)return'?';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return `${d}d ${h}h ${m}m`;}
+async function loadSysInfo(){
+  const i=await api('/api/system/info');
+  const memPct=i.mem_total?Math.round(100*i.mem_used/i.mem_total):0;
+  const diskPct=i.disk_total?Math.round(100*i.disk_used/i.disk_total):0;
+  const load=i.load?i.load.map(x=>x.toFixed(2)).join(' '):'?';
+  $('sysInfo').innerHTML=`
+    <div class="s"><div class="k">OS</div><div class="v" style="font-size:.8rem">${esc(i.os||'?')}</div></div>
+    <div class="s"><div class="k">CPU cores</div><div class="v">${i.cpus??'?'}</div></div>
+    <div class="s"><div class="k">Load avg</div><div class="v" style="font-size:.82rem">${load}</div></div>
+    <div class="s"><div class="k">Memory</div><div class="v">${fmtGB(i.mem_used)} / ${fmtGB(i.mem_total)}</div><div class="b"><i style="width:${memPct}%"></i></div></div>
+    <div class="s"><div class="k">Disk</div><div class="v">${fmtGB(i.disk_used)} / ${fmtGB(i.disk_total)}</div><div class="b"><i style="width:${diskPct}%"></i></div></div>
+    <div class="s"><div class="k">Uptime</div><div class="v" style="font-size:.85rem">${fmtUp(i.uptime_sec)}</div></div>`;
+}
+function renderSysToggle(){
+  const on=!!(SETTINGS&&SETTINGS.system_actions_enabled);
+  $('sysEnable').checked=on;
+  $('sysDanger').style.opacity=on?'1':'.45';
+  $('sysDanger').style.pointerEvents=on?'auto':'none';
+}
+async function toggleSystem(){
+  const on=$('sysEnable').checked;
+  const d=await api('/api/settings','POST',{system_actions_enabled:on});
+  if(d.settings)SETTINGS=d.settings;
+  renderSysToggle();
+}
+async function loadSysJob(){
+  const j=await api('/api/system/job');
+  if(j&&j.status&&j.status!=='idle'){
+    $('sysJob').textContent=`[${j.name} — ${j.status}]\n`+(j.output||'');
+    const box=$('sysJob'); box.scrollTop=box.scrollHeight;
+  }
+}
+async function sysAction(action){
+  if(action==='reboot'&&!confirm('Reboot the VPS now? All proxies will drop and the manager will go offline until the host is back.'))return;
+  if(action==='update'&&!confirm('Run apt-get update && upgrade now? This can take a few minutes.'))return;
+  const d=await api('/api/system/'+action,'POST');
+  if(d.error){$('sysJob').textContent='✗ '+d.error;return;}
+  $('sysJob').textContent='['+action+'] '+(d.note||'started');
+  if(action==='update')setTimeout(loadSysJob,800);
+}
+
+function openScan(){
+  $('scanScrim').classList.add('open');
+  loadScan();
+}
+function closeScan(e){
+  if(e&&e.target!==$('scanScrim'))return;
+  $('scanScrim').classList.remove('open');
+}
+async function loadScan(){
+  $('scanMsg').textContent='scanning…';
+  $('scanList').innerHTML='';
+  let d;
+  try{ d=await api('/api/scan'); }catch(err){ $('scanMsg').textContent='scan failed'; return; }
+  const rows=d.sessions||[];
+  $('scanMsg').textContent='';
+  if(!rows.length){ $('scanList').innerHTML='<div class="hint">No unmanaged tmux sessions found.</div>'; return; }
+  $('scanList').innerHTML=rows.map((r,idx)=>`
+    <div class="scand ${r.likely_proxy?'likely':''}">
+      <div class="si">
+        <div class="sn">${esc(r.session)} ${r.likely_proxy?'<span class="tag">proxy?</span>':''}</div>
+        <div class="sp" title="${esc(r.path)}">${esc(r.path||'(no path)')} <span style="color:#586675">[${esc(r.command)}]</span></div>
+        <div class="sr">${esc(r.reason)} · launch: ${esc(r.suggested_launch)}</div>
+      </div>
+      <button class="go" id="adopt${idx}" onclick='adopt(${JSON.stringify(r.session)},this)'>Adopt</button>
+    </div>`).join('');
+}
+async function adopt(session,btn){
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
+  const d=await api('/api/adopt','POST',{session});
+  if(d.error){ btn.disabled=false; btn.textContent='Adopt'; $('scanMsg').textContent='✗ '+d.error; return; }
+  await loadScan();
+  refresh();
+}
+
+function openAdd(){
+  ['f_name','f_dir','f_launch','f_cfg','f_keys','f_to'].forEach(id=>$(id).value='');
+  $('addMsg').textContent='';
+  $('addScrim').classList.add('open');
+  setTimeout(()=>$('f_name').focus(),50);
+}
+function closeAdd(e){
+  if(e&&e.target!==$('addScrim'))return;
+  $('addScrim').classList.remove('open');
+}
+async function submitAdd(){
+  const body={
+    name:$('f_name').value.trim(),
+    dir:$('f_dir').value.trim(),
+    launch_cmd:$('f_launch').value.trim()||null,
+    config_file:$('f_cfg').value.trim()||null,
+    stop_keys:$('f_keys').value.trim()||null,
+    stop_timeout:$('f_to').value.trim()||null,
+  };
+  $('addMsg').textContent='';
+  $('addBtn').disabled=true;
+  const d=await api('/api/instances/add','POST',body);
+  $('addBtn').disabled=false;
+  if(d.error){$('addMsg').textContent='✗ '+d.error;return;}
+  $('addScrim').classList.remove('open');
+  refresh();
+}
+
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function jsq(s){return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
+function tick(){$('clock').textContent=new Date().toLocaleTimeString();}
+setInterval(tick,1000);tick();
+loadSettings();
+refresh();
+setInterval(refresh,4000);
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
