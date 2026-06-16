@@ -297,6 +297,68 @@ def list_proxies(cfg):
     return rows
 
 
+def _parse_proxy_entry(entry):
+    """Accept {'host':..,'port':..} or a 'host:port' string -> (host, port).
+    Tolerates an optional 'user:pass@' prefix (only the host:port tail is used)."""
+    if isinstance(entry, dict):
+        host, port = entry.get("host"), entry.get("port")
+    else:
+        s = str(entry).strip()
+        if not s:
+            raise ValueError("empty proxy entry")
+        if "@" in s:
+            s = s.rsplit("@", 1)[1]
+        if ":" not in s:
+            raise ValueError(f"proxy '{entry}' must be host:port")
+        host, port = s.rsplit(":", 1)
+    host = (str(host).strip() if host is not None else "")
+    if not host:
+        raise ValueError("proxy host is empty")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError(f"proxy port is not a number: {port!r}")
+    return host, port
+
+
+def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=False):
+    """Assign proxies across many instances at once.
+    target_names: list of instance names, or ['all'].
+    proxies: list of {host,port} dicts or 'host:port' strings.
+    mode: 'roundrobin' (cycle the list across targets) or 'same' (first to all).
+    Returns a list of per-target result dicts."""
+    if mode not in ("roundrobin", "same"):
+        raise ValueError("mode must be 'roundrobin' or 'same'")
+    parsed = [_parse_proxy_entry(p) for p in (proxies or [])]
+    if not parsed:
+        raise ValueError("no proxies provided")
+    if list(target_names) == ["all"]:
+        insts = list(cfg["instances"])
+    else:
+        insts = []
+        for n in target_names:
+            inst = cfg["by_name"].get(n)
+            if not inst:
+                raise ValueError(f"no such instance: {n}")
+            insts.append(inst)
+    if not insts:
+        raise ValueError("no target instances")
+    results = []
+    for idx, inst in enumerate(insts):
+        host, port = parsed[0] if mode == "same" else parsed[idx % len(parsed)]
+        row = {"name": inst["name"], "host": host, "port": port}
+        try:
+            set_proxy(inst, host=host, port=port)
+            row["ok"] = True
+            if do_restart:
+                row["restart"] = restart(inst)
+        except ValueError as e:
+            row["ok"] = False
+            row["error"] = str(e)
+        results.append(row)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # discover
 # ---------------------------------------------------------------------------
@@ -588,20 +650,31 @@ THEME_PRESETS = {
 }
 HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
+# Quick-command buttons shown in each instance's Console tab. Editable in the UI
+# (Settings -> Console) and stored under settings.console_presets. These defaults
+# are sensible AquariusProxy/ZenithProxy console commands; change them to taste.
+DEFAULT_CONSOLE_PRESETS = [
+    {"label": "Reconnect", "command": "connect"},
+    {"label": "Disconnect", "command": "disconnect"},
+    {"label": "Status", "command": "info"},
+]
+
 
 def get_settings(cfg):
     s = cfg["raw"].get("settings", {})
+    presets = s.get("console_presets")
     return {
         "theme": {
             "preset": s.get("theme", {}).get("preset", "midnight"),
             "accent": s.get("theme", {}).get("accent", ""),
         },
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
+        "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "presets": THEME_PRESETS,
     }
 
 
-def save_settings(cfg, theme=None, system_actions_enabled=None):
+def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None):
     s = cfg["raw"].setdefault("settings", {})
     if theme is not None:
         t = s.setdefault("theme", {})
@@ -617,6 +690,18 @@ def save_settings(cfg, theme=None, system_actions_enabled=None):
             t["accent"] = a
     if system_actions_enabled is not None:
         s["system_actions_enabled"] = bool(system_actions_enabled)
+    if console_presets is not None:
+        if not isinstance(console_presets, list):
+            raise ValueError("console_presets must be a list")
+        cleaned = []
+        for p in console_presets:
+            if not isinstance(p, dict):
+                raise ValueError("each console preset must be an object with label + command")
+            label = str(p.get("label", "")).strip()
+            command = str(p.get("command", "")).strip()
+            if label and command:          # silently drop blank rows
+                cleaned.append({"label": label, "command": command})
+        s["console_presets"] = cleaned
     save_config(cfg)
     return get_settings(cfg)
 
@@ -1055,7 +1140,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 p = json.loads(self._read_body() or b"{}")
                 out = save_settings(cfg, theme=p.get("theme"),
-                                    system_actions_enabled=p.get("system_actions_enabled"))
+                                    system_actions_enabled=p.get("system_actions_enabled"),
+                                    console_presets=p.get("console_presets"))
                 return self._json({"ok": True, "settings": out})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
@@ -1138,6 +1224,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no such instance"}, 404)
             action = {"start": start, "stop": stop, "restart": restart}[m.group(2)]
             return self._json({"result": action(inst), "status": instance_status(inst)})
+
+        # bulk proxy assignment (round-robin / same) across many instances
+        if path == "/api/proxies/bulk":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                res = set_proxies_bulk(
+                    cfg, p.get("targets") or [], p.get("proxies") or [],
+                    mode=p.get("mode", "roundrobin"), do_restart=bool(p.get("restart")))
+                return self._json({"ok": True, "results": res})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
 
         # update proxy host/port
         m = re.match(r"^/api/instances/([^/]+)/proxy$", path)
@@ -1292,6 +1391,14 @@ def main():
     p.add_argument("--enable", dest="p_enable", action="store_true")
     p.add_argument("--disable", dest="p_disable", action="store_true")
 
+    p = sub.add_parser("proxybulk", help="assign proxies across many instances (round-robin or same)")
+    p.add_argument("--targets", default="all",
+                   help="comma-separated instance names, or 'all' (default)")
+    p.add_argument("--list", dest="plist", required=True,
+                   help="host:port entries, comma- or newline-separated")
+    p.add_argument("--mode", choices=["roundrobin", "same"], default="roundrobin")
+    p.add_argument("--restart", action="store_true", help="restart each instance after assigning")
+
     p = sub.add_parser("set", help="edit an instance field (name or 'all')")
     p.add_argument("name")
     p.add_argument("field", choices=SETTABLE_FIELDS)
@@ -1404,6 +1511,21 @@ def main():
                 print(f"{args.name}: set to {r['host']}:{r['port']}")
             except ValueError as e:
                 die(str(e))
+    elif args.cmd == "proxybulk":
+        tnames = [t for t in re.split(r"[,\s]+", args.targets) if t]
+        if "all" in tnames:
+            tnames = ["all"]
+        plist = [s for s in re.split(r"[,\n]+", args.plist) if s.strip()]
+        try:
+            rows = set_proxies_bulk(cfg, tnames, plist, mode=args.mode, do_restart=args.restart)
+        except ValueError as e:
+            die(str(e))
+        for r in rows:
+            if r.get("ok"):
+                extra = f"  ({r['restart']})" if "restart" in r else ""
+                print(f"{r['name']}: -> {r['host']}:{r['port']}{extra}")
+            else:
+                print(f"{r['name']}: error: {r.get('error')}")
     elif args.cmd == "set":
         try:
             for nm, val in set_field(cfg, args.name, args.field, args.value):
@@ -1750,10 +1872,32 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 </main>
 
 <div class="scrim" id="proxScrim" onclick="closeProxies(event)">
-  <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
-    <div class="mhead">Proxy host / port</div>
-    <div class="hint" style="margin:-.3rem 0 .5rem">Instances with a proxy field (client.connection.proxy). Edits write to config.json — restart the instance to apply.</div>
-    <div id="proxList" style="max-height:60vh;overflow:auto;display:flex;flex-direction:column;gap:.5rem">loading…</div>
+  <div class="modal" style="width:min(680px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Proxies</div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Instances with a proxy field (client.connection.proxy). Edits write to config.json — restart to apply (use ⟳ to save &amp; restart).</div>
+
+    <div class="modcard" id="bulkCard" style="margin-bottom:.4rem">
+      <div class="mhd" onclick="document.getElementById('bulkCard').classList.toggle('open')">
+        <span class="caret">▶</span><span class="mtitle">Bulk assign / rotate</span>
+      </div>
+      <div class="mbody" style="gap:.6rem">
+        <label style="color:var(--dim)">Proxy list <span class="hint">one host:port per line</span>
+          <textarea id="bulkList" spellcheck="false" placeholder="1.2.3.4:1080&#10;5.6.7.8:1080" style="min-height:84px;font-size:.76rem"></textarea></label>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="roundrobin" checked style="width:auto"> Round-robin</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="same" style="width:auto"> Same to all</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400;margin-left:auto"><input type="checkbox" id="bulkRestart" style="width:auto"> Restart after</label>
+        </div>
+        <div class="hint">Targets <span id="bulkCount"></span></div>
+        <div id="bulkTargets" style="display:flex;gap:.4rem;flex-wrap:wrap"></div>
+        <div class="mbar"><span class="msg" id="bulkMsg" style="color:var(--dim);flex:1"></span>
+          <button onclick="bulkSelectAll(true)">All</button>
+          <button onclick="bulkSelectAll(false)">None</button>
+          <button class="go" onclick="applyBulkProxies(this)">Apply</button></div>
+      </div>
+    </div>
+
+    <div id="proxList" style="max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:.5rem">loading…</div>
     <div class="mbar"><span class="msg" id="proxMsg" style="color:var(--dim)"></span>
       <button onclick="loadProxies()">Refresh</button>
       <button onclick="closeProxies()">Close</button></div>
@@ -1765,6 +1909,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <div class="mhead">Settings</div>
     <div class="tabs" style="padding:0;margin-bottom:.6rem">
       <div class="tab active" id="stApBtn" onclick="setTab('ap')">Appearance</div>
+      <div class="tab" id="stPreBtn" onclick="setTab('pre')">Console</div>
       <div class="tab" id="stSysBtn" onclick="setTab('sys')">System</div>
     </div>
 
@@ -1782,6 +1927,14 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
         <span class="msg" id="apMsg" style="color:var(--dim)"></span>
         <button class="go" onclick="saveAppearance()">Save appearance</button>
       </div>
+    </div>
+
+    <div id="stPre" style="display:none">
+      <div class="hint" style="margin-bottom:.6rem">Quick-command buttons shown in each instance's Console tab. Clicking one sends its command to the live console. Label is what you see; command is what's typed.</div>
+      <div id="preList" style="display:flex;flex-direction:column;gap:.4rem"></div>
+      <button onclick="addPreset()" style="width:auto;margin-top:.6rem">+ Add preset</button>
+      <div class="mbar"><span class="msg" id="preMsg" style="color:var(--dim);flex:1"></span>
+        <button class="go" onclick="savePresets()">Save presets</button></div>
     </div>
 
     <div id="stSys" style="display:none">
@@ -1853,6 +2006,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   <div class="body">
     <div id="tabLogs">
       <pre class="log" id="logBox">…</pre>
+      <div id="presetBar" style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.6rem"></div>
       <div class="cmdbar">
         <span class="prompt">&gt;</span>
         <input id="cmdInput" placeholder="send a console command, e.g. killAura on" autocomplete="off" spellcheck="false"
@@ -1958,8 +2112,21 @@ function showTab(t){
   $('cfgSave').style.display=t==='cfg'?'':'none';
   $('cfgSaveRestart').style.display=t==='cfg'?'':'none';
   if(logTimer){clearInterval(logTimer);logTimer=null;}
-  if(t==='logs'){loadLogs();logTimer=setInterval(loadLogs,3000);}
+  if(t==='logs'){renderPresetBar();loadLogs();logTimer=setInterval(loadLogs,3000);}
   else loadCfg();
+}
+function renderPresetBar(){
+  const bar=$('presetBar'); if(!bar)return;
+  const presets=(SETTINGS&&SETTINGS.console_presets)||[];
+  bar.innerHTML=presets.map((p,i)=>`<button class="chip" title="sends: ${esc(p.command)}" onclick="sendPreset(${i})">${esc(p.label)}</button>`).join('');
+}
+async function sendPreset(i){
+  const presets=(SETTINGS&&SETTINGS.console_presets)||[];
+  if(!presets[i]||!CUR)return;
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/command`,'POST',{command:presets[i].command});
+  if(d.error){ $('drawerMsg').textContent='✗ '+d.error; return; }
+  $('drawerMsg').textContent='✓ sent: '+presets[i].command;
+  setTimeout(loadLogs,250); setTimeout(loadLogs,1200);
 }
 async function loadLogs(){
   if(!CUR)return;
@@ -2249,32 +2416,82 @@ async function loadSettings(){
   return SETTINGS;
 }
 
+let PROXROWS=[], BULKSEL=new Set();
 function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); }
 function closeProxies(e){ if(e&&e.target!==$('proxScrim'))return; $('proxScrim').classList.remove('open'); }
 async function loadProxies(){
   $('proxMsg').textContent='';
   const d=await api('/api/proxies');
-  const rows=d.proxies||[];
-  const box=$('proxList');
-  const have=rows.filter(r=>r.found);
-  if(!have.length){ box.innerHTML='<div class="hint">No instances have a proxy field.</div>'; return; }
+  PROXROWS=d.proxies||[];
+  renderProxyList();
+  renderBulkTargets();
+}
+function renderProxyList(){
+  const rows=PROXROWS, box=$('proxList');
+  const inp='font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem';
+  if(!rows.filter(r=>r.found).length){ box.innerHTML='<div class="hint">No instances have a proxy field.</div>'; return; }
   box.innerHTML=rows.map((r,idx)=> r.found ? `
     <div class="scand likely" style="gap:.5rem">
       <div class="si"><div class="sn">${esc(r.name)}</div></div>
-      <input id="ph${idx}" value="${esc(String(r.host))}" placeholder="host" style="width:40%;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem">
-      <input id="pp${idx}" value="${esc(String(r.port))}" placeholder="port" style="width:22%;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem">
-      <button class="go" onclick="saveProxy('${jsq(r.name)}',${idx},this)">Save</button>
+      <input id="ph${idx}" value="${esc(String(r.host))}" placeholder="host" style="width:38%;${inp}">
+      <input id="pp${idx}" value="${esc(String(r.port))}" placeholder="port" style="width:20%;${inp}">
+      <button class="go" onclick="saveProxy('${jsq(r.name)}',${idx},this,false)">Save</button>
+      <button class="warn" title="Save &amp; restart" onclick="saveProxy('${jsq(r.name)}',${idx},this,true)">⟳</button>
     </div>` :
     `<div class="scand" style="opacity:.5"><div class="si"><div class="sn">${esc(r.name)}</div><div class="sr">${esc(r.reason||'no proxy')}</div></div></div>`
   ).join('');
 }
-async function saveProxy(name,idx,btn){
+async function saveProxy(name,idx,btn,restart){
   const host=$('ph'+idx).value.trim(), port=parseInt($('pp'+idx).value,10);
-  if(!host||!Number.isInteger(port)){ $('proxMsg').textContent='✗ host and numeric port required'; return; }
-  btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
+  if(!host||!Number.isInteger(port)){ $('proxMsg').style.color='var(--crash)'; $('proxMsg').textContent='✗ host and numeric port required'; return; }
+  const orig=btn.textContent; btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
   const d=await api(`/api/instances/${encodeURIComponent(name)}/proxy`,'POST',{host,port});
-  btn.disabled=false; btn.textContent='Save';
-  $('proxMsg').textContent=d.error?('✗ '+d.error):('✓ '+name+' → '+host+':'+port);
+  let extra='';
+  if(!d.error&&restart){
+    const r=await api(`/api/instances/${encodeURIComponent(name)}/restart`,'POST');
+    extra=r.error?(' — restart failed: '+r.error):(' — restarted ('+r.status+')'); refresh();
+  }
+  btn.disabled=false; btn.textContent=orig;
+  $('proxMsg').style.color=d.error?'var(--crash)':'var(--dim)';
+  $('proxMsg').textContent=d.error?('✗ '+d.error):('✓ '+name+' → '+host+':'+port+extra);
+}
+function renderBulkTargets(){
+  const found=PROXROWS.filter(r=>r.found);
+  BULKSEL=new Set(found.map(r=>r.name));   // default: all proxy-capable selected
+  $('bulkTargets').innerHTML=found.length
+    ? found.map(r=>`<div class="chip sel" data-n="${esc(r.name)}" onclick="toggleBulk('${jsq(r.name)}',this)">${esc(r.name)}</div>`).join('')
+    : '<span class="hint">No proxy-capable instances.</span>';
+  updateBulkCount();
+}
+function toggleBulk(name,el){
+  if(BULKSEL.has(name)){ BULKSEL.delete(name); el.classList.remove('sel'); }
+  else{ BULKSEL.add(name); el.classList.add('sel'); }
+  updateBulkCount();
+}
+function bulkSelectAll(on){
+  document.querySelectorAll('#bulkTargets .chip').forEach(c=>{
+    const n=c.dataset.n; c.classList.toggle('sel',on);
+    if(on)BULKSEL.add(n); else BULKSEL.delete(n);
+  });
+  updateBulkCount();
+}
+function updateBulkCount(){ $('bulkCount').textContent='('+BULKSEL.size+' selected)'; }
+async function applyBulkProxies(btn){
+  const targets=[...BULKSEL];
+  const proxies=$('bulkList').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  $('bulkMsg').style.color='var(--crash)';
+  if(!targets.length){ $('bulkMsg').textContent='select at least one target'; return; }
+  if(!proxies.length){ $('bulkMsg').textContent='paste at least one host:port'; return; }
+  const mode=document.querySelector('input[name=bulkmode]:checked').value;
+  const restart=$('bulkRestart').checked;
+  btn.disabled=true; $('bulkMsg').style.color='var(--dim)'; $('bulkMsg').textContent=restart?'applying + restarting…':'applying…';
+  const d=await api('/api/proxies/bulk','POST',{targets,proxies,mode,restart});
+  btn.disabled=false;
+  if(d.error){ $('bulkMsg').style.color='var(--crash)'; $('bulkMsg').textContent='✗ '+d.error; return; }
+  const ok=d.results.filter(r=>r.ok).length, fail=d.results.length-ok;
+  $('bulkMsg').style.color=fail?'var(--warn)':'var(--dim)';
+  $('bulkMsg').textContent=`✓ ${ok} updated`+(fail?` · ${fail} failed`:'')+(restart?' · restarted':'');
+  loadProxies(); if(restart)refresh();
 }
 
 function openSettings(){
@@ -2290,11 +2507,39 @@ function closeSettings(e){
 }
 function setTab(t){
   $('stApBtn').classList.toggle('active',t==='ap');
+  $('stPreBtn').classList.toggle('active',t==='pre');
   $('stSysBtn').classList.toggle('active',t==='sys');
   $('stAp').style.display=t==='ap'?'':'none';
+  $('stPre').style.display=t==='pre'?'':'none';
   $('stSys').style.display=t==='sys'?'':'none';
   if(sysTimer){clearInterval(sysTimer);sysTimer=null;}
+  if(t==='pre'){renderPresetEditor();}
   if(t==='sys'){loadSysInfo();loadSysJob();renderSysToggle();sysTimer=setInterval(()=>{loadSysInfo();loadSysJob();},4000);}
+}
+function presetRow(label,command){
+  const row=document.createElement('div'); row.style.cssText='display:flex;gap:.4rem;align-items:center';
+  const l=document.createElement('input'); l.className='pl'; l.placeholder='Label'; l.value=label||''; l.style.flex='1';
+  const c=document.createElement('input'); c.className='pc'; c.placeholder='command'; c.value=command||''; c.style.cssText='flex:2;font-family:var(--mono)';
+  const rm=document.createElement('button'); rm.className='danger'; rm.textContent='✕'; rm.style.width='auto'; rm.onclick=()=>row.remove();
+  row.appendChild(l); row.appendChild(c); row.appendChild(rm);
+  return row;
+}
+function renderPresetEditor(){
+  const presets=(SETTINGS&&SETTINGS.console_presets)||[];
+  const box=$('preList'); box.innerHTML='';
+  (presets.length?presets:[{label:'',command:''}]).forEach(p=>box.appendChild(presetRow(p.label,p.command)));
+  $('preMsg').textContent='';
+}
+function addPreset(){ $('preList').appendChild(presetRow('','')); }
+async function savePresets(){
+  const presets=[...$('preList').children].map(r=>({
+    label:r.querySelector('.pl').value.trim(), command:r.querySelector('.pc').value.trim()
+  })).filter(p=>p.label&&p.command);
+  $('preMsg').style.color='var(--dim)'; $('preMsg').textContent='saving…';
+  const d=await api('/api/settings','POST',{console_presets:presets});
+  if(d.error){ $('preMsg').style.color='var(--crash)'; $('preMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; renderPresetBar();
+  $('preMsg').style.color='var(--dim)'; $('preMsg').textContent='✓ saved ('+presets.length+')';
 }
 let SELPRESET=null, SELACCENT='';
 function renderPresets(){

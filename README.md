@@ -67,6 +67,8 @@ abm boot                                  # start all autostart instances (run a
 abm send    bot1 killAura on              # send a command to the live console
 abm proxies                               # list each instance's proxy host:port
 abm proxy   bot1 --host 1.2.3.4 --port 1080   # set proxy (view if no flags)
+abm proxybulk --list "1.2.3.4:1080,5.6.7.8:1080" [--targets a,b,c|all] [--mode roundrobin|same] [--restart]
+                                          # assign/rotate proxies across many instances at once
 
 # host / settings / auth
 abm sysinfo
@@ -86,8 +88,14 @@ Browse to http://127.0.0.1:8765.
 - **+ New instance** — add via a form.
 - **⟲ Scan existing** — detect unmanaged tmux sessions and adopt them.
 - **⚙ Settings** — Appearance (theme presets + accent) and System (host dashboard + reboot/update).
-- **🌐 Proxies** — quick host/port editor for instances using `client.connection.proxy`.
-- Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin); **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback. The ★ on each card toggles autostart.
+- **🌐 Proxies** — quick host/port editor for instances using `client.connection.proxy`. Each row has **Save** and **⟳** (save **& restart**). A **Bulk assign / rotate** panel lets you paste a list of `host:port` proxies and apply them across selected instances — **round-robin** (cycle the list across targets) or **same to all** — with an optional restart-after.
+- Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin) plus **quick-command preset buttons**; **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback and **Save** / **Save & Restart**. The ★ on each card toggles autostart.
+
+### Console presets
+The buttons above the console command bar are editable in **Settings → Console** (label + the command it types). They're stored under `settings.console_presets` in `instances.json`. Defaults are `Reconnect` (`connect`), `Disconnect` (`disconnect`), and `Status` (`info`) — adjust them to your proxy's commands.
+
+### Bulk / round-robin proxies
+If you rotate through a pool of proxy IPs, paste them (one `host:port` per line) into the Proxies → Bulk panel, pick the targets, and choose **round-robin** to spread them out or **same to all** to point everyone at one. The same is available headless: `abm proxybulk --list ... --mode roundrobin --restart`. Each write goes to that instance's `config.json` and applies on (optional) restart.
 
 ## Detecting proxies you already run (scan / adopt)
 Your manually-started sessions have arbitrary names, so scan inspects every live tmux session and flags likely Aquarius/Zenith proxy sessions using three signals (any one is enough):
