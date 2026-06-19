@@ -11,6 +11,7 @@ packages:
   - wget
   - git
   - curl
+# For public HTTPS instead of a tunnel, add  ABM_ACCESS=https ABM_DOMAIN=bots.example.com  to the line below.
 runcmd:
-  - 'curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Aquarius-Bot-Manager/main/install.sh | ABM_RUN_USER=ubuntu bash'
-final_message: "Aquarius Bot Manager installed. SSH-tunnel to 127.0.0.1:8765, run `sudo -u ubuntu abm setpassword`, then Deploy proxies."
+  - 'curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Aquarius-Bot-Manager/main/install.sh | ABM_RUN_USER=ubuntu ABM_ACCESS=tunnel bash'
+final_message: "Aquarius Bot Manager installed. SSH-tunnel to 127.0.0.1:8765 and open http://localhost:8765 — first visit creates your login, then Deploy proxies."

@@ -20,17 +20,25 @@ AquariusProxy is a ZenithProxy fork, so they share the same launch model and con
 - `python3` (3.8+) and `tmux`: `sudo apt install tmux`
 
 ## Provision a fresh VPS (recommended)
-On a new Ubuntu box, one command installs everything (deps, the manager, systemd units, lingering for resource caps) and starts the web UI on localhost:
+On a new Ubuntu box, **one command** installs everything (deps, the manager, systemd units, lingering for resource caps), starts the web UI, and prints the exact line to reach it:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Aquarius-Bot-Manager/main/install.sh | sudo bash
-# override defaults: sudo ABM_RUN_USER=ubuntu ABM_PORT=8765 ABM_BASE_DIR=/home/ubuntu/zenith bash install.sh
 ```
-Then:
-1. `sudo -u ubuntu abm setpassword` — set the web login.
-2. From your computer: `ssh -L 8765:127.0.0.1:8765 ubuntu@<vps-ip>`, open `http://localhost:8765`.
-3. Click **🚀 Deploy** to add proxies.
+It asks how you want to reach the UI:
+- **SSH tunnel** (default, most secure) — stays on `127.0.0.1`; the installer prints a ready-to-paste `ssh -L … you@<your-detected-ip>` line. Paste it on your computer, open `http://localhost:8765`.
+- **Public HTTPS** — fronts the manager with Caddy so you just open `https://<vps>` (give it a domain for a trusted cert, or accept a one-time self-signed warning).
 
-To provision at boot, paste `cloud-init.yaml` into your provider's user-data field (edit `ABM_RUN_USER` if not `ubuntu`).
+There's **no CLI password step** — the first time you open the UI it walks you through creating your login, then you click **🚀 Deploy** to add proxies. That's the whole flow.
+
+Scripted / non-interactive overrides:
+```bash
+# pick the access mode up front (no prompt); override any default
+sudo ABM_ACCESS=tunnel bash install.sh
+sudo ABM_ACCESS=https ABM_DOMAIN=bots.example.com bash install.sh
+sudo ABM_RUN_USER=ubuntu ABM_PORT=8765 ABM_BASE_DIR=/home/ubuntu/zenith bash install.sh
+```
+
+To provision at boot, paste `cloud-init.yaml` into your provider's user-data field (edit `ABM_RUN_USER` if not `ubuntu`; add `ABM_ACCESS=https ABM_DOMAIN=…` for public HTTPS).
 
 ## Manual install
 ```bash
@@ -184,11 +192,11 @@ tmux sessions don't survive a reboot, so "auto-restart" means **re-launch on boo
 ## Remote access & login
 The web UI has a real login page with server-side sessions (HttpOnly cookie, 7-day expiry), a salted PBKDF2 password hash stored in `instances.json` (never plaintext), and login rate-limiting (5 tries / 5 min per IP).
 
+**First run = a browser setup wizard.** Before any login exists, the whole UI is replaced by a one-screen "create your admin login" form (the rest of the app is locked until you do). Submitting it sets the password and signs you in — no CLI step. You can still skip it from that screen to run open on localhost (e.g. behind an SSH tunnel), and you can change credentials later:
 ```bash
-abm setpassword       # prompts for username + password
+abm setpassword       # set/replace the login from the CLI (also works headless)
 abm logout-all        # invalidate active sessions
 ```
-Until a password is set, the UI is open to anyone who can reach the port — so set one, or keep it on localhost (default).
 
 ### Recommended: SSH tunnel (no new exposure)
 Keep the manager on `127.0.0.1` (default) and forward the port from your local machine:

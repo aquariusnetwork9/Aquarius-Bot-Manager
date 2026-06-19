@@ -40,7 +40,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1518,6 +1518,14 @@ class Handler(BaseHTTPRequestHandler):
         # Auth is enforced if a password has been set, or legacy env creds exist.
         return auth_configured(cfg) or bool(ABM_USER and ABM_PASS)
 
+    def _needs_setup(self, cfg):
+        # First run: no login configured at all and the user hasn't explicitly
+        # chosen to run open. The web setup wizard then takes over the whole UI
+        # so onboarding is "open the page → create a login" with no CLI step.
+        if auth_configured(cfg) or (ABM_USER and ABM_PASS):
+            return False
+        return not bool(cfg["raw"].get("settings", {}).get("setup_skipped"))
+
     def _auth_ok(self, cfg):
         if not self._auth_required(cfg):
             return True
@@ -1593,7 +1601,15 @@ class Handler(BaseHTTPRequestHandler):
         # whether auth is on, expose it so the login page can decide what to show
         if path == "/api/authstatus":
             return self._json({"required": self._auth_required(cfg),
-                               "authed": self._auth_ok(cfg)})
+                               "authed": self._auth_ok(cfg),
+                               "needs_setup": self._needs_setup(cfg)})
+
+        # First run: the setup wizard owns the UI until a login is created
+        # (or the user explicitly skips to run open on localhost).
+        if self._needs_setup(cfg):
+            if path in ("/", "/index.html", "/login", "/setup"):
+                return self._html(SETUP_PAGE)
+            return self._json({"error": "setup required"}, 401)
 
         if not self._auth_ok(cfg):
             # unauthenticated: only the login page and its check are reachable
@@ -1692,6 +1708,33 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         cfg = self._cfg()
+
+        # First-run setup wizard: create the first login from the browser
+        # (replaces `abm setpassword`). Only reachable while no auth exists,
+        # so it can never be used to reset an existing password.
+        if path == "/api/setup":
+            if auth_configured(cfg):
+                return self._json({"error": "a login is already configured"}, 409)
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            try:
+                set_password(cfg, p.get("username", "").strip(), p.get("password", ""))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            # log the new admin straight in
+            cfg = self._cfg()
+            return self._json({"ok": True}, cookie=_new_session(session_epoch(cfg)))
+
+        # First-run "skip" — run open on localhost, remember the choice so the
+        # wizard doesn't reappear every visit.
+        if path == "/api/setup/skip":
+            if not self._needs_setup(cfg):
+                return self._json({"ok": True})
+            cfg["raw"].setdefault("settings", {})["setup_skipped"] = True
+            save_config(cfg)
+            return self._json({"ok": True})
 
         # login is the one POST reachable without a session
         if path == "/api/login":
@@ -1937,8 +1980,10 @@ def serve(cfg_path, host, port):
         auth = "ON (login required)"
     elif ABM_USER and ABM_PASS:
         auth = "ON (basic auth env)"
+    elif not cfg["raw"].get("settings", {}).get("setup_skipped"):
+        auth = "SETUP — open the UI to create your login (first-run wizard)"
     else:
-        auth = "OFF — run `manager.py setpassword`, or keep this bound to 127.0.0.1"
+        auth = "OFF — running open (skipped); keep this bound to 127.0.0.1"
     print(f"Aquarius Bot Manager {__version__} serving http://{host}:{port}   auth: {auth}")
     if host not in ("127.0.0.1", "localhost", "::1") and auth.startswith("OFF"):
         print("WARNING: listening on a non-local address with NO auth. Anyone who can reach "
@@ -2303,6 +2348,85 @@ def main():
 # Web page (served as a single string)
 # ---------------------------------------------------------------------------
 
+SETUP_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Bot Manager — Welcome</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0e12;--panel:#11171e;--line:#1d2730;--txt:#dfe7ee;--dim:#7b8a98;--acc:#3ddc97;--acc-dim:#1f7a55;--crash:#ff5d5d}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  font-family:'Sora',system-ui,sans-serif;color:var(--txt);
+  background:radial-gradient(900px 500px at 80% -10%,#12372a33,transparent 60%),
+   radial-gradient(700px 400px at 0% 0%,#10202e55,transparent 55%),var(--bg)}
+.card{width:min(400px,92vw);background:linear-gradient(180deg,var(--panel),#0d1319);
+  border:1px solid var(--line);border-radius:16px;padding:2rem 1.8rem;box-shadow:0 30px 80px #000a}
+.brand{display:flex;align-items:center;gap:.6rem;font-weight:800;font-size:1.2rem;letter-spacing:-.02em;margin-bottom:.3rem}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc)}
+.sub{color:var(--dim);font-size:.82rem;margin-bottom:1.3rem;line-height:1.5}
+label{display:block;font-size:.78rem;font-weight:600;color:var(--dim);margin:.8rem 0 .3rem}
+input{width:100%;font-family:'Space Mono',monospace;font-size:.85rem;background:#06090c;color:#cdd9e2;
+  border:1px solid var(--line);border-radius:9px;padding:.6rem .7rem}
+input:focus{outline:none;border-color:var(--acc)}
+button{width:100%;margin-top:1.3rem;cursor:pointer;border:1px solid var(--acc-dim);background:var(--panel);
+  color:var(--acc);font-weight:700;font-size:.9rem;padding:.65rem;border-radius:10px;font-family:inherit;transition:.15s}
+button:hover{background:#15201b}
+button:disabled{opacity:.5;cursor:not-allowed}
+.skip{margin-top:.9rem;width:100%;background:none;border:none;color:#586675;font-size:.72rem;
+  cursor:pointer;text-decoration:underline;padding:.2rem}
+.skip:hover{color:var(--dim)}
+.msg{margin-top:.9rem;font-family:'Space Mono',monospace;font-size:.74rem;color:var(--crash);min-height:1em;text-align:center}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand"><span class="dot"></span>Aquarius Bot Manager</div>
+  <div class="sub">Welcome — create your admin login to finish setup. This is the only account; you can change it later from Settings.</div>
+  <label for="u">Choose a username</label>
+  <input id="u" autocomplete="username" autofocus onkeydown="k(event)">
+  <label for="p">Choose a password</label>
+  <input id="p" type="password" autocomplete="new-password" onkeydown="k(event)">
+  <label for="p2">Confirm password</label>
+  <input id="p2" type="password" autocomplete="new-password" onkeydown="k(event)">
+  <button id="btn" onclick="setup()">Create login &amp; continue</button>
+  <button class="skip" onclick="skip()">Skip — run open on localhost only</button>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+function k(e){ if(e.key==='Enter') setup(); }
+async function setup(){
+  const username=$('u').value.trim(), password=$('p').value, p2=$('p2').value;
+  if(!username||!password){ $('msg').textContent='enter a username and password'; return; }
+  if(password.length<6){ $('msg').textContent='password must be at least 6 characters'; return; }
+  if(password!==p2){ $('msg').textContent='passwords do not match'; return; }
+  $('btn').disabled=true; $('msg').style.color='var(--dim)'; $('msg').textContent='creating…';
+  try{
+    const r=await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password})});
+    const d=await r.json();
+    if(r.ok&&d.ok){ location.href='/'; return; }
+    $('msg').style.color='var(--crash)'; $('msg').textContent='✗ '+(d.error||'setup failed');
+  }catch(e){ $('msg').style.color='var(--crash)'; $('msg').textContent='✗ connection error'; }
+  $('btn').disabled=false;
+}
+async function skip(){
+  if(!confirm('Run with no login? Only do this if the manager stays on localhost (e.g. reached over an SSH tunnel). Anyone who can reach the port will have full control.')) return;
+  try{
+    const r=await fetch('/api/setup/skip',{method:'POST'});
+    if(r.ok){ location.href='/'; return; }
+  }catch(e){}
+  $('msg').style.color='var(--crash)'; $('msg').textContent='✗ could not save';
+}
+</script>
+</body>
+</html>
+"""
+
 LOGIN_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2353,7 +2477,7 @@ async function init(){
   try{
     const r=await fetch('/api/authstatus'); const d=await r.json();
     if(!d.required){ $('sub').textContent='No password set yet';
-      $('hint').innerHTML='No login is configured. Set one on the server with <b>abm setpassword</b>, or just open the app — access is currently open on this address.';
+      $('hint').innerHTML='This manager is running open (no login). To add one, run <b>abm setpassword</b> on the server, then reload.';
       $('btn').textContent='Open app'; $('btn').onclick=()=>location.href='/'; }
   }catch(e){}
 }

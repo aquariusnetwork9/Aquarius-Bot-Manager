@@ -3,8 +3,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Aquarius-Bot-Manager/main/install.sh | sudo bash
 #
-# Override defaults with env vars:
-#   sudo ABM_RUN_USER=ubuntu ABM_PORT=8765 ABM_BASE_DIR=/home/ubuntu/zenith bash install.sh
+# That one command installs everything and ends by printing the single line you
+# paste on your own computer to reach the UI. You set the login in the browser
+# on first visit — there is no separate CLI password step.
+#
+# Non-interactive / scripted overrides (env vars):
+#   ABM_ACCESS=tunnel            keep on localhost, reach it over an SSH tunnel (default)
+#   ABM_ACCESS=https             expose over HTTPS via Caddy (set ABM_DOMAIN for a real cert)
+#   ABM_DOMAIN=bots.example.com  domain pointed at this VPS (HTTPS mode; omit for a self-signed cert)
+#   ABM_RUN_USER=ubuntu  ABM_PORT=8765  ABM_BASE_DIR=/home/ubuntu/zenith
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -21,7 +28,28 @@ PORT="${ABM_PORT:-8765}"
 USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 BASE_DIR="${ABM_BASE_DIR:-$USER_HOME/zenith}"
 
-echo "==> Installing Aquarius Bot Manager  (user=$RUN_USER dir=$INSTALL_DIR base=$BASE_DIR port=$PORT)"
+# ---- choose how the UI is reached ------------------------------------------
+# tunnel = stay on 127.0.0.1 (most secure, default); https = public via Caddy.
+ACCESS="${ABM_ACCESS:-}"
+if [ -z "$ACCESS" ]; then
+  if [ -r /dev/tty ]; then
+    echo
+    echo "How do you want to reach the web UI from your own computer?"
+    echo "  1) SSH tunnel   — keep it private on localhost (recommended, no exposure)"
+    echo "  2) Public HTTPS — open it on https://<this-vps> via Caddy (needs a domain for a trusted cert)"
+    printf "Choose [1/2] (default 1): " > /dev/tty
+    read -r choice < /dev/tty || choice=""
+    case "$choice" in 2|https|HTTPS) ACCESS="https" ;; *) ACCESS="tunnel" ;; esac
+    if [ "$ACCESS" = "https" ] && [ -z "${ABM_DOMAIN:-}" ]; then
+      printf "Domain pointed at this VPS (blank = self-signed cert with a browser warning): " > /dev/tty
+      read -r ABM_DOMAIN < /dev/tty || ABM_DOMAIN=""
+    fi
+  else
+    ACCESS="tunnel"   # non-interactive default: never auto-expose
+  fi
+fi
+
+echo "==> Installing Aquarius Bot Manager  (user=$RUN_USER dir=$INSTALL_DIR base=$BASE_DIR port=$PORT access=$ACCESS)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -67,18 +95,70 @@ systemctl daemon-reload
 systemctl enable --now aquarius-bot-manager.service
 systemctl enable aquarius-bot-manager-boot.service
 
+# best-effort public IP for the printed instructions
+PUBIP="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+[ -z "$PUBIP" ] && PUBIP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[ -z "$PUBIP" ] && PUBIP="<this-vps-ip>"
+
+# ---- HTTPS path: front the manager with Caddy --------------------------------
+if [ "$ACCESS" = "https" ]; then
+  echo "==> Setting up HTTPS via Caddy"
+  if ! command -v caddy >/dev/null 2>&1; then
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+      > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -y
+    apt-get install -y caddy
+  fi
+  if [ -n "${ABM_DOMAIN:-}" ]; then
+    cat > /etc/caddy/Caddyfile <<CADDY
+${ABM_DOMAIN} {
+    reverse_proxy 127.0.0.1:${PORT}
+}
+CADDY
+    UI_URL="https://${ABM_DOMAIN}"
+    CERT_NOTE=""
+  else
+    cat > /etc/caddy/Caddyfile <<CADDY
+:443 {
+    tls internal
+    reverse_proxy 127.0.0.1:${PORT}
+}
+CADDY
+    UI_URL="https://${PUBIP}"
+    CERT_NOTE="  (self-signed cert — your browser will warn once; click through. Set ABM_DOMAIN for a trusted cert.)"
+  fi
+  systemctl enable --now caddy 2>/dev/null || systemctl restart caddy
+  systemctl reload caddy 2>/dev/null || systemctl restart caddy
+
+  cat <<DONE
+
+==> Done. Aquarius Bot Manager is live.
+
+Open it in your browser:
+    ${UI_URL}
+${CERT_NOTE}
+First visit walks you through creating your login. Then click 🚀 Deploy to add proxies.
+A login is required in this mode — don't skip it, since the port is public.
+DONE
+else
+  cat <<DONE
+
+==> Done. Aquarius Bot Manager is running privately on 127.0.0.1:${PORT}.
+
+Open it in 2 steps:
+  1) On YOUR computer, paste this (keep the terminal open):
+       ssh -L ${PORT}:127.0.0.1:${PORT} ${RUN_USER}@${PUBIP}
+  2) Open http://localhost:${PORT}
+
+First visit walks you through creating your login. Then click 🚀 Deploy to add proxies.
+DONE
+fi
+
 cat <<DONE
 
-==> Done. Aquarius Bot Manager is running on 127.0.0.1:$PORT (localhost only).
-
-Next steps:
-  1) Set a web login:
-       sudo -u $RUN_USER abm setpassword
-  2) Reach the UI from your computer over an SSH tunnel:
-       ssh -L $PORT:127.0.0.1:$PORT $RUN_USER@<this-vps-ip>
-     then open  http://localhost:$PORT
-  3) In the UI, click  🚀 Deploy  to add AquariusProxy / ZenithProxy / a custom fork.
-
   (Optional) allow reboot / OS-update from the UI by granting tight passwordless sudo:
-     echo '$RUN_USER ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/apt-get' | sudo tee /etc/sudoers.d/aquarius-bot-manager
+     echo '${RUN_USER} ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/apt-get' | sudo tee /etc/sudoers.d/aquarius-bot-manager
 DONE
