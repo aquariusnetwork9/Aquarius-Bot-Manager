@@ -10,6 +10,7 @@ AquariusProxy is a ZenithProxy fork, so they share the same launch model and con
 - `manager.py` — the program (CLI + web server, single source of truth)
 - `schema.py` — curated AquariusProxy/ZenithProxy config schema for the structured editor
 - `abm` — short CLI wrapper (`abm restart bot1`)
+- `fleet.py` — **experimental** multi-droplet fleet controller (DigitalOcean); `abmfleet` is its wrapper. See the wiki's _Fleet (DigitalOcean)_ page
 - `install.sh` — fresh-VPS installer (curl | sudo bash)
 - `cloud-init.yaml` — first-boot provisioning template for cloud providers
 - `aquarius-bot-manager.service` — systemd unit for the web UI

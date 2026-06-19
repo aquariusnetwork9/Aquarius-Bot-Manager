@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper around fleet.py so you can run e.g. `abmfleet status`.
+# Install:  sudo ln -s /opt/aquarius-bot-manager/abmfleet /usr/local/bin/abmfleet
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$DIR/fleet.py" "$@"

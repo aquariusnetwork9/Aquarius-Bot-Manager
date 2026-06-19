@@ -29,9 +29,13 @@ USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 BASE_DIR="${ABM_BASE_DIR:-$USER_HOME/zenith}"
 
 # ---- choose how the UI is reached ------------------------------------------
-# tunnel = stay on 127.0.0.1 (most secure, default); https = public via Caddy.
+# tunnel = stay on 127.0.0.1 (most secure, default); https = public via Caddy;
+# agent  = fleet member, binds the VPC private IP + HTTP Basic auth (set by the
+#          fleet controller's cloud-init; needs ABM_USER + ABM_PASS).
 ACCESS="${ABM_ACCESS:-}"
-if [ -z "$ACCESS" ]; then
+if [ "$ACCESS" = "agent" ]; then
+  : # non-interactive: provisioned by the fleet controller, skip the prompt
+elif [ -z "$ACCESS" ]; then
   if [ -r /dev/tty ]; then
     echo
     echo "How do you want to reach the web UI from your own computer?"
@@ -49,7 +53,19 @@ if [ -z "$ACCESS" ]; then
   fi
 fi
 
-echo "==> Installing Aquarius Bot Manager  (user=$RUN_USER dir=$INSTALL_DIR base=$BASE_DIR port=$PORT access=$ACCESS)"
+# agent mode binds the droplet's VPC private IP so the controller (in the same
+# VPC) can reach it, while it stays off the public internet.
+BIND_HOST="127.0.0.1"
+if [ "$ACCESS" = "agent" ]; then
+  if [ -z "${ABM_USER:-}" ] || [ -z "${ABM_PASS:-}" ]; then
+    echo "ERROR: agent mode requires ABM_USER and ABM_PASS (the fleet credentials)."; exit 1
+  fi
+  BIND_HOST="$(curl -fsSL --max-time 3 http://169.254.169.254/metadata/v2/interfaces/private/0/ipv4/address 2>/dev/null || true)"
+  [ -z "$BIND_HOST" ] && BIND_HOST="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1)"
+  [ -z "$BIND_HOST" ] && BIND_HOST="0.0.0.0"
+fi
+
+echo "==> Installing Aquarius Bot Manager  (user=$RUN_USER dir=$INSTALL_DIR base=$BASE_DIR port=$PORT access=$ACCESS bind=$BIND_HOST)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -63,8 +79,9 @@ else
   rm -rf "$INSTALL_DIR"
   git clone --depth 1 "$REPO" "$INSTALL_DIR"
 fi
-chmod +x "$INSTALL_DIR/abm" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/abm" "$INSTALL_DIR/abmfleet" 2>/dev/null || true
 ln -sf "$INSTALL_DIR/abm" /usr/local/bin/abm
+ln -sf "$INSTALL_DIR/abmfleet" /usr/local/bin/abmfleet
 
 # base dir for proxy instances
 mkdir -p "$BASE_DIR"
@@ -84,12 +101,18 @@ chown -R "$RUN_USER":"$RUN_USER" "$INSTALL_DIR" "$BASE_DIR"
 loginctl enable-linger "$RUN_USER" 2>/dev/null || \
   echo "WARN: could not enable linger; per-instance resource limits may not enforce."
 
-# install systemd units (patch the run user + bind port from the bundled templates)
+# install systemd units (patch the run user + bind host/port from the bundled templates)
 for unit in aquarius-bot-manager.service aquarius-bot-manager-boot.service; do
   sed -e "s/^User=.*/User=$RUN_USER/" \
-      -e "s#serve --host 127.0.0.1 --port 8765#serve --host 127.0.0.1 --port $PORT#" \
+      -e "s#serve --host 127.0.0.1 --port 8765#serve --host $BIND_HOST --port $PORT#" \
       "$INSTALL_DIR/$unit" > "/etc/systemd/system/$unit"
 done
+
+# agent mode: bake the fleet's Basic-auth credentials into the web unit's env
+if [ "$ACCESS" = "agent" ]; then
+  sed -i "/^\[Service\]/a Environment=ABM_USER=$ABM_USER\nEnvironment=ABM_PASS=$ABM_PASS" \
+      /etc/systemd/system/aquarius-bot-manager.service
+fi
 
 systemctl daemon-reload
 # enable = start automatically on every VPS boot/reboot (no SSH needed); --now also starts it right away
@@ -108,8 +131,17 @@ PUBIP="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
 [ -z "$PUBIP" ] && PUBIP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [ -z "$PUBIP" ] && PUBIP="<this-vps-ip>"
 
+# ---- agent path: fleet member, nothing public, reachable only on the VPC ------
+if [ "$ACCESS" = "agent" ]; then
+  cat <<DONE
+
+==> Done. This droplet is an Aquarius Bot Manager AGENT.
+    API: http://${BIND_HOST}:${PORT}  (HTTP Basic auth; reachable on the VPC only)
+    The fleet controller manages it from here — deploys/operates bots over this API.
+DONE
+
 # ---- HTTPS path: front the manager with Caddy --------------------------------
-if [ "$ACCESS" = "https" ]; then
+elif [ "$ACCESS" = "https" ]; then
   echo "==> Setting up HTTPS via Caddy"
   if ! command -v caddy >/dev/null 2>&1; then
     apt-get install -y debian-keyring debian-archive-keyring apt-transport-https

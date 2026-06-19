@@ -30,9 +30,12 @@ If your setup is one-bot-per-droplet, your options are:
 
 | Option | Reality |
 |--------|---------|
-| **Install a separate manager on each droplet** | Works, but each is its own island — separate URL, separate login, separate dashboard. You are not getting "one place to manage everything." For 1 bot per box, the manager adds little over just running the bot. |
-| **Switch to the consolidated model** | Run multiple bots on **one** bigger VPS and use **proxies** for per-bot IPs. This is what the tool is built for, and it's usually cheaper than N droplets. |
-| **Don't use this tool** | If you specifically need physical/host isolation per bot, a single-host manager isn't the right shape. |
+| **Use the Fleet controller** (experimental) | A **[[Fleet (DigitalOcean)]]** layer provisions droplets via the DigitalOcean API and aggregates each droplet's agent into one place. This is the supported path for multi-droplet — see that page (prototype, CLI-driven, not yet live-tested). |
+| **Install a separate manager on each droplet** | Works without the fleet layer, but each is its own island — separate URL, login, dashboard. |
+| **Switch to the consolidated model** | Run multiple bots on **one** bigger VPS and use **proxies** for per-bot IPs. Usually far cheaper than N droplets. |
+| **Don't use this tool** | If you need a model none of the above fit. |
+
+> The fleet controller does **not** change the core: each droplet still runs the single-host manager. It adds provisioning + aggregation on top. See **[[Fleet (DigitalOcean)]]**.
 
 ### Why one-bot-per-droplet at all?
 People do it for **IP diversity** (each droplet has a unique IP, avoiding shared-IP detection/bans), **resource isolation**, and **blast radius** (one bot dying doesn't touch the others). This tool's answer to the first is **proxies**; to the second, **cgroup limits**; the third (true host isolation) it deliberately does not provide.

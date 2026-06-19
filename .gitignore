@@ -1,6 +1,9 @@
 # Runtime config (contains instance roster, theme, and the PBKDF2 password hash)
 instances.json
 
+# Fleet registry (contains the DigitalOcean API token + agent credentials)
+fleet.json
+
 # Python
 __pycache__/
 *.py[cod]

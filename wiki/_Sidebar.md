@@ -5,5 +5,6 @@
 - [[Usage]]
 - [[Configuration]]
 - [[Proxies]]
+- [[Fleet (DigitalOcean)]]
 - **[[Security]]** ⚠️
 - [[Architecture and Limitations]]
