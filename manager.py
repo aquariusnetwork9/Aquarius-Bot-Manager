@@ -24,6 +24,7 @@ $ABM_CONFIG, or --config PATH.
 
 import argparse
 import base64
+import getpass
 import hashlib
 import hmac
 import html
@@ -40,7 +41,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -307,6 +308,8 @@ def write_instance_config(inst, text):
 
 _HOST_KEYS = ("host", "address", "ip", "server", "hostname")
 _PORT_KEYS = ("port",)
+_USER_KEYS = ("user", "username", "login")
+_PASS_KEYS = ("password", "pass", "pwd", "secret")
 
 
 def _find_proxy_paths(obj, base=None):
@@ -321,11 +324,16 @@ def _find_proxy_paths(obj, base=None):
             host = next((kk for kk in v if kk.lower() in _HOST_KEYS), None)
             port = next((kk for kk in v if kk.lower() in _PORT_KEYS), None)
             if host and port:
-                out = {"host": base + [k, host], "port": base + [k, port]}
+                out = {"host": base + [k, host], "port": base + [k, port],
+                       "container": base + [k]}
                 en = next((kk for kk in v if kk.lower() in ("enabled", "enable", "use")), None)
                 ty = next((kk for kk in v if kk.lower() in ("type", "kind", "protocol")), None)
+                us = next((kk for kk in v if kk.lower() in _USER_KEYS), None)
+                pw = next((kk for kk in v if kk.lower() in _PASS_KEYS), None)
                 if en: out["enabled"] = base + [k, en]
                 if ty: out["type"] = base + [k, ty]
+                if us: out["user"] = base + [k, us]
+                if pw: out["password"] = base + [k, pw]
                 return out
     # 2) flat keys like proxyHost / proxyPort
     fh = next((k for k in obj if "proxy" in k.lower() and any(h in k.lower() for h in _HOST_KEYS)), None)
@@ -371,11 +379,19 @@ def get_proxy(inst):
            "host_key": ".".join(map(str, paths["host"]))}
     if "enabled" in paths:
         out["enabled"] = bool(_dig(cfg, paths["enabled"]))
+    if "user" in paths:
+        out["user"] = _dig(cfg, paths["user"]) or ""
+    # report whether credentials are set, but never echo the password back
+    pw = _dig(cfg, paths["password"]) if "password" in paths else ""
+    out["has_auth"] = bool(out.get("user")) or bool(pw)
     return out
 
 
-def set_proxy(inst, host=None, port=None, enabled=None):
-    """Update the proxy host/port/enabled in an instance's config. Returns updated values."""
+def set_proxy(inst, host=None, port=None, enabled=None, user=None, password=None,
+              ptype=None):
+    """Update the proxy host/port/enabled/user/password/type in an instance's config.
+    user/password/type keys are created under the proxy object if the config lacks
+    them (e.g. an IP-auth config that never had credentials). Returns updated values."""
     text, _ = read_instance_config(inst)
     if not text:
         raise ValueError("no config file to edit")
@@ -383,12 +399,27 @@ def set_proxy(inst, host=None, port=None, enabled=None):
     paths = _find_proxy_paths(cfg)
     if not paths:
         raise ValueError("no proxy field found in this config")
+    container = paths.get("container")
+
+    def _put(key, conventional, val):
+        # write to the discovered path, or create the conventional key under the proxy object
+        if key in paths:
+            _set(cfg, paths[key], val)
+        elif container is not None:
+            _dig(cfg, container)[conventional] = val
+
     if host is not None:
         _set(cfg, paths["host"], str(host))
     if port is not None:
         _set(cfg, paths["port"], int(port))
-    if enabled is not None and "enabled" in paths:
-        _set(cfg, paths["enabled"], bool(enabled))
+    if enabled is not None:
+        _put("enabled", "enabled", bool(enabled))
+    if user is not None:
+        _put("user", "user", str(user))
+    if password is not None:
+        _put("password", "password", str(password))
+    if ptype is not None:
+        _put("type", "type", str(ptype))
     write_instance_config(inst, json.dumps(cfg, indent=2))
     return get_proxy(inst)
 
@@ -403,19 +434,36 @@ def list_proxies(cfg):
 
 
 def _parse_proxy_entry(entry):
-    """Accept {'host':..,'port':..} or a 'host:port' string -> (host, port).
-    Tolerates an optional 'user:pass@' prefix (only the host:port tail is used)."""
+    """Parse one proxy into (host, port, user, password); user/password may be None.
+
+    Accepts:
+      - {'host':..,'port':..,'user':..,'password':..}
+      - 'host:port'
+      - 'user:pass@host:port'              (creds prefix)
+      - 'host:port:user:pass'              (Webshare download format)
+    """
+    user = password = None
     if isinstance(entry, dict):
         host, port = entry.get("host"), entry.get("port")
+        user = entry.get("user") if entry.get("user") not in ("", None) else None
+        password = entry.get("password") if entry.get("password") not in ("", None) else None
     else:
         s = str(entry).strip()
         if not s:
             raise ValueError("empty proxy entry")
-        if "@" in s:
-            s = s.rsplit("@", 1)[1]
-        if ":" not in s:
-            raise ValueError(f"proxy '{entry}' must be host:port")
-        host, port = s.rsplit(":", 1)
+        if "@" in s:                                  # user:pass@host:port
+            creds, s = s.rsplit("@", 1)
+            if ":" in creds:
+                user, password = creds.split(":", 1)
+            else:
+                user = creds
+        parts = s.split(":")
+        if len(parts) == 2:                           # host:port
+            host, port = parts
+        elif len(parts) == 4 and user is None:        # host:port:user:pass
+            host, port, user, password = parts
+        else:
+            raise ValueError(f"proxy '{entry}' must be host:port (optionally with creds)")
     host = (str(host).strip() if host is not None else "")
     if not host:
         raise ValueError("proxy host is empty")
@@ -423,14 +471,20 @@ def _parse_proxy_entry(entry):
         port = int(port)
     except (TypeError, ValueError):
         raise ValueError(f"proxy port is not a number: {port!r}")
-    return host, port
+    user = str(user).strip() if user not in (None, "") else None
+    password = str(password) if password not in (None, "") else None
+    return host, port, user, password
 
 
-def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=False):
+def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=False,
+                     enable=None, ptype=None, clear_auth=False):
     """Assign proxies across many instances at once.
     target_names: list of instance names, or ['all'].
-    proxies: list of {host,port} dicts or 'host:port' strings.
+    proxies: list of {host,port,user?,password?} dicts or 'host:port[:user:pass]' strings.
     mode: 'roundrobin' (cycle the list across targets) or 'same' (first to all).
+    enable: if not None, set proxy.enabled on each target.
+    ptype: if set, write proxy.type (e.g. 'HTTP'/'SOCKS5').
+    clear_auth: wipe user/password on each target (IP-authorization mode).
     Returns a list of per-target result dicts."""
     if mode not in ("roundrobin", "same"):
         raise ValueError("mode must be 'roundrobin' or 'same'")
@@ -450,10 +504,14 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
         raise ValueError("no target instances")
     results = []
     for idx, inst in enumerate(insts):
-        host, port = parsed[0] if mode == "same" else parsed[idx % len(parsed)]
-        row = {"name": inst["name"], "host": host, "port": port}
+        host, port, user, password = parsed[0] if mode == "same" else parsed[idx % len(parsed)]
+        if clear_auth:
+            user = password = ""        # wipe stale creds for IP-auth proxies
+        row = {"name": inst["name"], "host": host, "port": port,
+               "auth": bool(user) and not clear_auth}
         try:
-            set_proxy(inst, host=host, port=port)
+            set_proxy(inst, host=host, port=port, user=user, password=password,
+                      enabled=enable, ptype=ptype)
             row["ok"] = True
             if do_restart:
                 row["restart"] = restart(inst)
@@ -462,6 +520,108 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
             row["error"] = str(e)
         results.append(row)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Webshare proxy import  (fetch a subscription's proxy list and assign it)
+# ---------------------------------------------------------------------------
+
+WEBSHARE_API = "https://proxy.webshare.io/api/v2/proxy/list/"
+
+
+def _enc_token(t):
+    # Obfuscation at rest, NOT encryption — keeps the token from being
+    # eyeball-plaintext in instances.json. The 'b64:' marker lets us tell
+    # encoded from any legacy plaintext value.
+    t = (t or "").strip()
+    return "b64:" + base64.b64encode(t.encode()).decode() if t else ""
+
+
+def _dec_token(s):
+    s = s or ""
+    if s.startswith("b64:"):
+        try:
+            return base64.b64decode(s[4:]).decode()
+        except Exception:
+            return ""
+    return s   # tolerate a legacy plaintext token
+
+
+def _webshare_token(cfg, token=None):
+    """Resolve the API token: explicit arg > env > saved (decoded) setting."""
+    saved = cfg["raw"].get("settings", {}).get("webshare", {}).get("token") or ""
+    return (token or os.environ.get("WEBSHARE_TOKEN") or _dec_token(saved) or "").strip()
+
+
+def save_webshare_token(cfg, token):
+    cfg["raw"].setdefault("settings", {}).setdefault("webshare", {})["token"] = _enc_token(token)
+    save_config(cfg)
+
+
+def webshare_fetch(token, list_mode="direct", valid_only=True, countries=None,
+                   plan_id=None, max_pages=50):
+    """Fetch the proxy list from the Webshare API → [{host,port,user,password,country,valid}].
+    Raises ValueError on auth/HTTP errors with a readable message."""
+    import urllib.request, urllib.parse, urllib.error
+    if not token:
+        raise ValueError("no Webshare API token (pass --token, set WEBSHARE_TOKEN, or save one)")
+    if list_mode not in ("direct", "backbone"):
+        raise ValueError("list_mode must be 'direct' or 'backbone'")
+    out, page, page_size = [], 1, 100
+    while page <= max_pages:
+        params = {"mode": list_mode, "page": page, "page_size": page_size}
+        if plan_id:
+            params["plan_id"] = plan_id
+        if valid_only:
+            params["valid"] = "true"
+        if countries:
+            params["country_code__in"] = ",".join(c.strip().upper() for c in countries if c.strip())
+        url = WEBSHARE_API + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"Authorization": f"Token {token}",
+                                                   "User-Agent": "aquarius-bot-manager"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise ValueError("Webshare API rejected the token (401/403) — check the API key")
+            raise ValueError(f"Webshare API error {e.code}: {e.reason}")
+        except urllib.error.URLError as e:
+            raise ValueError(f"could not reach Webshare API: {e.reason}")
+        for it in data.get("results", []):
+            host, port = it.get("proxy_address"), it.get("port")
+            if not host or not port:
+                continue
+            out.append({"host": host, "port": port,
+                        "user": it.get("username"), "password": it.get("password"),
+                        "country": it.get("country_code"), "valid": it.get("valid")})
+        if not data.get("next"):
+            break
+        page += 1
+    return out
+
+
+def webshare_import(cfg, target_names, auth="userpass", token=None, assign_mode="roundrobin",
+                    list_mode="direct", valid_only=True, countries=None, plan_id=None,
+                    do_restart=False, ptype="HTTP"):
+    """Pull the Webshare proxy list and assign it across instances.
+    auth: 'userpass' (write per-proxy credentials) or 'ip' (host:port only, wipe creds).
+    Returns {fetched, assigned:[...]}."""
+    if auth not in ("ip", "userpass"):
+        raise ValueError("auth must be 'ip' or 'userpass'")
+    tok = _webshare_token(cfg, token)
+    proxies = webshare_fetch(tok, list_mode=list_mode, valid_only=valid_only,
+                             countries=countries, plan_id=plan_id)
+    if not proxies:
+        raise ValueError("Webshare returned no proxies (check the plan, filters, or valid-only)")
+    clear_auth = (auth == "ip")
+    entries = [{"host": p["host"], "port": p["port"],
+                "user": None if clear_auth else p.get("user"),
+                "password": None if clear_auth else p.get("password")} for p in proxies]
+    results = set_proxies_bulk(cfg, target_names, entries, mode=assign_mode,
+                               do_restart=do_restart, enable=True, ptype=ptype,
+                               clear_auth=clear_auth)
+    return {"fetched": len(proxies), "auth": auth, "assigned": results}
 
 
 # ---------------------------------------------------------------------------
@@ -1125,9 +1285,11 @@ def _launcher_asset(repo, osname, arch, log):
     raise ValueError(f"no launcher for {osname}-{arch} in {repo}@launcher-v3 (have: {have})")
 
 
-def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None):
+def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None,
+                 autostart=True):
     """Start a background deploy: download the fork's launcher, unzip into `directory`,
-    register the instance. Returns immediately; poll DEPLOY_JOB for progress."""
+    register the instance. Returns immediately; poll DEPLOY_JOB for progress.
+    autostart defaults True so a VPS reboot relaunches the bot via the boot unit."""
     name = (name or "").strip()
     if not VALID_NAME.match(name):
         raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
@@ -1167,8 +1329,11 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
         if name in fresh["by_name"]:
             log(f"'{name}' already registered — files are in place, left config as-is")
         else:
-            add_instance(fresh, name, directory, launch_cmd=launch_cmd, limits=clean_lim or None)
-            log(f"registered instance '{name}'" + (f" with limits {clean_lim}" if clean_lim else ""))
+            add_instance(fresh, name, directory, launch_cmd=launch_cmd, limits=clean_lim or None,
+                         autostart=autostart)
+            log(f"registered instance '{name}'"
+                + (f" with limits {clean_lim}" if clean_lim else "")
+                + (" [autostart on boot]" if autostart else ""))
         log("✓ deploy complete — start it from the dashboard "
             "(the launcher fetches Java + the proxy jar on first run).")
 
@@ -1220,6 +1385,7 @@ def get_settings(cfg):
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
         "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
+        "webshare_saved": bool(s.get("webshare", {}).get("token")),
     }
 
 
@@ -1489,6 +1655,66 @@ def _record_fail(ip):
 
 
 # ---------------------------------------------------------------------------
+# Connection info  (for the dashboard's reconnect panel + tunnel shortcut)
+# ---------------------------------------------------------------------------
+
+_PUBLIC_IP_CACHE = None
+
+
+def public_ip():
+    """Best-effort public IP of this VPS (cached). '' if it can't be determined."""
+    global _PUBLIC_IP_CACHE
+    if _PUBLIC_IP_CACHE is not None:
+        return _PUBLIC_IP_CACHE
+    ip = ""
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://api.ipify.org",
+                                     headers={"User-Agent": "aquarius-bot-manager"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            ip = r.read().decode().strip()
+    except Exception:
+        ip = ""
+    _PUBLIC_IP_CACHE = ip
+    return ip
+
+
+def _run_user():
+    return (os.environ.get("SUDO_USER") or os.environ.get("USER")
+            or os.environ.get("USERNAME") or getpass.getuser() or "ubuntu")
+
+
+def reconnect_script(ostype, ip, user, port):
+    """Generate a one-double-click reconnect helper for the user's LOCAL machine:
+    open the SSH tunnel to the VPS, then open the dashboard in a browser.
+    Returns (filename, mimetype, text)."""
+    ip = (ip or "").strip() or "YOUR_VPS_IP"
+    user = (user or _run_user()).strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 8765
+    fwd = f"{port}:127.0.0.1:{port}"
+    url = f"http://localhost:{port}"
+    if ostype == "windows":
+        text = ("@echo off\r\n"
+                "REM Aquarius Bot Manager - reconnect (open SSH tunnel + dashboard)\r\n"
+                f'start "" ssh -N -L {fwd} {user}@{ip}\r\n'
+                "timeout /t 2 >nul\r\n"
+                f'start "" {url}\r\n')
+        return "reconnect-aquarius.bat", "application/octet-stream", text
+    # mac (.command) and linux (.sh) share a body; opener differs
+    opener = "open" if ostype == "mac" else "xdg-open"
+    name = "reconnect-aquarius.command" if ostype == "mac" else "reconnect-aquarius.sh"
+    text = ("#!/bin/bash\n"
+            "# Aquarius Bot Manager - reconnect (open SSH tunnel + dashboard)\n"
+            f"ssh -fNL {fwd} {user}@{ip} 2>/dev/null || true\n"
+            "sleep 1\n"
+            f"{opener} {url} >/dev/null 2>&1 &\n")
+    return name, "application/octet-stream", text
+
+
+# ---------------------------------------------------------------------------
 # Web server
 # ---------------------------------------------------------------------------
 
@@ -1501,6 +1727,7 @@ ABM_PASS = os.environ.get("ABM_PASS") or os.environ.get("ZP_PASS")
 class Handler(BaseHTTPRequestHandler):
     server_version = "AquariusBotManager"
     cfg_path = DEFAULT_CONFIG
+    bind_port = 8765
 
     def log_message(self, *a):
         pass  # quiet
@@ -1658,6 +1885,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/system/info":
             return self._json(_sysinfo())
 
+        # connection info for the reconnect panel (bookmark URL + tunnel command)
+        if path == "/api/connection":
+            return self._json({"port": self.bind_port, "user": _run_user(),
+                               "public_ip": public_ip()})
+
+        # download a reconnect shortcut for the user's local machine
+        if path == "/api/connection/script":
+            ostype = q.get("os", ["windows"])[0]
+            if ostype not in ("windows", "mac", "linux"):
+                return self._json({"error": "os must be windows|mac|linux"}, 400)
+            fname, mime, text = reconnect_script(
+                ostype, q.get("ip", [""])[0], q.get("user", [""])[0],
+                q.get("port", [str(self.bind_port)])[0])
+            body = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/api/system/job":
             return self._json(SYS_JOB.snapshot())
 
@@ -1794,7 +2043,8 @@ class Handler(BaseHTTPRequestHandler):
                 p = json.loads(self._read_body() or b"{}")
                 return self._json(deploy_proxy(self.cfg_path, p.get("name"), p.get("dir"),
                                                p.get("source"), owner_repo=p.get("owner_repo"),
-                                               limits=p.get("limits")))
+                                               limits=p.get("limits"),
+                                               autostart=p.get("autostart", True)))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
             except json.JSONDecodeError as e:
@@ -1880,6 +2130,40 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError as e:
                 return self._json({"error": f"invalid request: {e}"}, 400)
 
+        # import proxies from a Webshare subscription via its API
+        if path == "/api/proxies/webshare":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+            token = _webshare_token(cfg, p.get("token"))
+            if p.get("save_token") and token:
+                save_webshare_token(cfg, token)
+                cfg = self._cfg()
+            countries = p.get("countries") or None
+            if isinstance(countries, str):
+                countries = [c for c in re.split(r"[,\s]+", countries) if c]
+            try:
+                # count-only preview: fetch and report, change nothing
+                if p.get("count_only"):
+                    got = webshare_fetch(token, list_mode=p.get("list_mode", "direct"),
+                                         valid_only=not p.get("all_proxies"),
+                                         countries=countries, plan_id=p.get("plan_id"))
+                    return self._json({"ok": True, "count": len(got),
+                                       "countries": sorted({g["country"] for g in got
+                                                            if g.get("country")}),
+                                       "saved_token": bool(p.get("save_token") and token)})
+                res = webshare_import(
+                    cfg, p.get("targets") or [], auth=p.get("auth", "userpass"), token=token,
+                    assign_mode=p.get("mode", "roundrobin"), list_mode=p.get("list_mode", "direct"),
+                    valid_only=not p.get("all_proxies"), countries=countries,
+                    plan_id=p.get("plan_id"), do_restart=bool(p.get("restart")))
+                res["ok"] = True
+                res["saved_token"] = bool(p.get("save_token") and token)
+                return self._json(res)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
         # update proxy host/port
         m = re.match(r"^/api/instances/([^/]+)/proxy$", path)
         if m:
@@ -1889,7 +2173,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 p = json.loads(self._read_body() or b"{}")
                 res = set_proxy(inst, host=p.get("host"), port=p.get("port"),
-                                enabled=p.get("enabled"))
+                                enabled=p.get("enabled"), user=p.get("user"),
+                                password=p.get("password"))
                 return self._json({"ok": True, "proxy": res})
             except ValueError as e:
                 return self._json({"error": str(e)}, 409)
@@ -1974,6 +2259,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(cfg_path, host, port):
     Handler.cfg_path = cfg_path
+    Handler.bind_port = port
     cfg = load_config(cfg_path)  # validate early
     httpd = ThreadingHTTPServer((host, port), Handler)
     if auth_configured(cfg):
@@ -2072,9 +2358,25 @@ def main():
     p.add_argument("--targets", default="all",
                    help="comma-separated instance names, or 'all' (default)")
     p.add_argument("--list", dest="plist", required=True,
-                   help="host:port entries, comma- or newline-separated")
+                   help="host:port[:user:pass] entries, comma- or newline-separated")
     p.add_argument("--mode", choices=["roundrobin", "same"], default="roundrobin")
     p.add_argument("--restart", action="store_true", help="restart each instance after assigning")
+
+    p = sub.add_parser("webshare", help="import proxies from a Webshare subscription via its API")
+    p.add_argument("action", choices=["import", "count"],
+                   help="'count' = fetch and report how many (no changes); 'import' = assign them")
+    p.add_argument("--token", default=None, help="Webshare API token (else WEBSHARE_TOKEN or saved)")
+    p.add_argument("--auth", choices=["ip", "userpass"], default="userpass",
+                   help="ip = host:port only (whitelist VPS in Webshare); userpass = per-proxy creds")
+    p.add_argument("--targets", default="all", help="instance names, or 'all' (default)")
+    p.add_argument("--mode", choices=["roundrobin", "same"], default="roundrobin")
+    p.add_argument("--list-mode", choices=["direct", "backbone"], default="direct",
+                   help="Webshare proxy list mode")
+    p.add_argument("--countries", default=None, help="comma-separated country codes, e.g. US,CA")
+    p.add_argument("--plan-id", default=None, help="target a specific Webshare plan")
+    p.add_argument("--all-proxies", action="store_true", help="include proxies Webshare marks invalid")
+    p.add_argument("--restart", action="store_true", help="restart each instance after assigning")
+    p.add_argument("--save-token", action="store_true", help="save the token for reuse")
 
     p = sub.add_parser("set", help="edit an instance field (name or 'all')")
     p.add_argument("name")
@@ -2097,6 +2399,8 @@ def main():
     p.add_argument("--dir", default=None, help="install dir (default: <base>/<name>)")
     p.add_argument("--memory", default=None, help="optional memory cap, e.g. 2G")
     p.add_argument("--cpu", default=None, help="optional CPU cap, percent of one core")
+    p.add_argument("--no-autostart", dest="no_autostart", action="store_true",
+                   help="don't relaunch this bot on VPS reboot (autostart is on by default)")
 
     p = sub.add_parser("adopt")
     p.add_argument("session", help="existing tmux session name")
@@ -2220,6 +2524,38 @@ def main():
                 print(f"{r['name']}: -> {r['host']}:{r['port']}{extra}")
             else:
                 print(f"{r['name']}: error: {r.get('error')}")
+    elif args.cmd == "webshare":
+        tnames = [t for t in re.split(r"[,\s]+", args.targets) if t]
+        if "all" in tnames:
+            tnames = ["all"]
+        countries = [c for c in re.split(r"[,\s]+", args.countries or "") if c]
+        token = _webshare_token(cfg, args.token)
+        if args.save_token and token:
+            save_webshare_token(cfg, token)
+            print("saved Webshare token")
+        try:
+            if args.action == "count":
+                got = webshare_fetch(token, list_mode=args.list_mode,
+                                     valid_only=not args.all_proxies, countries=countries or None,
+                                     plan_id=args.plan_id)
+                print(f"Webshare: {len(got)} proxies"
+                      + (f" in {','.join(sorted({p['country'] for p in got if p.get('country')}))}"
+                         if got else ""))
+            else:
+                res = webshare_import(cfg, tnames, auth=args.auth, token=token,
+                                      assign_mode=args.mode, list_mode=args.list_mode,
+                                      valid_only=not args.all_proxies, countries=countries or None,
+                                      plan_id=args.plan_id, do_restart=args.restart)
+                print(f"fetched {res['fetched']} proxies, auth={res['auth']}:")
+                for r in res["assigned"]:
+                    if r.get("ok"):
+                        extra = f"  ({r['restart']})" if "restart" in r else ""
+                        tag = " +auth" if r.get("auth") else ""
+                        print(f"  {r['name']}: -> {r['host']}:{r['port']}{tag}{extra}")
+                    else:
+                        print(f"  {r['name']}: error: {r.get('error')}")
+        except ValueError as e:
+            die(str(e))
     elif args.cmd == "set":
         try:
             for nm, val in set_field(cfg, args.name, args.field, args.value):
@@ -2253,7 +2589,7 @@ def main():
         lim = {"memory": args.memory, "cpu": args.cpu} if (args.memory or args.cpu) else None
         try:
             deploy_proxy(args.config, args.name, args.dir, args.source,
-                         owner_repo=args.repo, limits=lim)
+                         owner_repo=args.repo, limits=lim, autostart=not args.no_autostart)
         except ValueError as e:
             die(str(e))
         seen = 0                       # stream the background job's log to stdout
@@ -2697,6 +3033,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small class="ver">v__ABM_VERSION__</small> <small id="clock"></small></div>
   <div class="bulk">
     <button onclick="openSettings()">⚙ Settings</button>
+    <button onclick="openConnection()">🔗 Connect</button>
     <button onclick="openFiles()">📁 Files</button>
     <button onclick="openProxies()">🌐 Proxies</button>
     <button onclick="openScan()">⟲ Scan existing</button>
@@ -2714,10 +3051,49 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   <div class="grid" id="grid"></div>
 </main>
 
+<div class="scrim" id="connScrim" onclick="closeConnection(event)">
+  <div class="modal" style="width:min(560px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Connect / Reconnect</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Your bots and this dashboard run on the VPS and keep going if you close the browser, restart your PC, or drop offline. To get back in, just reopen the bookmark below — re-logging in only if your session has expired.</div>
+
+    <label style="color:var(--dim);font-size:.8rem">Bookmark this dashboard
+      <div style="display:flex;gap:.4rem;margin-top:.25rem">
+        <input id="connUrl" readonly style="flex:1;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem">
+        <button onclick="copyText($('connUrl').value,this)">Copy</button>
+      </div>
+    </label>
+
+    <div id="connTunnel" style="display:none">
+      <div class="hint" style="margin:.9rem 0 .3rem">You're on a private (localhost) connection — that means an SSH tunnel. After a PC restart you re-open the tunnel first, then the bookmark. Make it one double-click:</div>
+      <label style="color:var(--dim);font-size:.8rem">VPS IP / host
+        <input id="connIp" oninput="renderConn()" style="width:100%;margin-top:.25rem;font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem"></label>
+      <label style="color:var(--dim);font-size:.8rem;margin-top:.5rem;display:block">Tunnel command
+        <div style="display:flex;gap:.4rem;margin-top:.25rem">
+          <input id="connSsh" readonly style="flex:1;font-family:var(--mono);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem">
+          <button onclick="copyText($('connSsh').value,this)">Copy</button>
+        </div></label>
+      <div class="hint" style="margin:.9rem 0 .35rem">Or download a one-click reconnect shortcut (opens the tunnel + this dashboard):</div>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+        <button onclick="dlReconnect('windows')">⬇ Windows (.bat)</button>
+        <button onclick="dlReconnect('mac')">⬇ macOS (.command)</button>
+        <button onclick="dlReconnect('linux')">⬇ Linux (.sh)</button>
+      </div>
+      <div class="hint" style="margin-top:.4rem;opacity:.75">Save it on your PC; double-click to reconnect. (macOS/Linux: <code>chmod +x</code> it first.)</div>
+    </div>
+
+    <div id="connDirect" style="display:none">
+      <div class="hint" style="margin:.9rem 0 0">You're connecting directly over the network — just bookmark the URL above. Reconnecting after a PC restart or dropout is one step: open the bookmark, then log in.</div>
+    </div>
+
+    <div class="mbar" style="margin-top:1rem"><span class="msg" id="connMsg" style="color:var(--dim);flex:1"></span>
+      <button onclick="closeConnection()">Close</button></div>
+  </div>
+</div>
+
 <div class="scrim" id="proxScrim" onclick="closeProxies(event)">
   <div class="modal" style="width:min(680px,94vw)" onclick="event.stopPropagation()">
     <div class="mhead">Proxies</div>
-    <div class="hint" style="margin:-.3rem 0 .5rem">Instances with a proxy field (client.connection.proxy). Edits write to config.json — restart to apply (use ⟳ to save &amp; restart).</div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Instances with a proxy field (client.connection.proxy). Set host/port and optional user/password — edits write to config.json — restart to apply (use ⟳ to save &amp; restart). Clearing the user field removes the saved credentials.</div>
 
     <div class="modcard" id="bulkCard" style="margin-bottom:.4rem">
       <div class="mhd" onclick="document.getElementById('bulkCard').classList.toggle('open')">
@@ -2737,6 +3113,37 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
           <button onclick="bulkSelectAll(true)">All</button>
           <button onclick="bulkSelectAll(false)">None</button>
           <button class="go" onclick="applyBulkProxies(this)">Apply</button></div>
+      </div>
+    </div>
+
+    <div class="modcard" id="wsCard" style="margin-bottom:.4rem">
+      <div class="mhd" onclick="document.getElementById('wsCard').classList.toggle('open')">
+        <span class="caret">▶</span><span class="mtitle">Import from Webshare</span>
+      </div>
+      <div class="mbody" style="gap:.6rem">
+        <label style="color:var(--dim)">API token <span class="hint" id="wsTokHint"></span>
+          <input id="wsToken" type="password" spellcheck="false" autocomplete="off" placeholder="Webshare API key" style="font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem"></label>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <span class="hint">Auth</span>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsauth" value="userpass" checked style="width:auto"> User / pass</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsauth" value="ip" style="width:auto"> IP-authorized</label>
+          <span class="hint" style="flex-basis:100%;margin:0">IP mode writes host:port only — whitelist this VPS's IP in your Webshare dashboard first.</span>
+        </div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsmode" value="roundrobin" checked style="width:auto"> Round-robin</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsmode" value="same" style="width:auto"> Same to all</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="checkbox" id="wsValid" checked style="width:auto"> Valid only</label>
+        </div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--dim);font-weight:400">Countries <input id="wsCountries" placeholder="US,CA (optional)" style="width:9rem;font-family:var(--mono);font-size:.72rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.3rem .4rem"></label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="checkbox" id="wsSave" style="width:auto"> Save token</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400;margin-left:auto"><input type="checkbox" id="wsRestart" style="width:auto"> Restart after</label>
+        </div>
+        <div class="hint">Targets <span id="wsCount"></span> <span style="opacity:.7">— shared with the bulk panel</span></div>
+        <div id="wsTargets" style="display:flex;gap:.4rem;flex-wrap:wrap"></div>
+        <div class="mbar"><span class="msg" id="wsMsg" style="color:var(--dim);flex:1"></span>
+          <button onclick="webshareCount(this)">Count</button>
+          <button class="go" onclick="webshareImport(this)">Import &amp; assign</button></div>
       </div>
     </div>
 
@@ -2770,6 +3177,8 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
       <label style="flex:1">CPU cap % <span class="hint">100 = one core</span>
         <input id="dep_cpu" type="number" placeholder="200" autocomplete="off"></label>
     </div>
+    <label style="flex-direction:row;align-items:center;gap:.4rem;color:var(--txt);font-weight:400;margin-top:.2rem">
+      <input type="checkbox" id="dep_autostart" checked style="width:auto"> Relaunch on VPS reboot <span class="hint">(autostart — recommended)</span></label>
     <pre class="log" id="depLog" style="display:none;min-height:120px;max-height:32vh">…</pre>
     <div class="mbar"><span class="msg" id="depMsg" style="flex:1;color:var(--dim)"></span>
       <button onclick="closeDeploy()">Close</button>
@@ -3418,7 +3827,34 @@ async function loadSettings(){
 }
 
 let PROXROWS=[], BULKSEL=new Set();
-function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); }
+let CONN={port:8765,user:'ubuntu',public_ip:''};
+function copyText(t,btn){
+  const done=()=>{ if(btn){ const o=btn.textContent; btn.textContent='✓'; setTimeout(()=>btn.textContent=o,1200); } };
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(t).then(done,()=>{}); }
+  else{ const a=document.createElement('textarea'); a.value=t; document.body.appendChild(a); a.select();
+    try{document.execCommand('copy');done();}catch(e){} a.remove(); }
+}
+async function openConnection(){
+  $('connScrim').classList.add('open'); $('connMsg').textContent='';
+  $('connUrl').value=location.origin;
+  try{ CONN=await api('/api/connection'); }catch(e){}
+  const localish=['localhost','127.0.0.1','::1','[::1]'].includes(location.hostname);
+  $('connTunnel').style.display=localish?'block':'none';
+  $('connDirect').style.display=localish?'none':'block';
+  if(localish){ $('connIp').value=CONN.public_ip||''; renderConn(); }
+}
+function closeConnection(e){ if(e&&e.target!==$('connScrim'))return; $('connScrim').classList.remove('open'); }
+function renderConn(){
+  const ip=($('connIp').value.trim()||'YOUR_VPS_IP'), p=CONN.port||8765, u=CONN.user||'ubuntu';
+  $('connSsh').value=`ssh -L ${p}:127.0.0.1:${p} ${u}@${ip}`;
+}
+function dlReconnect(os){
+  const ip=encodeURIComponent($('connIp').value.trim());
+  if(!ip){ $('connMsg').style.color='var(--crash)'; $('connMsg').textContent='enter the VPS IP first'; return; }
+  $('connMsg').style.color='var(--dim)'; $('connMsg').textContent='downloading shortcut…';
+  window.location=`/api/connection/script?os=${os}&ip=${ip}&port=${CONN.port||8765}&user=${encodeURIComponent(CONN.user||'')}`;
+}
+function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); loadWebshareHint(); }
 function closeProxies(e){ if(e&&e.target!==$('proxScrim'))return; $('proxScrim').classList.remove('open'); }
 async function loadProxies(){
   $('proxMsg').textContent='';
@@ -3432,10 +3868,12 @@ function renderProxyList(){
   const inp='font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem';
   if(!rows.filter(r=>r.found).length){ box.innerHTML='<div class="hint">No instances have a proxy field.</div>'; return; }
   box.innerHTML=rows.map((r,idx)=> r.found ? `
-    <div class="scand likely" style="gap:.5rem">
-      <div class="si"><div class="sn">${esc(r.name)}</div></div>
-      <input id="ph${idx}" value="${esc(String(r.host))}" placeholder="host" style="width:38%;${inp}">
-      <input id="pp${idx}" value="${esc(String(r.port))}" placeholder="port" style="width:20%;${inp}">
+    <div class="scand likely" style="gap:.4rem;flex-wrap:wrap;align-items:center">
+      <div class="si" style="flex-basis:100%"><div class="sn">${esc(r.name)}${r.has_auth?` <span title="proxy credentials set${r.user?' ('+esc(r.user)+')':''}">🔒</span>`:''}</div></div>
+      <input id="ph${idx}" value="${esc(String(r.host))}" placeholder="host" style="flex:2 1 8rem;${inp}">
+      <input id="pp${idx}" value="${esc(String(r.port))}" placeholder="port" style="flex:1 1 4rem;${inp}">
+      <input id="pu${idx}" value="${esc(String(r.user||''))}" placeholder="user (optional)" autocomplete="off" style="flex:1.4 1 6rem;${inp}">
+      <input id="pw${idx}" type="password" placeholder="${r.has_auth?'password (set — blank keeps)':'password (optional)'}" autocomplete="off" style="flex:1.4 1 6rem;${inp}">
       <button class="go" onclick="saveProxy('${jsq(r.name)}',${idx},this,false)">Save</button>
       <button class="warn" title="Save &amp; restart" onclick="saveProxy('${jsq(r.name)}',${idx},this,true)">⟳</button>
     </div>` :
@@ -3444,9 +3882,14 @@ function renderProxyList(){
 }
 async function saveProxy(name,idx,btn,restart){
   const host=$('ph'+idx).value.trim(), port=parseInt($('pp'+idx).value,10);
+  const user=$('pu'+idx).value.trim(), pw=$('pw'+idx).value;
   if(!host||!Number.isInteger(port)){ $('proxMsg').style.color='var(--crash)'; $('proxMsg').textContent='✗ host and numeric port required'; return; }
+  const body={host,port};
+  if(user) body.user=user;                              // set username
+  else if((PROXROWS[idx]||{}).has_auth){ body.user=''; body.password=''; }  // cleared user = drop auth
+  if(pw) body.password=pw;                              // blank password = keep existing
   const orig=btn.textContent; btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
-  const d=await api(`/api/instances/${encodeURIComponent(name)}/proxy`,'POST',{host,port});
+  const d=await api(`/api/instances/${encodeURIComponent(name)}/proxy`,'POST',body);
   let extra='';
   if(!d.error&&restart){
     const r=await api(`/api/instances/${encodeURIComponent(name)}/restart`,'POST');
@@ -3459,24 +3902,66 @@ async function saveProxy(name,idx,btn,restart){
 function renderBulkTargets(){
   const found=PROXROWS.filter(r=>r.found);
   BULKSEL=new Set(found.map(r=>r.name));   // default: all proxy-capable selected
-  $('bulkTargets').innerHTML=found.length
-    ? found.map(r=>`<div class="chip sel" data-n="${esc(r.name)}" onclick="toggleBulk('${jsq(r.name)}',this)">${esc(r.name)}</div>`).join('')
+  const chips=found.length
+    ? found.map(r=>`<div class="chip sel" data-n="${esc(r.name)}" onclick="toggleBulk('${jsq(r.name)}')">${esc(r.name)}</div>`).join('')
     : '<span class="hint">No proxy-capable instances.</span>';
+  $('bulkTargets').innerHTML=chips;
+  $('wsTargets').innerHTML=chips;          // same selection drives both panels
   updateBulkCount();
 }
-function toggleBulk(name,el){
-  if(BULKSEL.has(name)){ BULKSEL.delete(name); el.classList.remove('sel'); }
-  else{ BULKSEL.add(name); el.classList.add('sel'); }
-  updateBulkCount();
+function syncChip(name){
+  const on=BULKSEL.has(name);
+  document.querySelectorAll('.chip[data-n="'+CSS.escape(name)+'"]').forEach(c=>c.classList.toggle('sel',on));
+}
+function toggleBulk(name){
+  if(BULKSEL.has(name)) BULKSEL.delete(name); else BULKSEL.add(name);
+  syncChip(name); updateBulkCount();
 }
 function bulkSelectAll(on){
-  document.querySelectorAll('#bulkTargets .chip').forEach(c=>{
-    const n=c.dataset.n; c.classList.toggle('sel',on);
-    if(on)BULKSEL.add(n); else BULKSEL.delete(n);
+  PROXROWS.filter(r=>r.found).forEach(r=>{
+    if(on)BULKSEL.add(r.name); else BULKSEL.delete(r.name); syncChip(r.name);
   });
   updateBulkCount();
 }
-function updateBulkCount(){ $('bulkCount').textContent='('+BULKSEL.size+' selected)'; }
+function updateBulkCount(){
+  const t='('+BULKSEL.size+' selected)';
+  $('bulkCount').textContent=t; if($('wsCount'))$('wsCount').textContent=t;
+}
+async function webshareCount(btn){
+  const token=$('wsToken').value.trim();
+  $('wsMsg').style.color='var(--dim)'; $('wsMsg').textContent='checking…'; btn.disabled=true;
+  const d=await api('/api/proxies/webshare','POST',{token,count_only:true,
+    valid_only:$('wsValid').checked, countries:$('wsCountries').value.trim()});
+  btn.disabled=false;
+  if(d.error){ $('wsMsg').style.color='var(--crash)'; $('wsMsg').textContent='✗ '+d.error; return; }
+  $('wsMsg').style.color='var(--dim)';
+  $('wsMsg').textContent=`✓ ${d.count} proxies`+(d.countries&&d.countries.length?` (${d.countries.join(', ')})`:'');
+}
+async function webshareImport(btn){
+  const targets=[...BULKSEL];
+  if(!targets.length){ $('wsMsg').style.color='var(--crash)'; $('wsMsg').textContent='select at least one target'; return; }
+  const body={ targets, token:$('wsToken').value.trim(),
+    auth:document.querySelector('input[name=wsauth]:checked').value,
+    mode:document.querySelector('input[name=wsmode]:checked').value,
+    valid_only:$('wsValid').checked, countries:$('wsCountries').value.trim(),
+    save_token:$('wsSave').checked, restart:$('wsRestart').checked };
+  btn.disabled=true; $('wsMsg').style.color='var(--dim)';
+  $('wsMsg').textContent=body.restart?'importing + restarting…':'importing…';
+  const d=await api('/api/proxies/webshare','POST',body);
+  btn.disabled=false;
+  if(d.error){ $('wsMsg').style.color='var(--crash)'; $('wsMsg').textContent='✗ '+d.error; return; }
+  const ok=d.assigned.filter(r=>r.ok).length, fail=d.assigned.length-ok;
+  $('wsMsg').style.color=fail?'var(--warn)':'var(--dim)';
+  $('wsMsg').textContent=`✓ fetched ${d.fetched}, assigned ${ok}`+(fail?` · ${fail} failed`:'')
+    +(d.saved_token?' · token saved':'')+(body.restart?' · restarted':'');
+  if(d.saved_token){ $('wsToken').value=''; loadWebshareHint(true); }
+  loadProxies(); if(body.restart)refresh();
+}
+async function loadWebshareHint(saved){
+  if(saved===undefined){ try{ const s=await api('/api/settings'); saved=s.webshare_saved; }catch(e){ return; } }
+  $('wsTokHint').textContent=saved?'a token is saved — leave blank to reuse it':'';
+  if(saved)$('wsToken').placeholder='(saved token — blank to reuse)';
+}
 async function applyBulkProxies(btn){
   const targets=[...BULKSEL];
   const proxies=$('bulkList').value.split('\n').map(s=>s.trim()).filter(Boolean);
@@ -3516,7 +4001,8 @@ async function startDeploy(){
   const name=$('dep_name').value.trim();
   if(!name){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='name required'; return; }
   const body={name,dir:$('dep_dir').value.trim(),source:depSrc,owner_repo:$('dep_repo').value.trim(),
-              limits:{memory:$('dep_mem').value.trim(),cpu:$('dep_cpu').value.trim()}};
+              limits:{memory:$('dep_mem').value.trim(),cpu:$('dep_cpu').value.trim()},
+              autostart:$('dep_autostart').checked};
   $('depMsg').style.color='var(--dim)'; $('depMsg').textContent='starting…'; $('depBtn').disabled=true;
   const d=await api('/api/deploy','POST',body);
   if(d.error){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='✗ '+d.error; $('depBtn').disabled=false; return; }

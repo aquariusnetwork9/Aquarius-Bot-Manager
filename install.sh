@@ -92,8 +92,16 @@ for unit in aquarius-bot-manager.service aquarius-bot-manager-boot.service; do
 done
 
 systemctl daemon-reload
+# enable = start automatically on every VPS boot/reboot (no SSH needed); --now also starts it right away
 systemctl enable --now aquarius-bot-manager.service
 systemctl enable aquarius-bot-manager-boot.service
+
+# confirm the manager is wired to boot, so the operator knows it's hands-off
+if systemctl is-enabled --quiet aquarius-bot-manager.service; then
+  echo "==> Manager enabled to start automatically on every boot (systemd). It is also running now."
+else
+  echo "WARN: could not confirm boot-autostart (systemctl is-enabled failed). Check: systemctl status aquarius-bot-manager"
+fi
 
 # best-effort public IP for the printed instructions
 PUBIP="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
@@ -154,6 +162,9 @@ Open it in 2 steps:
   2) Open http://localhost:${PORT}
 
 First visit walks you through creating your login. Then click 🚀 Deploy to add proxies.
+Bots keep running on the VPS even if you close the browser or restart your PC.
+To reconnect later in one click, grab a reconnect shortcut from the dashboard's
+🔗 Connect panel (it opens the tunnel + dashboard for you).
 DONE
 fi
 

@@ -94,6 +94,12 @@ abm proxies                               # list each instance's proxy host:port
 abm proxy   bot1 --host 1.2.3.4 --port 1080   # set proxy (view if no flags)
 abm proxybulk --list "1.2.3.4:1080,5.6.7.8:1080" [--targets a,b,c|all] [--mode roundrobin|same] [--restart]
                                           # assign/rotate proxies across many instances at once
+                                          # entries may carry creds: host:port:user:pass or user:pass@host:port
+abm webshare count  --token <KEY>         # fetch your Webshare list and report how many (no changes)
+abm webshare import --token <KEY> [--auth userpass|ip] [--targets all] [--mode roundrobin|same]
+                    [--countries US,CA] [--valid-only is default; --all-proxies to include invalid]
+                    [--plan-id N] [--save-token] [--restart]
+                                          # pull a Webshare subscription's proxies and assign them
 
 # deploy / limits / files
 abm deploy  bot1 --source aquarius        # or zenith, or custom --repo owner/repo; [--dir ...] [--memory 2G] [--cpu 200]
@@ -121,14 +127,28 @@ Browse to http://127.0.0.1:8765.
 - **+ New instance** — register an existing dir via a form (incl. optional resource caps).
 - **⟲ Scan existing** — detect unmanaged tmux sessions and adopt them.
 - **⚙ Settings** — Appearance (theme presets + accent) and System (host dashboard + reboot/update).
-- **🌐 Proxies** — quick host/port editor for instances using `client.connection.proxy`. Each row has **Save** and **⟳** (save **& restart**). A **Bulk assign / rotate** panel lets you paste a list of `host:port` proxies and apply them across selected instances — **round-robin** (cycle the list across targets) or **same to all** — with an optional restart-after.
+- **🌐 Proxies** — quick host/port **and user/password** editor for instances using `client.connection.proxy`. Each row has host, port, optional username + password (blank password keeps the existing one; clearing the username drops the saved credentials), with **Save** and **⟳** (save **& restart**). A **Bulk assign / rotate** panel lets you paste a list of `host:port` proxies and apply them across selected instances — **round-robin** (cycle the list across targets) or **same to all** — with an optional restart-after.
 - Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin) plus **quick-command preset buttons**; **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback and **Save** / **Save & Restart**; **Limits** tab sets the memory/CPU caps. The ★ on each card toggles autostart.
 
 ### Console presets
 The buttons above the console command bar are editable in **Settings → Console** (label + the command it types). They're stored under `settings.console_presets` in `instances.json`. Defaults are `Reconnect` (`connect`), `Disconnect` (`disconnect`), and `Status` (`info`) — adjust them to your proxy's commands.
 
 ### Bulk / round-robin proxies
-If you rotate through a pool of proxy IPs, paste them (one `host:port` per line) into the Proxies → Bulk panel, pick the targets, and choose **round-robin** to spread them out or **same to all** to point everyone at one. The same is available headless: `abm proxybulk --list ... --mode roundrobin --restart`. Each write goes to that instance's `config.json` and applies on (optional) restart.
+If you rotate through a pool of proxy IPs, paste them (one `host:port` per line) into the Proxies → Bulk panel, pick the targets, and choose **round-robin** to spread them out or **same to all** to point everyone at one. The same is available headless: `abm proxybulk --list ... --mode roundrobin --restart`. Each write goes to that instance's `config.json` and applies on (optional) restart. Entries may include credentials (`host:port:user:pass` or `user:pass@host:port`); they're written to `proxy.user`/`proxy.password`.
+
+### Import from Webshare
+If your proxies come from a [Webshare](https://www.webshare.io/) subscription, **🌐 Proxies → Import from Webshare** pulls the live list straight from their API and round-robins it across your bots — no copy-paste. Paste your **API token** (from the Webshare dashboard → API), pick the auth model, and hit **Count** to preview or **Import & assign**:
+
+- **User / pass** — writes each proxy's `host:port` *and* its username/password into `client.connection.proxy`. Works anywhere, no whitelisting; the password lands in `config.json`.
+- **IP-authorized** — writes `host:port` only and wipes any stale creds. First add this VPS's public IP to Webshare → **IP Authorization**, then the proxies need no credentials.
+
+Optional **Countries** filter (e.g. `US,CA`), **Valid only** (default), **Save token** (kept under `settings.webshare` in `instances.json`, base64-obfuscated at rest — not real encryption — and reused so you don't paste it again), and **Restart after**. The target set is shared with the Bulk panel. Each imported proxy is enabled and set to type `HTTP`. Headless equivalent:
+```bash
+abm webshare count  --token <KEY>                          # how many would import
+abm webshare import --token <KEY> --auth userpass --save-token --restart
+abm webshare import --auth ip --countries US,CA            # reuses the saved token
+```
+The token can also come from the `WEBSHARE_TOKEN` env var. A 🔒 on a proxy row means credentials are set (hover for the username); the password is never shown in the UI or API.
 
 ## Detecting proxies you already run (scan / adopt)
 Your manually-started sessions have arbitrary names, so scan inspects every live tmux session and flags likely Aquarius/Zenith proxy sessions using three signals (any one is enough):
@@ -171,7 +191,9 @@ Confirm paths with `which reboot apt-get`. The manager calls `sudo -n` (non-inte
 ## Auto-restart proxies after reboot
 tmux sessions don't survive a reboot, so "auto-restart" means **re-launch on boot**.
 
-1. Mark which instances should come back: the ★ star on each web card, `abm autostart <name> --on`, or `--autostart` on `abm add` / `abm adopt`.
+> If you used the **curl installer**, this is already done for you — both the manager web UI *and* the boot unit are `systemctl enable`d, and deployed bots default to autostart. A VPS reboot brings the dashboard and your starred bots back with no SSH. The steps below are only for manual installs or to toggle which bots come back.
+
+1. Mark which instances should come back: the ★ star on each web card, `abm autostart <name> --on`, or `--autostart` on `abm add` / `abm adopt`. (Bots deployed via 🚀 Deploy are starred by default.)
 2. Install the boot unit so they launch when the host comes up:
    ```bash
    sudo cp aquarius-bot-manager-boot.service /etc/systemd/system/
@@ -197,6 +219,14 @@ The web UI has a real login page with server-side sessions (HttpOnly cookie, 7-d
 abm setpassword       # set/replace the login from the CLI (also works headless)
 abm logout-all        # invalidate active sessions
 ```
+
+### Reconnecting (close browser / restart PC / drop connection)
+Your bots and the manager both run on the VPS, independent of your browser — closing the tab, restarting your PC, or losing your connection does **not** stop them. Getting back in:
+
+- **HTTPS mode:** just open your bookmarked `https://<vps>` — you're back (it only asks you to log in again once the session has expired). One step.
+- **Tunnel mode:** the SSH tunnel is a process on *your* machine, so it ends when you restart/disconnect. Re-open the tunnel, then the bookmark. To make that one double-click, open the dashboard's **🔗 Connect** panel and download a **reconnect shortcut** (`.bat` / `.command` / `.sh`) — it opens the tunnel *and* the dashboard for you. The panel also shows your bookmark URL and the exact tunnel command with copy buttons.
+
+Sessions last 7 days, so you usually won't even re-login between reconnects. Deployed bots default to **autostart**, so if the *VPS* itself reboots, the boot unit relaunches them automatically.
 
 ### Recommended: SSH tunnel (no new exposure)
 Keep the manager on `127.0.0.1` (default) and forward the port from your local machine:
