@@ -10,7 +10,7 @@ Pure Python standard library + `tmux`. No pip installs, no Docker, no database.
 
 **Aquarius Bot Manager controls only the bots that run on the same machine it runs on.** It manages local `tmux` sessions, reads the local `/proc` for monitoring, enforces local cgroup limits, and deploys into local directories. It does **not** reach out over SSH to control bots on other servers.
 
-This means its design is **many bots consolidated on one VPS**, using **proxies** for per-bot IP diversity. If your setup is **one bot per server** (e.g. a DigitalOcean droplet per bot for separate IPs), this tool is **not compatible** with that architecture — see **[[Architecture and Limitations]]** before you install.
+This means its core design is **many bots consolidated on one VPS**, using **proxies** for per-bot IP diversity. If your setup is **one bot per server** (e.g. a DigitalOcean droplet per bot for separate IPs), the base manager alone won't span them — but the experimental **[[Fleet (DigitalOcean)]]** controller adds a multi-droplet layer on top. Read **[[Architecture and Limitations]]** before you install.
 
 ---
 
@@ -34,8 +34,9 @@ This means its design is **many bots consolidated on one VPS**, using **proxies*
 | **[[Usage]]** | Dashboard tour, full CLI reference, lifecycle, console, monitoring, reconnecting |
 | **[[Configuration]]** | `instances.json`, per-bot fields, autostart/boot, resource limits, settings |
 | **[[Proxies]]** | Manual + bulk proxy assignment, **Webshare import** (both auth models) |
+| **[[Fleet (DigitalOcean)]]** | *(experimental)* Multi-droplet: provision via the DigitalOcean API and manage agents from one controller |
 | **[[Security]]** | **The full security model, what dashboard access grants, and what's stored on disk — read this** |
-| **[[Architecture and Limitations]]** | The single-host model and **why 1-bot-per-server (DigitalOcean) does not fit** |
+| **[[Architecture and Limitations]]** | The single-host model, **the multi-droplet fleet path**, and where the tool does not fit |
 
 ## 60-second start
 
