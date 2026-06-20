@@ -12,6 +12,9 @@ This is the answer to the limitation in **[[Architecture and Limitations]]**: th
  agent A    agent B     agent C   …   (each = normal manager + its bot)
 ```
 
+![abmfleet CLI](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/fleet-cli.png)
+*The fleet is driven entirely from the `abmfleet` CLI — there is no fleet web UI (each droplet keeps its own dashboard).*
+
 ---
 
 ## When to use it (and when not to)

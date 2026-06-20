@@ -33,6 +33,15 @@ A sticky host gauge strip shows CPU load, memory, and disk vs capacity. Per-bot 
 
 ![Settings → Monitoring thresholds](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/settings-monitoring.png)
 
+### Appearance
+**Settings → Appearance** picks a theme preset — midnight, ember, ice, amethyst, and the light **paper** — plus an optional accent-color override.
+
+![Settings → Appearance](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/appearance.png)
+
+The whole dashboard re-themes live; here it is in the light **paper** theme:
+
+![Light (paper) theme dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard-light.png)
+
 ---
 
 ## Reconnecting (close browser / restart PC / lose connection)
@@ -41,6 +50,8 @@ Your bots and the dashboard run on the VPS, **independent of your browser**. Clo
 
 - **HTTPS mode** — just reopen your bookmark; you're back (re-login only if the 7-day session expired).
 - **Tunnel mode** — the SSH tunnel is a process on *your* machine, so it ends when you restart. Re-open the tunnel, then the bookmark. To make that one double-click, open **🔗 Connect → download a reconnect shortcut** (`.bat` / `.command` / `.sh`); it opens the tunnel *and* the dashboard for you.
+
+![Connect / Reconnect panel](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/connect.png)
 
 If the **VPS itself** reboots, the manager and your autostart bots come back automatically (see **[[Configuration]]**).
 

@@ -14,6 +14,9 @@ Aquarius Bot Manager is a **single-host control plane**. It manages the bots tha
 - It deploys launchers into **local directories** and edits **local config files**.
 - The file manager is jailed to **local** roots.
 
+![Jailed file manager](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/files.png)
+*The file manager is realpath-jailed to the allowlisted local roots — it can't escape to the rest of the box.*
+
 It has **no concept of remote hosts.** It does not SSH out to other servers, it has no agent/controller split, and it does not aggregate multiple machines into one view. One manager = one VPS = the bots on that VPS.
 
 **Its intended design:** put **many bots on one reasonably-sized VPS**, and give each bot a distinct outbound IP using **[[Proxies]]** (including one-click Webshare import). That's how you get IP diversity without a fleet of servers.
@@ -59,5 +62,7 @@ People do it for **IP diversity** (each droplet has a unique IP, avoiding shared
 Since all bots share one box, size it for the **sum** of your bots plus headroom:
 
 - Give each bot a **memory cap** (Limits tab / `abm limits`) so one can't OOM the others.
+
+![Per-bot resource limits](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/limits.png)
 - Watch the **host gauge strip**; if CPU/mem/disk regularly cross your thresholds, move some bots to a second VPS with its own manager, or get a bigger box.
 - Proxies add latency and can fail independently of your bots — the per-bot proxy editor and bulk/Webshare rotation exist to swap them quickly. See **[[Proxies]]**.

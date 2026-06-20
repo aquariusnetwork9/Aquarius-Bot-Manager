@@ -35,6 +35,8 @@ If you must expose it directly, put it behind TLS (the HTTPS installer mode does
 
 ## 3. Authentication
 
+![Login screen](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/login.png)
+
 - **First-run wizard** forces creating an admin login before the UI unlocks. Passwords are stored as a **salted PBKDF2 hash** in `instances.json` — never plaintext.
 - **Sessions**: HttpOnly, `SameSite=Strict` cookie, **7-day** expiry, held in server memory. A manager restart invalidates all sessions (everyone re-logs-in). `abm logout-all` does the same on demand.
 - **Login rate-limiting**: 5 failed attempts per 5 minutes per IP.
@@ -61,6 +63,8 @@ This single file holds, in one place:
 ---
 
 ## 5. System actions (reboot / OS update)
+
+![Settings → System actions](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/system.png)
 
 **Off by default.** When enabled (Settings → System), the manager runs `sudo -n reboot` / `sudo -n apt-get …`. This needs **tightly-scoped passwordless sudo** for the run user — never store your password anywhere:
 

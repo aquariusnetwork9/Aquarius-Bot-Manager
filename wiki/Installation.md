@@ -49,6 +49,8 @@ sudo ABM_RUN_USER=ubuntu ABM_PORT=8765 ABM_BASE_DIR=/home/ubuntu/zenith bash ins
 
 There is **no CLI password step**. The first time you open the dashboard, a one-screen **setup wizard** asks you to create an admin login. Submitting it sets the password and signs you in. Until you do, the rest of the UI is locked.
 
+![First-run setup wizard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/setup.png)
+
 - You *can* click **"Skip — run open on localhost only"** to run with no login. Only do this if the manager stays on `127.0.0.1` (e.g. reached via SSH tunnel). See **[[Security]]**.
 - To change credentials later: `abm setpassword` (or it stays editable from the server).
 
