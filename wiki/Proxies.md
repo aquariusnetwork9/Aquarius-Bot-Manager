@@ -4,6 +4,9 @@ Proxies are how this tool gives each bot its **own outbound IP** while they all 
 
 Open **🌐 Proxies** in the dashboard. Three tools, smallest to largest:
 
+![Proxies panel](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/proxies.png)
+*Per-bot host / port / user / password rows, plus the collapsible **Bulk assign / rotate** and **Import from Webshare** tools.*
+
 ---
 
 ## 1. Per-bot editor (manual)

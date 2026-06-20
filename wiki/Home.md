@@ -4,6 +4,9 @@ A **control plane for a whole VPS of Minecraft proxy bots** — [AquariusProxy](
 
 Pure Python standard library + `tmux`. No pip installs, no Docker, no database.
 
+![Aquarius Bot Manager dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard.png)
+*The dashboard: a host gauge strip (CPU / memory / disk) above one card per bot — status, live CPU/RAM, and start/stop/restart.*
+
 ---
 
 ## ⚠️ Read this first: the one-host model

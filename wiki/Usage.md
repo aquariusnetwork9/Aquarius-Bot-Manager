@@ -2,6 +2,8 @@
 
 ## The dashboard
 
+![Dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard.png)
+
 Open the web UI (see **[[Installation]]**). Top bar buttons:
 
 - **⚙ Settings** — appearance (themes/accent), monitoring thresholds, console presets, and the System tab (reboot / OS update toggle).
@@ -13,16 +15,23 @@ Open the web UI (see **[[Installation]]**). Top bar buttons:
 - **+ New instance** — register an existing directory.
 - **▶ Start all / ⟳ Restart all** — bulk lifecycle.
 
+![Deploy a proxy modal](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/deploy.png)
+*🚀 Deploy stands up a brand-new AquariusProxy / ZenithProxy / custom-fork bot — name it, set memory/CPU caps, and the launcher self-bootstraps Java and the jar.*
+
 Each bot is a **card**: status (running / stopped / crashed), start/stop/restart, live CPU/RAM bars, a ★ autostart toggle, and a **⋯** drawer with **Console**, **Config**, and **Limits** tabs.
 
 ### Console
 The drawer's Console tab shows a live `tmux` capture with a command bar (types into the bot's stdin) and editable **quick-command preset** buttons (configured in Settings → Console; defaults: Reconnect / Disconnect / Status).
+
+![Console drawer](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/console.png)
 
 ### Config editor
 The Config tab is a structured editor over the bot's `config.json` — toggles, numbers, lists, with a filter and a Raw JSON fallback. **Save** writes the file; **Save & Restart** applies it live.
 
 ### Monitoring
 A sticky host gauge strip shows CPU load, memory, and disk vs capacity. Per-bot CPU%/RAM are read from each `tmux` pane's process tree. Bars turn warn/crit colored past the thresholds in **Settings → Monitoring** (defaults 85/85/90%).
+
+![Settings → Monitoring thresholds](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/settings-monitoring.png)
 
 ---
 

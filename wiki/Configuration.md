@@ -4,6 +4,9 @@ All state lives in a single file: **`instances.json`** (next to `manager.py`, or
 
 > `instances.json` contains secrets (proxy passwords, the Webshare token, your login hash). Treat it as sensitive — see **[[Security]]**.
 
+![Structured config editor](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/config.png)
+*Most edits go through the dashboard's structured **Config** editor — toggles, numbers, and lists grouped by area, with a Raw JSON fallback — so you rarely touch `instances.json` or a bot's `config.json` by hand.*
+
 ---
 
 ## Per-instance fields
