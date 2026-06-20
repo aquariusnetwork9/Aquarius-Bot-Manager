@@ -8,3 +8,4 @@
 - [[Fleet (DigitalOcean)]]
 - **[[Security]]** ⚠️
 - [[Architecture and Limitations]]
+- [[Changelog]]
