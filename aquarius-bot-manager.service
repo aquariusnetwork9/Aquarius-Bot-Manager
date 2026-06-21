@@ -24,6 +24,10 @@ ExecStart=/usr/bin/python3 /opt/aquarius-bot-manager/manager.py serve --host 127
 
 Restart=on-failure
 RestartSec=3
+# Only kill the web UI process on stop/restart — NEVER the bot tmux sessions, which
+# may share this service's cgroup (e.g. when bots are started from the dashboard).
+# Without this, `systemctl restart`/`abm selfupdate` would take every bot down.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
