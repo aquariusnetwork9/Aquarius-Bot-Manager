@@ -87,9 +87,10 @@ abm boot                                   # start all autostart instances (run 
 ```bash
 abm proxies                                # list each instance's proxy
 abm proxy   bot1 --host 1.2.3.4 --port 1080
-abm proxybulk --list "h:p,h:p" [--targets a,b|all] [--mode roundrobin|same] [--restart]
+abm proxybulk --list "h:p,h:p" [--targets a,b|all|errored] [--mode roundrobin|same|random] [--restart]
+abm proxyhealth [--targets all] [--lines 200]   # list bots whose console shows proxy errors
 abm webshare count  --token <KEY>
-abm webshare import --token <KEY> [--auth userpass|ip] [--targets all] [--countries US,CA] [--save-token] [--restart]
+abm webshare import --token <KEY> [--auth userpass|ip] [--targets all|errored] [--mode roundrobin|same|random] [--countries US,CA] [--save-token] [--restart]
 ```
 
 ### Deploy / limits / files
@@ -107,5 +108,10 @@ abm update                                 # apt update && upgrade (system actio
 abm reboot                                 # reboot the host (system actions must be enabled)
 abm setpassword                            # set/replace the web UI login
 abm logout-all                             # invalidate active web sessions
+
+# update the manager itself (no reinstall):
+abm selfupdate [--no-restart]              # git pull + restart the web UI
+abm autoupdate on [--schedule daily]       # install a systemd timer that self-updates on a schedule
+abm autoupdate off | status
 abm serve --host 127.0.0.1 --port 8765     # run the web server (the systemd unit does this for you)
 ```

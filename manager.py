@@ -31,6 +31,7 @@ import html
 import json
 import os
 import platform
+import random
 import re
 import secrets
 import shlex
@@ -41,7 +42,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -479,20 +480,27 @@ def _parse_proxy_entry(entry):
 def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=False,
                      enable=None, ptype=None, clear_auth=False):
     """Assign proxies across many instances at once.
-    target_names: list of instance names, or ['all'].
+    target_names: list of instance names, ['all'], or ['errored'] (only bots whose
+        console currently shows proxy errors — see detect_proxy_issues).
     proxies: list of {host,port,user?,password?} dicts or 'host:port[:user:pass]' strings.
-    mode: 'roundrobin' (cycle the list across targets) or 'same' (first to all).
+    mode: 'roundrobin' (cycle the list across targets), 'same' (first to all), or
+        'random' (a random proxy per target — unique when the pool is large enough).
     enable: if not None, set proxy.enabled on each target.
     ptype: if set, write proxy.type (e.g. 'HTTP'/'SOCKS5').
     clear_auth: wipe user/password on each target (IP-authorization mode).
     Returns a list of per-target result dicts."""
-    if mode not in ("roundrobin", "same"):
-        raise ValueError("mode must be 'roundrobin' or 'same'")
+    if mode not in ("roundrobin", "same", "random"):
+        raise ValueError("mode must be 'roundrobin', 'same', or 'random'")
     parsed = [_parse_proxy_entry(p) for p in (proxies or [])]
     if not parsed:
         raise ValueError("no proxies provided")
     if list(target_names) == ["all"]:
         insts = list(cfg["instances"])
+    elif list(target_names) == ["errored"]:
+        names = errored_proxy_names(cfg)
+        if not names:
+            raise ValueError("no instances currently show proxy errors")
+        insts = [cfg["by_name"][n] for n in names]
     else:
         insts = []
         for n in target_names:
@@ -502,9 +510,18 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
             insts.append(inst)
     if not insts:
         raise ValueError("no target instances")
+    # pick a proxy per target up-front according to the assignment mode
+    if mode == "same":
+        chosen = [parsed[0]] * len(insts)
+    elif mode == "random":
+        # unique sampling when the pool is large enough, else random with replacement
+        chosen = (random.sample(parsed, len(insts)) if len(parsed) >= len(insts)
+                  else [random.choice(parsed) for _ in range(len(insts))])
+    else:  # roundrobin
+        chosen = [parsed[i % len(parsed)] for i in range(len(insts))]
     results = []
     for idx, inst in enumerate(insts):
-        host, port, user, password = parsed[0] if mode == "same" else parsed[idx % len(parsed)]
+        host, port, user, password = chosen[idx]
         if clear_auth:
             user = password = ""        # wipe stale creds for IP-auth proxies
         row = {"name": inst["name"], "host": host, "port": port,
@@ -622,6 +639,170 @@ def webshare_import(cfg, target_names, auth="userpass", token=None, assign_mode=
                                do_restart=do_restart, enable=True, ptype=ptype,
                                clear_auth=clear_auth)
     return {"fetched": len(proxies), "auth": auth, "assigned": results}
+
+
+# ---------------------------------------------------------------------------
+# proxy health  (scan bot consoles for proxy errors → flag dead/removed IPs)
+# ---------------------------------------------------------------------------
+
+# Default patterns that flag a proxy problem in a bot's console (case-insensitive).
+# Tunable per-deployment via settings.proxy_health.patterns (a list of regexes) — when
+# you see the exact wording your proxies produce, add it there. The scan shows the
+# matching line as evidence so you can confirm a pattern is hitting the right thing.
+DEFAULT_PROXY_ERROR_PATTERNS = [
+    r"prox(?:y|ies)\b.{0,60}(?:refus|timed?\s*out|time-?out|unreachable|unable|fail|error|cannot connect|no route|reset|broken|disconnect|denied)",
+    r"(?:refus|timed?\s*out|time-?out|unreachable|unable to connect|connection reset|no route|broken pipe).{0,60}\bprox(?:y|ies)\b",
+    r"failed to connect to proxy",
+    r"proxy[\s_-]*connect(?:ion)?\s*(?:exception|error|failed|refused|timed)",
+    r"proxyconnectexception",
+    r"clientconnection.{0,60}prox(?:y|ies)",
+]
+
+
+def _proxy_error_patterns(cfg):
+    pats = (cfg.get("raw", {}).get("settings", {}) or {}).get("proxy_health", {}).get("patterns")
+    return pats if isinstance(pats, list) and pats else DEFAULT_PROXY_ERROR_PATTERNS
+
+
+def detect_proxy_issues(cfg, names=None, lines=200):
+    """Scan each proxy-using instance's live console for proxy-error lines.
+
+    Returns a list of {name, host, port, running, errored, hits, evidence}; instances
+    with no proxy field are skipped. Only RUNNING instances can be flagged 'errored'
+    (a stopped bot produces no live errors). 'evidence' is the most recent matching line."""
+    try:
+        pats = [re.compile(p, re.I) for p in _proxy_error_patterns(cfg)]
+    except re.error as e:
+        raise ValueError(f"invalid proxy-error pattern: {e}")
+    if names:
+        insts = [cfg["by_name"][n] for n in names if n in cfg["by_name"]]
+    else:
+        insts = list(cfg["instances"])
+    out = []
+    for inst in insts:
+        prox = get_proxy(inst)
+        if not prox.get("found"):
+            continue
+        running = session_exists(session_name(inst))
+        rec = {"name": inst["name"], "host": prox.get("host"), "port": prox.get("port"),
+               "running": running, "errored": False, "hits": 0, "evidence": ""}
+        if running:
+            text = logs(inst, lines=lines)
+            hits = [ln.strip() for ln in text.splitlines() if any(p.search(ln) for p in pats)]
+            if hits:
+                rec["errored"] = True
+                rec["hits"] = len(hits)
+                rec["evidence"] = hits[-1][:300]
+        out.append(rec)
+    return out
+
+
+def errored_proxy_names(cfg, lines=200):
+    """Names of running instances whose console currently shows proxy errors."""
+    return [r["name"] for r in detect_proxy_issues(cfg, lines=lines) if r["errored"]]
+
+
+# ---------------------------------------------------------------------------
+# manager self-update  (git pull in place + restart — no full reinstall)
+# ---------------------------------------------------------------------------
+
+MANAGER_DIR = os.path.dirname(os.path.abspath(__file__))
+SERVICE_NAME = "aquarius-bot-manager.service"
+UPDATE_TIMER = "aquarius-bot-manager-update.timer"
+
+
+def _git(args, cwd=MANAGER_DIR, timeout=60):
+    return subprocess.run(["git", "-C", cwd] + args, capture_output=True, text=True, timeout=timeout)
+
+
+def self_update(do_restart=True, service=SERVICE_NAME):
+    """Update the manager in place: `git pull --ff-only` in MANAGER_DIR, then restart the
+    web-UI service so the new code loads. Returns a dict describing what happened.
+
+    Fast-forward only, so it never rewrites history or clobbers local edits; instances.json
+    is gitignored, so config is untouched. Raises ValueError if the dir isn't a git clone
+    or the pull can't fast-forward (e.g. local commits) — those need manual attention."""
+    if not os.path.isdir(os.path.join(MANAGER_DIR, ".git")):
+        raise ValueError(f"{MANAGER_DIR} is not a git checkout — was the manager installed "
+                         "from the installer/clone? (manual installs can't self-update)")
+    before = _git(["rev-parse", "--short", "HEAD"])
+    old = before.stdout.strip() if before.returncode == 0 else "?"
+    _git(["fetch", "--quiet"])
+    pull = _git(["pull", "--ff-only"])
+    after = _git(["rev-parse", "--short", "HEAD"])
+    new = after.stdout.strip() if after.returncode == 0 else "?"
+    if pull.returncode != 0:
+        raise ValueError("git pull failed (not a fast-forward?): "
+                         + (pull.stderr.strip() or pull.stdout.strip()))
+    out = {"old": old, "new": new, "updated": old != new,
+           "message": pull.stdout.strip() or pull.stderr.strip()}
+    if do_restart:
+        # restart the system service so the new manager.py is loaded; needs sudo (same as
+        # other system actions). The CLI/timer is a separate process, so this is safe.
+        r = subprocess.run(["sudo", "-n", "systemctl", "restart", service],
+                           capture_output=True, text=True)
+        out["restarted"] = (r.returncode == 0)
+        if r.returncode != 0:
+            out["restart_error"] = (r.stderr.strip() or r.stdout.strip()
+                                    or "sudo systemctl restart failed")
+    return out
+
+
+def autoupdate_status():
+    """Whether the periodic self-update systemd timer is installed + enabled.
+    Degrades to disabled/unavailable where systemd isn't present (non-Linux dev)."""
+    try:
+        r = subprocess.run(["systemctl", "is-enabled", UPDATE_TIMER],
+                           capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return {"enabled": False, "state": "unavailable"}
+    state = r.stdout.strip() or r.stderr.strip()
+    return {"enabled": r.returncode == 0 and state == "enabled", "state": state}
+
+
+def autoupdate_set(enable, schedule="daily"):
+    """Install+enable (or disable) the periodic self-update systemd timer.
+
+    Writes a oneshot service that runs `abm selfupdate` and a timer firing on `schedule`
+    (a systemd OnCalendar value, default 'daily'). Needs sudo. Returns a status dict."""
+    abm = os.path.join(MANAGER_DIR, "abm")
+    svc = "aquarius-bot-manager-update.service"
+    if enable:
+        svc_unit = (
+            "[Unit]\n"
+            "Description=Aquarius Bot Manager self-update (git pull + restart)\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"User={os.environ.get('USER') or 'ubuntu'}\n"
+            f"ExecStart={abm} selfupdate\n"
+        )
+        timer_unit = (
+            "[Unit]\n"
+            "Description=Run Aquarius Bot Manager self-update on a schedule\n\n"
+            "[Timer]\n"
+            f"OnCalendar={schedule}\n"
+            "Persistent=true\n"
+            "RandomizedDelaySec=300\n\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n"
+        )
+        for name, body in ((svc, svc_unit), (UPDATE_TIMER, timer_unit)):
+            w = subprocess.run(["sudo", "-n", "tee", f"/etc/systemd/system/{name}"],
+                               input=body, capture_output=True, text=True)
+            if w.returncode != 0:
+                raise ValueError(f"could not write {name}: {w.stderr.strip()} "
+                                 "(needs passwordless sudo)")
+        subprocess.run(["sudo", "-n", "systemctl", "daemon-reload"], capture_output=True, text=True)
+        r = subprocess.run(["sudo", "-n", "systemctl", "enable", "--now", UPDATE_TIMER],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ValueError(f"could not enable {UPDATE_TIMER}: {r.stderr.strip()}")
+    else:
+        subprocess.run(["sudo", "-n", "systemctl", "disable", "--now", UPDATE_TIMER],
+                       capture_output=True, text=True)
+    return {**autoupdate_status(), "schedule": schedule if enable else None}
 
 
 # ---------------------------------------------------------------------------
@@ -1386,6 +1567,7 @@ def get_settings(cfg):
         "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
         "webshare_saved": bool(s.get("webshare", {}).get("token")),
+        "autoupdate": autoupdate_status(),
     }
 
 
@@ -2164,6 +2346,44 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
 
+        # scan bot consoles for proxy errors (dead / removed IPs)
+        if path == "/api/proxies/health":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+            try:
+                res = detect_proxy_issues(cfg, names=p.get("names") or None,
+                                          lines=int(p.get("lines", 200)))
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True, "results": res,
+                               "errored": [r["name"] for r in res if r["errored"]]})
+
+        # update the manager itself: git pull + restart (no full reinstall)
+        if path == "/api/selfupdate":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                p = {}
+            try:
+                return self._json({"ok": True, **self_update(do_restart=p.get("restart", True))})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
+        # enable/disable the periodic self-update timer
+        if path == "/api/autoupdate":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                p = {}
+            try:
+                return self._json({"ok": True,
+                                   **autoupdate_set(bool(p.get("enable")),
+                                                    schedule=p.get("schedule", "daily"))})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
         # update proxy host/port
         m = re.match(r"^/api/instances/([^/]+)/proxy$", path)
         if m:
@@ -2354,13 +2574,17 @@ def main():
     p.add_argument("--enable", dest="p_enable", action="store_true")
     p.add_argument("--disable", dest="p_disable", action="store_true")
 
-    p = sub.add_parser("proxybulk", help="assign proxies across many instances (round-robin or same)")
+    p = sub.add_parser("proxybulk", help="assign proxies across many instances (round-robin / same / random)")
     p.add_argument("--targets", default="all",
-                   help="comma-separated instance names, or 'all' (default)")
+                   help="comma-separated instance names, 'all' (default), or 'errored' (only bots with proxy errors)")
     p.add_argument("--list", dest="plist", required=True,
                    help="host:port[:user:pass] entries, comma- or newline-separated")
-    p.add_argument("--mode", choices=["roundrobin", "same"], default="roundrobin")
+    p.add_argument("--mode", choices=["roundrobin", "same", "random"], default="roundrobin")
     p.add_argument("--restart", action="store_true", help="restart each instance after assigning")
+
+    p = sub.add_parser("proxyhealth", help="scan bot consoles for proxy errors (dead/removed IPs)")
+    p.add_argument("--targets", default="all", help="instance names, or 'all' (default)")
+    p.add_argument("--lines", type=int, default=200, help="console lines to scan per bot")
 
     p = sub.add_parser("webshare", help="import proxies from a Webshare subscription via its API")
     p.add_argument("action", choices=["import", "count"],
@@ -2368,8 +2592,9 @@ def main():
     p.add_argument("--token", default=None, help="Webshare API token (else WEBSHARE_TOKEN or saved)")
     p.add_argument("--auth", choices=["ip", "userpass"], default="userpass",
                    help="ip = host:port only (whitelist VPS in Webshare); userpass = per-proxy creds")
-    p.add_argument("--targets", default="all", help="instance names, or 'all' (default)")
-    p.add_argument("--mode", choices=["roundrobin", "same"], default="roundrobin")
+    p.add_argument("--targets", default="all",
+                   help="instance names, 'all' (default), or 'errored' (only bots with proxy errors)")
+    p.add_argument("--mode", choices=["roundrobin", "same", "random"], default="roundrobin")
     p.add_argument("--list-mode", choices=["direct", "backbone"], default="direct",
                    help="Webshare proxy list mode")
     p.add_argument("--countries", default=None, help="comma-separated country codes, e.g. US,CA")
@@ -2435,6 +2660,15 @@ def main():
 
     sub.add_parser("update")   # OS update (requires system actions enabled)
     sub.add_parser("reboot")   # reboot the host (requires system actions enabled)
+
+    p = sub.add_parser("selfupdate", help="update the manager in place (git pull + restart) — no reinstall")
+    p.add_argument("--no-restart", dest="no_restart", action="store_true",
+                   help="pull only; don't restart the web-UI service")
+
+    p = sub.add_parser("autoupdate", help="enable/disable the periodic self-update timer")
+    p.add_argument("action", choices=["on", "off", "status"])
+    p.add_argument("--schedule", default="daily",
+                   help="systemd OnCalendar value when enabling (default: daily)")
 
     args = ap.parse_args()
 
@@ -2513,6 +2747,8 @@ def main():
         tnames = [t for t in re.split(r"[,\s]+", args.targets) if t]
         if "all" in tnames:
             tnames = ["all"]
+        elif "errored" in tnames:
+            tnames = ["errored"]
         plist = [s for s in re.split(r"[,\n]+", args.plist) if s.strip()]
         try:
             rows = set_proxies_bulk(cfg, tnames, plist, mode=args.mode, do_restart=args.restart)
@@ -2524,10 +2760,57 @@ def main():
                 print(f"{r['name']}: -> {r['host']}:{r['port']}{extra}")
             else:
                 print(f"{r['name']}: error: {r.get('error')}")
+    elif args.cmd == "proxyhealth":
+        names = None if args.targets.strip() == "all" else [t for t in re.split(r"[,\s]+", args.targets) if t]
+        try:
+            rows = detect_proxy_issues(cfg, names=names, lines=args.lines)
+        except ValueError as e:
+            die(str(e))
+        if not rows:
+            print("no proxy-using instances")
+        for r in rows:
+            tag = "ERRORED" if r["errored"] else ("ok" if r["running"] else "stopped")
+            line = f"{r['name']:<20} {(str(r['host']) + ':' + str(r['port'])):<24} {tag}"
+            if r["errored"]:
+                line += f"  ({r['hits']} hits) {r['evidence']}"
+            print(line)
+        n = sum(1 for r in rows if r["errored"])
+        if rows:
+            print(f"\n{n} errored / {len(rows)} proxy bots"
+                  + (" — fix with: abm webshare import --targets errored --mode random --restart"
+                     if n else ""))
+    elif args.cmd == "selfupdate":
+        try:
+            res = self_update(do_restart=not args.no_restart)
+        except ValueError as e:
+            die(str(e))
+        if res["updated"]:
+            print(f"updated {res['old']} -> {res['new']}")
+        else:
+            print(f"already up to date ({res['new']})")
+        if not args.no_restart:
+            print("restarted manager service" if res.get("restarted")
+                  else f"NOT restarted: {res.get('restart_error', 'unknown')} "
+                       f"(run: sudo systemctl restart {SERVICE_NAME})")
+    elif args.cmd == "autoupdate":
+        if args.action == "status":
+            st = autoupdate_status()
+            print(f"auto-update timer: {'enabled' if st['enabled'] else 'disabled'} ({st['state']})")
+        else:
+            try:
+                st = autoupdate_set(args.action == "on", schedule=args.schedule)
+            except ValueError as e:
+                die(str(e))
+            if args.action == "on":
+                print(f"auto-update enabled ({st.get('schedule')}); timer {st['state']}")
+            else:
+                print("auto-update disabled")
     elif args.cmd == "webshare":
         tnames = [t for t in re.split(r"[,\s]+", args.targets) if t]
         if "all" in tnames:
             tnames = ["all"]
+        elif "errored" in tnames:
+            tnames = ["errored"]
         countries = [c for c in re.split(r"[,\s]+", args.countries or "") if c]
         token = _webshare_token(cfg, args.token)
         if args.save_token and token:
@@ -3095,6 +3378,31 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <div class="mhead">Proxies</div>
     <div class="hint" style="margin:-.3rem 0 .5rem">Instances with a proxy field (client.connection.proxy). Set host/port and optional user/password — edits write to config.json — restart to apply (use ⟳ to save &amp; restart). Clearing the user field removes the saved credentials.</div>
 
+    <div class="modcard open" id="healthCard" style="margin-bottom:.4rem">
+      <div class="mhd" onclick="document.getElementById('healthCard').classList.toggle('open')">
+        <span class="caret">▶</span><span class="mtitle">Proxy health &amp; auto-fix</span>
+      </div>
+      <div class="mbody" style="gap:.6rem">
+        <div class="hint">Scans each running bot's console for proxy errors (dead / removed IPs). Re-import fresh IPs from Webshare and reassign to the broken bots in one click. Tune the detection patterns in Settings → Monitoring if your proxies word errors differently.</div>
+        <div id="healthList" style="display:flex;flex-direction:column;gap:.25rem;font-size:.78rem"><span class="hint">Click Scan to check bot consoles.</span></div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <span class="hint">Fix scope</span>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="fixscope" value="errored" checked style="width:auto"> Errored only</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="fixscope" value="selected" style="width:auto"> Selected</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="fixscope" value="all" style="width:auto"> All</label>
+        </div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <span class="hint">Assign</span>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="fixmode" value="random" checked style="width:auto"> Random</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="fixmode" value="roundrobin" style="width:auto"> Round-robin</label>
+          <span class="hint" style="flex-basis:100%;margin:0">Re-import uses the Webshare token + auth below (saved token reused if the field is blank). Restarts the fixed bots so the new IP takes effect.</span>
+        </div>
+        <div class="mbar"><span class="msg" id="healthMsg" style="color:var(--dim);flex:1"></span>
+          <button onclick="scanHealth(this)">Scan</button>
+          <button class="go" onclick="autoFix(this)">Re-import &amp; fix (Webshare)</button></div>
+      </div>
+    </div>
+
     <div class="modcard" id="bulkCard" style="margin-bottom:.4rem">
       <div class="mhd" onclick="document.getElementById('bulkCard').classList.toggle('open')">
         <span class="caret">▶</span><span class="mtitle">Bulk assign / rotate</span>
@@ -3104,6 +3412,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
           <textarea id="bulkList" spellcheck="false" placeholder="1.2.3.4:1080&#10;5.6.7.8:1080" style="min-height:84px;font-size:.76rem"></textarea></label>
         <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="roundrobin" checked style="width:auto"> Round-robin</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="random" style="width:auto"> Random</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="same" style="width:auto"> Same to all</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400;margin-left:auto"><input type="checkbox" id="bulkRestart" style="width:auto"> Restart after</label>
         </div>
@@ -3112,6 +3421,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
         <div class="mbar"><span class="msg" id="bulkMsg" style="color:var(--dim);flex:1"></span>
           <button onclick="bulkSelectAll(true)">All</button>
           <button onclick="bulkSelectAll(false)">None</button>
+          <button onclick="bulkSelectErrored(this)" title="select only bots with proxy errors">Errored</button>
           <button class="go" onclick="applyBulkProxies(this)">Apply</button></div>
       </div>
     </div>
@@ -3131,6 +3441,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
         </div>
         <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsmode" value="roundrobin" checked style="width:auto"> Round-robin</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsmode" value="random" style="width:auto"> Random</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsmode" value="same" style="width:auto"> Same to all</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="checkbox" id="wsValid" checked style="width:auto"> Valid only</label>
         </div>
@@ -3256,6 +3567,15 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 
     <div id="stSys" style="display:none">
       <div id="sysInfo" class="sysgrid">loading…</div>
+      <div style="margin:.9rem 0;padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
+        <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Manager updates</div>
+        <div class="hint" style="margin-bottom:.55rem">Update the manager in place (<code>git pull</code> + restart the web UI) — no reinstall. Enable auto-update to run it on a daily schedule.</div>
+        <div class="row" style="align-items:center;gap:.7rem;flex-wrap:wrap">
+          <button class="go" onclick="selfUpdate(this)">🔄 Update manager now</button>
+          <label style="flex-direction:row;align-items:center;gap:.4rem;color:var(--txt);font-weight:400;margin:0"><input type="checkbox" id="autoUpd" onchange="toggleAutoupdate(this)" style="width:auto"> Auto-update daily</label>
+          <span class="msg" id="updMsg" style="color:var(--dim);flex:1"></span>
+        </div>
+      </div>
       <div style="display:flex;align-items:center;gap:.6rem;margin:.9rem 0;padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
         <input type="checkbox" id="sysEnable" onchange="toggleSystem()" style="width:18px;height:18px">
         <label for="sysEnable" style="margin:0;color:var(--txt);font-size:.85rem">Enable system actions (reboot / OS update)</label>
@@ -3980,6 +4300,64 @@ async function applyBulkProxies(btn){
   loadProxies(); if(restart)refresh();
 }
 
+// --- proxy health / auto-fix ---
+let HEALTH=[];
+async function scanHealth(btn){
+  if(btn)btn.disabled=true;
+  $('healthMsg').style.color='var(--dim)'; $('healthMsg').textContent='scanning consoles…';
+  const d=await api('/api/proxies/health','POST',{});
+  if(btn)btn.disabled=false;
+  if(d.error){ $('healthMsg').style.color='var(--crash)'; $('healthMsg').textContent='✗ '+d.error; return null; }
+  HEALTH=d.results||[]; renderHealth();
+  const n=(d.errored||[]).length;
+  $('healthMsg').style.color=n?'var(--warn)':'var(--dim)';
+  $('healthMsg').textContent=n?('⚠ '+n+' bot'+(n>1?'s':'')+' with proxy errors'):'✓ no proxy errors detected';
+  return d.errored||[];
+}
+function renderHealth(){
+  const box=$('healthList');
+  if(!HEALTH.length){ box.innerHTML='<span class="hint">No proxy-using bots, or not scanned yet.</span>'; return; }
+  box.innerHTML=HEALTH.map(r=>{
+    const tag=r.errored?'<span style="color:var(--crash)">● errored</span>'
+      :(r.running?'<span style="color:#57b65a">● ok</span>':'<span class="hint">○ stopped</span>');
+    const ev=r.errored?`<div class="hint" style="margin-left:1.1rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.evidence)}">${esc(r.evidence)}</div>`:'';
+    return `<div><span style="display:inline-block;min-width:10rem">${esc(r.name)}</span> <span class="hint">${esc(String(r.host)+':'+r.port)}</span> ${tag}${r.errored?' <span class="hint">('+r.hits+')</span>':''}${ev}</div>`;
+  }).join('');
+}
+async function autoFix(btn){
+  const scope=document.querySelector('input[name=fixscope]:checked').value;
+  const mode=document.querySelector('input[name=fixmode]:checked').value;
+  let targets;
+  if(scope==='errored'){
+    const er=await scanHealth(null);
+    if(er===null)return;
+    if(!er.length){ $('healthMsg').style.color='var(--dim)'; $('healthMsg').textContent='✓ nothing to fix — no errored bots'; return; }
+    targets=['errored'];
+  } else if(scope==='all'){ targets=['all']; }
+  else { targets=[...BULKSEL]; if(!targets.length){ $('healthMsg').style.color='var(--crash)'; $('healthMsg').textContent='select target bots first (chips below)'; return; } }
+  btn.disabled=true; $('healthMsg').style.color='var(--dim)';
+  $('healthMsg').textContent='re-importing from Webshare + reassigning + restarting…';
+  const body={ targets, token:$('wsToken').value.trim(),
+    auth:document.querySelector('input[name=wsauth]:checked').value,
+    mode, valid_only:true, save_token:$('wsSave').checked, restart:true };
+  const d=await api('/api/proxies/webshare','POST',body);
+  btn.disabled=false;
+  if(d.error){ $('healthMsg').style.color='var(--crash)'; $('healthMsg').textContent='✗ '+d.error; return; }
+  const ok=d.assigned.filter(r=>r.ok).length, fail=d.assigned.length-ok;
+  $('healthMsg').style.color=fail?'var(--warn)':'var(--dim)';
+  $('healthMsg').textContent='✓ fetched '+d.fetched+', reassigned '+ok+(fail?(' · '+fail+' failed'):'')+' · restarted';
+  loadProxies(); refresh(); setTimeout(()=>scanHealth(null),2000);
+}
+async function bulkSelectErrored(btn){
+  const er=await scanHealth(null);
+  if(er===null)return;
+  BULKSEL=new Set(er);
+  PROXROWS.filter(r=>r.found).forEach(r=>syncChip(r.name));
+  updateBulkCount();
+  $('bulkMsg').style.color='var(--dim)';
+  $('bulkMsg').textContent=er.length?('selected '+er.length+' errored bot'+(er.length>1?'s':'')):'no errored bots';
+}
+
 let depSrc='aquarius', depTimer=null, depDirEdited=false;
 function openDeploy(){
   depDirEdited=false; depSrc='aquarius';
@@ -4186,6 +4564,30 @@ function renderSysToggle(){
   $('sysEnable').checked=on;
   $('sysDanger').style.opacity=on?'1':'.45';
   $('sysDanger').style.pointerEvents=on?'auto':'none';
+  const au=SETTINGS&&SETTINGS.autoupdate;
+  if($('autoUpd')){ $('autoUpd').checked=!!(au&&au.enabled); $('autoUpd').disabled=!!(au&&au.state==='unavailable'); }
+}
+async function selfUpdate(btn){
+  if(!confirm('Update the manager now (git pull + restart the web UI)? The dashboard will blink for a moment.'))return;
+  const orig=btn.textContent; btn.disabled=true; btn.innerHTML='<span class="spin"></span> updating…';
+  $('updMsg').style.color='var(--dim)'; $('updMsg').textContent='git pull + restart…';
+  let d; try{ d=await api('/api/selfupdate','POST',{}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false; btn.textContent=orig;
+  if(!d||d.error){ $('updMsg').style.color='var(--crash)'; $('updMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  $('updMsg').style.color='var(--dim)';
+  if(d.updated){ $('updMsg').textContent='✓ '+d.old+' → '+d.new+(d.restarted?' · restarting…':' · restart manually'); }
+  else { $('updMsg').textContent='✓ already up to date ('+d.new+')'; }
+}
+async function toggleAutoupdate(cb){
+  const enable=cb.checked; cb.disabled=true;
+  $('updMsg').style.color='var(--dim)'; $('updMsg').textContent=enable?'enabling daily auto-update…':'disabling auto-update…';
+  let d; try{ d=await api('/api/autoupdate','POST',{enable}); }catch(e){ d={error:String(e)}; }
+  cb.disabled=false;
+  if(!d||d.error){ cb.checked=!enable; $('updMsg').style.color='var(--crash)'; $('updMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  if(SETTINGS)SETTINGS.autoupdate={enabled:d.enabled,state:d.state};
+  cb.checked=!!d.enabled;
+  $('updMsg').style.color='var(--dim)';
+  $('updMsg').textContent=d.enabled?('✓ auto-update on ('+(d.schedule||'daily')+')'):'✓ auto-update off';
 }
 async function toggleSystem(){
   const on=$('sysEnable').checked;

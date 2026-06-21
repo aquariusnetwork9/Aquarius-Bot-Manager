@@ -2,7 +2,7 @@
 
 Proxies are how this tool gives each bot its **own outbound IP** while they all share one VPS. (This is the alternative to running one bot per server — see **[[Architecture and Limitations]]**.) Every proxy edit is written into that bot's `client.connection.proxy` block in its `config.json` and takes effect on restart.
 
-Open **🌐 Proxies** in the dashboard. Three tools, smallest to largest:
+Open **🌐 Proxies** in the dashboard. Four tools: a per-bot editor, bulk assign/rotate, Webshare import, and a **health & auto-fix** panel that detects and replaces dead IPs.
 
 ![Proxies panel](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/proxies.png)
 *Per-bot host / port / user / password rows, plus the collapsible **Bulk assign / rotate** and **Import from Webshare** tools.*
@@ -32,12 +32,15 @@ abm proxy bot1 --host 1.2.3.4 --port 1080
 Paste a list of proxies (one per line) and spread them across many bots at once.
 
 - **Round-robin** — cycle the list across the selected bots (bot1→proxy1, bot2→proxy2, …).
+- **Random** — give each bot a random proxy from the list (unique when the list is at least as long as the target set).
 - **Same to all** — point every selected bot at the first proxy.
 - Entries may carry credentials: `host:port`, `host:port:user:pass`, or `user:pass@host:port`.
+- The **Errored** button selects only the bots whose console currently shows proxy errors (see *Proxy health* below), so you can reassign just the broken ones from a pasted list.
 
 CLI:
 ```bash
 abm proxybulk --list "1.2.3.4:1080,5.6.7.8:1080" --targets all --mode roundrobin --restart
+abm proxybulk --list "..." --targets errored --mode random --restart   # fix only broken bots
 ```
 
 ---
@@ -71,6 +74,27 @@ The token can also come from the `WEBSHARE_TOKEN` environment variable.
 
 ### Saving the token
 **Save token** stores it under `settings.webshare` in `instances.json`, **base64-obfuscated** so it's not eyeball-plaintext. ⚠️ **This is obfuscation, not encryption** — anyone who can read `instances.json` can recover it. See **[[Security]]**.
+
+---
+
+## 4. Proxy health & auto-fix
+
+Webshare (and other providers) periodically **remove proxy IPs** — for performance, abuse, or plan changes. When that happens a bot keeps trying its now-dead IP and spews proxy errors in its console while making no progress. The **Proxy health & auto-fix** panel (top of **🌐 Proxies**) finds and fixes these in one place.
+
+- **Scan** reads each running bot's console and flags the ones showing proxy errors, with the matching line as **evidence** so you can confirm it's a real proxy fault (not just a transient hiccup).
+- **Re-import & fix (Webshare)** pulls a fresh proxy list from your Webshare subscription and reassigns it to the chosen bots, then restarts them so the new IP takes effect. Choose:
+  - **Fix scope** — **Errored only** (default), **Selected** (the chips below), or **All**.
+  - **Assign** — **Random** (default) or **Round-robin**.
+
+It reuses the Webshare token + auth model from the *Import from Webshare* panel (a saved token is reused when the field is blank). To fix from a **pasted list** instead of Webshare, click **Errored** in the Bulk panel and apply with **Random** + *Restart after*.
+
+**Tuning detection.** Errors are matched against a default set of patterns covering the common "proxy refused / timed out / unreachable / failed to connect" wordings. If your proxies word their errors differently, add your own to `settings.proxy_health.patterns` (a list of regexes) in `instances.json` — the scan's evidence line tells you the exact text to match.
+
+CLI:
+```bash
+abm proxyhealth                                              # list bots with proxy errors
+abm webshare import --targets errored --mode random --restart   # re-import + fix the broken ones
+```
 
 ---
 

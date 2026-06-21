@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.2.0 — *latest*
+## v1.3.0 — *latest*
+
+- **Proxy health & auto-fix** — scans each running bot's console for proxy errors (dead / Webshare-removed IPs) and shows which bots are broken (with the matching console line as evidence). One click re-imports fresh IPs from Webshare and reassigns them to the broken bots, then restarts. Fix scope: **errored only**, selected, or all; assignment: **random**, round-robin, or same. Detection patterns are tunable in the config (`settings.proxy_health.patterns`). New `Errored` quick-select in the bulk panel; new CLI `abm proxyhealth`, plus `--mode random` and `--targets errored` on `abm proxybulk` / `abm webshare`.
+- **Self-update / auto-update** — update the manager in place with **`abm selfupdate`** (`git pull` + restart, no reinstall) or the **🔄 Update manager** button in Settings → System. Enable **`abm autoupdate on`** (or the "Auto-update daily" toggle) to install a systemd timer that keeps it current automatically.
+
+## v1.2.0
 
 - **Webshare proxy import** — one-click import of a whole [Webshare](https://www.webshare.io/) proxy subscription, supporting both auth models (per-proxy user/pass and IP-authorized). See **[[Proxies]]**.
 - **Per-bot proxy credentials** — the proxy editor now carries host / port / username / password per bot, not just host:port.
