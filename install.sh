@@ -32,9 +32,13 @@ BASE_DIR="${ABM_BASE_DIR:-$USER_HOME/zenith}"
 # tunnel = stay on 127.0.0.1 (most secure, default); https = public via Caddy;
 # agent  = fleet member, binds the VPC private IP + HTTP Basic auth (set by the
 #          fleet controller's cloud-init; needs ABM_USER + ABM_PASS).
+# node   = controller-managed box: stays on 127.0.0.1 (reached only via the
+#          controller's SSH tunnel), lightweight, no Caddy. ABM_USER/ABM_PASS
+#          optional (set them if you want the node to require Basic auth, which
+#          the controller will present automatically).
 ACCESS="${ABM_ACCESS:-}"
-if [ "$ACCESS" = "agent" ]; then
-  : # non-interactive: provisioned by the fleet controller, skip the prompt
+if [ "$ACCESS" = "agent" ] || [ "$ACCESS" = "node" ]; then
+  : # non-interactive: provisioned by a controller / fleet, skip the prompt
 elif [ -z "$ACCESS" ]; then
   if [ -r /dev/tty ]; then
     echo
@@ -108,8 +112,9 @@ for unit in aquarius-bot-manager.service aquarius-bot-manager-boot.service; do
       "$INSTALL_DIR/$unit" > "/etc/systemd/system/$unit"
 done
 
-# agent mode: bake the fleet's Basic-auth credentials into the web unit's env
-if [ "$ACCESS" = "agent" ]; then
+# agent/node mode: bake Basic-auth credentials into the web unit's env. Agent
+# requires them; node bakes them only if provided (it may run open behind its tunnel).
+if [ "$ACCESS" = "agent" ] || { [ "$ACCESS" = "node" ] && [ -n "${ABM_USER:-}" ] && [ -n "${ABM_PASS:-}" ]; }; then
   sed -i "/^\[Service\]/a Environment=ABM_USER=$ABM_USER\nEnvironment=ABM_PASS=$ABM_PASS" \
       /etc/systemd/system/aquarius-bot-manager.service
 fi
@@ -131,8 +136,18 @@ PUBIP="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
 [ -z "$PUBIP" ] && PUBIP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [ -z "$PUBIP" ] && PUBIP="<this-vps-ip>"
 
+# ---- node path: controller-managed box, private, reached over the SSH tunnel ---
+if [ "$ACCESS" = "node" ]; then
+  cat <<DONE
+
+==> Done. This box is an Aquarius Bot Manager NODE (controller-managed).
+    It listens on http://${BIND_HOST}:${PORT} — private; reachable only through the
+    controller's SSH tunnel. Add it from the controller with the "Boxes" button
+    (or: abm node add <name> ${RUN_USER}@${PUBIP}).
+DONE
+
 # ---- agent path: fleet member, nothing public, reachable only on the VPC ------
-if [ "$ACCESS" = "agent" ]; then
+elif [ "$ACCESS" = "agent" ]; then
   cat <<DONE
 
 ==> Done. This droplet is an Aquarius Bot Manager AGENT.

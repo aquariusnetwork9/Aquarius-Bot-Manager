@@ -41,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -2201,6 +2202,43 @@ def ensure_node_tunnel(node, wait=8.0):
     return _port_open(node["local_port"])
 
 
+# A sticky top bar injected into every page (the controller's own and proxied node
+# pages) so you can switch which box you're viewing without leaving the browser tab.
+SWITCHER_BAR = """
+<div id="abmNodeBar" style="position:sticky;top:0;z-index:99999;display:flex;align-items:center;gap:.6rem;padding:.3rem .8rem;background:#0a1016;border-bottom:1px solid #1c2a36;font:600 .8rem/1.25 system-ui,-apple-system,sans-serif;color:#cdd9e2">
+  <span style="opacity:.6;font-weight:400">Viewing</span>
+  <select id="abmNodeSel" onchange="abmSelectNode(this.value)" style="font:600 .8rem system-ui,sans-serif;background:#06090c;color:#e6f0f7;border:1px solid #1c2a36;border-radius:7px;padding:.22rem .5rem;cursor:pointer">
+    <option value="">★ This box (controller)</option>
+  </select>
+  <span id="abmNodeWhich" style="opacity:.5;font-weight:400"></span>
+  <span style="flex:1"></span>
+  <a href="#" onclick="abmSelectNode('');return false" style="color:#7fb0d8;text-decoration:none;font-weight:400">controller home</a>
+</div>
+<script>
+window.ABM_CURRENT_NODE="__ABM_NODE__";
+function abmEsc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+async function abmSelectNode(name){
+  try{ await fetch('/api/node/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}); }catch(e){}
+  location.href='/';
+}
+(async function(){
+  try{
+    var d=await fetch('/api/nodes').then(function(r){return r.json();});
+    var sel=document.getElementById('abmNodeSel'); if(!sel)return;
+    var cur=window.ABM_CURRENT_NODE||'';
+    var html='<option value="">★ This box (controller)</option>';
+    (d.nodes||[]).forEach(function(n){
+      var off=(n.tunnel&&n.tunnel.alive)?'':' (offline)';
+      html+='<option value="'+abmEsc(n.name)+'"'+(n.name===cur?' selected':'')+'>'+abmEsc(n.name)+off+'</option>';
+    });
+    sel.innerHTML=html; if(cur)sel.value=cur;
+    var w=document.getElementById('abmNodeWhich'); if(w)w.textContent=cur?'remote node':'';
+  }catch(e){}
+})();
+</script>
+"""
+
+
 # ---------------------------------------------------------------------------
 # Web server
 # ---------------------------------------------------------------------------
@@ -2305,6 +2343,100 @@ class Handler(BaseHTTPRequestHandler):
     def _find(self, cfg, name):
         return cfg["by_name"].get(name)
 
+    # ---- controller: node selection + reverse proxy ----
+    def _selected_node(self):
+        """The node chosen via the abm_node cookie, or None for the local controller."""
+        raw = self.headers.get("Cookie", "")
+        name = None
+        for part in raw.split(";"):
+            part = part.strip()
+            if part.startswith("abm_node="):
+                name = part[len("abm_node="):]
+        if not name:
+            return None
+        return find_node(load_nodes(), name)
+
+    def _is_switcher_path(self, path):
+        # controller-level paths always served locally so box-switching keeps working
+        # even while a remote node is selected
+        return (path in ("/logout", "/api/authstatus", "/api/node/select",
+                         "/api/nodes", "/api/nodes/remove", "/api/nodes/do")
+                or path.startswith("/api/node/"))
+
+    def _inject_switcher_str(self, text, current):
+        if "<body>" not in text or "abmNodeBar" in text:
+            return text
+        bar = SWITCHER_BAR.replace("__ABM_NODE__", html.escape(current or "", quote=True))
+        return text.replace("<body>", "<body>" + bar, 1)
+
+    def _proxy_to_node(self, node):
+        """Forward this request verbatim to the node's manager over its loopback tunnel,
+        inject the node's Basic-auth, and splice the switcher bar into HTML responses."""
+        url = f"http://127.0.0.1:{node['local_port']}{self.path}"
+        data = self._read_body() if self.command in ("POST", "PUT", "PATCH", "DELETE") else None
+        fwd = {}
+        for h in ("Content-Type", "Accept", "User-Agent"):
+            v = self.headers.get(h)
+            if v:
+                fwd[h] = v
+        u, pw = node_creds(node)
+        if u:
+            fwd["Authorization"] = "Basic " + base64.b64encode(f"{u}:{pw}".encode()).decode()
+        req = urllib.request.Request(url, data=data, method=self.command, headers=fwd)
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+            status, rheaders, rbody = resp.status, resp.getheaders(), resp.read()
+        except urllib.error.HTTPError as e:
+            status = e.code
+            rheaders = list(e.headers.items()) if e.headers else []
+            try:
+                rbody = e.read()
+            except Exception:
+                rbody = b""
+        except Exception as e:
+            return self._node_unreachable(node, str(e))
+        ctype = next((v for k, v in rheaders if k.lower() == "content-type"), "")
+        if "text/html" in ctype.lower():
+            try:
+                rbody = self._inject_switcher_str(
+                    rbody.decode("utf-8", "replace"), node["name"]).encode("utf-8")
+            except Exception:
+                pass
+        self.send_response(status)
+        skip = ("content-length", "transfer-encoding", "connection",
+                "set-cookie", "content-encoding", "keep-alive")
+        for k, v in rheaders:
+            if k.lower() in skip:
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(rbody)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(rbody)
+
+    def _node_unreachable(self, node, err):
+        page = (
+            "<!doctype html><html><head><meta charset='utf-8'><title>box unreachable</title>"
+            "</head><body><div style='max-width:560px;margin:13vh auto;"
+            "font:400 15px/1.5 system-ui,sans-serif;color:#cdd9e2;background:#0d141b;"
+            "border:1px solid #1c2a36;border-radius:12px;padding:1.4rem'>"
+            f"<h2 style='margin:.2rem 0 .6rem'>“{html.escape(node['name'])}” is unreachable</h2>"
+            "<p style='opacity:.8'>The controller couldn't reach this box over its SSH tunnel:</p>"
+            "<pre style='white-space:pre-wrap;background:#06090c;border:1px solid #1c2a36;"
+            f"border-radius:8px;padding:.6rem;font-size:12px;color:#e08a8a'>{html.escape(err)}</pre>"
+            "<p style='opacity:.8'>The tunnel keeps retrying in the background. Use the bar above "
+            "to return to the controller or pick another box.</p>"
+            "<button onclick=\"abmSelectNode('')\" style='background:#1c5;border:0;color:#06240f;"
+            "font-weight:700;border-radius:8px;padding:.5rem .9rem;cursor:pointer'>"
+            "Back to controller</button></div></body></html>")
+        body = self._inject_switcher_str(page, node["name"]).encode("utf-8")
+        self.send_response(502)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     # ---- routing ----
     def do_GET(self):
         u = urlparse(self.path)
@@ -2331,8 +2463,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(LOGIN_PAGE)
             return self._json({"error": "unauthorized"}, 401)
 
+        # controller: a selected node proxies the whole UI through its SSH tunnel
+        node = self._selected_node()
+        if node is not None and not self._is_switcher_path(path):
+            return self._proxy_to_node(node)
+
         if path == "/" or path == "/index.html":
-            return self._html(PAGE.replace("__ABM_VERSION__", __version__))
+            page = PAGE.replace("__ABM_VERSION__", __version__)
+            if load_nodes()["nodes"]:
+                page = self._inject_switcher_str(page, "")
+            return self._html(page)
 
         if path == "/logout":
             tok = self._cookie_token()
@@ -2503,6 +2643,33 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self._auth_ok(cfg):
             return self._json({"error": "unauthorized"}, 401)
+
+        # controller: proxy mutating requests to the selected node too (skip switcher controls)
+        node = self._selected_node()
+        if node is not None and not self._is_switcher_path(path):
+            return self._proxy_to_node(node)
+
+        # controller: set/clear which box this browser is viewing (abm_node cookie)
+        if path == "/api/node/select":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            name = (p.get("name") or "").strip()
+            if name and not find_node(load_nodes(), name):
+                return self._json({"error": "no such node"}, 404)
+            body = json.dumps({"ok": True, "selected": name}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if name:
+                self.send_header("Set-Cookie",
+                                 f"abm_node={name}; Path=/; SameSite=Strict; Max-Age={SESSION_TTL}")
+            else:
+                self.send_header("Set-Cookie", "abm_node=; Path=/; SameSite=Strict; Max-Age=0")
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         # bulk actions
         m = re.match(r"^/api/(start|stop|restart)_all$", path)
