@@ -6,6 +6,7 @@ Release history for Aquarius Bot Manager. Downloads are on the [Releases page](h
 
 - **Proxy health & auto-fix** — scans each running bot's console for proxy errors (dead / Webshare-removed IPs) and shows which bots are broken (with the matching console line as evidence). One click re-imports fresh IPs from Webshare and reassigns them to the broken bots, then restarts. Fix scope: **errored only**, selected, or all; assignment: **random**, round-robin, or same. Detection patterns are tunable in the config (`settings.proxy_health.patterns`). New `Errored` quick-select in the bulk panel; new CLI `abm proxyhealth`, plus `--mode random` and `--targets errored` on `abm proxybulk` / `abm webshare`.
 - **Self-update / auto-update** — update the manager in place with **`abm selfupdate`** (`git pull` + restart, no reinstall) or the **🔄 Update manager** button in Settings → System. Enable **`abm autoupdate on`** (or the "Auto-update daily" toggle) to install a systemd timer that keeps it current automatically.
+- **Safe restarts** — the systemd units now set `KillMode=process`, so restarting the manager (including `abm selfupdate`) only stops the manager process and never tears down the running bot `tmux` sessions, even when bots share the service's cgroup.
 
 ## v1.2.0
 
