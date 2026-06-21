@@ -2034,6 +2034,55 @@ def set_do_token(reg, token):
     save_nodes(reg)
 
 
+def make_backup(cfg):
+    """A portable bundle of this box's configs (instances + connected nodes). Includes
+    secrets so a restore is complete — the downloaded file is sensitive."""
+    bundle = {"abm_backup": 1, "version": __version__, "created": time.time(),
+              "host": socket.gethostname(), "files": {}}
+    try:
+        with open(cfg["path"]) as f:
+            bundle["files"]["instances.json"] = json.load(f)
+    except Exception:
+        bundle["files"]["instances.json"] = cfg.get("raw")
+    if os.path.exists(DEFAULT_NODES):
+        try:
+            with open(DEFAULT_NODES) as f:
+                bundle["files"]["nodes.json"] = json.load(f)
+        except Exception:
+            pass
+    return bundle
+
+
+def restore_backup(cfg, bundle):
+    """Write configs from a backup bundle after snapshotting the current files
+    (.pre-restore-<ts>.bak alongside them). Returns a summary."""
+    if not isinstance(bundle, dict) or not bundle.get("abm_backup"):
+        raise ValueError("not an Aquarius Bot Manager backup file")
+    files = bundle.get("files") or {}
+    if not files:
+        raise ValueError("backup contains no files")
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    written = []
+    for fname, dest in (("instances.json", cfg["path"]), ("nodes.json", DEFAULT_NODES)):
+        if fname not in files:
+            continue
+        if os.path.exists(dest):
+            try:
+                shutil.copy2(dest, f"{dest}.pre-restore-{ts}.bak")
+            except Exception:
+                pass
+        tmp = dest + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(files[fname], f, indent=2)
+        os.replace(tmp, dest)
+        try:
+            os.chmod(dest, 0o600)
+        except OSError:
+            pass
+        written.append(fname)
+    return {"restored": written, "snapshot_suffix": f".pre-restore-{ts}.bak"}
+
+
 def save_nodes(reg):
     path = reg["_path"]
     out = {k: v for k, v in reg.items() if not k.startswith("_")}
@@ -2924,6 +2973,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # download a config backup of this box (instances + connected nodes)
+        if path == "/api/backup":
+            bundle = json.dumps(make_backup(self._cfg()), indent=2).encode()
+            fname = f"abm-backup-{socket.gethostname()}-{time.strftime('%Y%m%d')}.json"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", str(len(bundle)))
+            self.end_headers()
+            self.wfile.write(bundle)
+            return
+
         if path == "/api/system/job":
             return self._json(SYS_JOB.snapshot())
 
@@ -3210,6 +3271,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no DigitalOcean token saved"}, 400)
             try:
                 return self._json({"ok": True, **do_destroy_node(reg, tok, p.get("name"))})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
+        # restore configs from an uploaded backup bundle (snapshots current files first)
+        if path == "/api/restore":
+            try:
+                bundle = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            try:
+                return self._json({"ok": True, **restore_backup(self._cfg(), bundle)})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
 
@@ -4797,6 +4869,16 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
           <span class="msg" id="updMsg" style="color:var(--dim);flex:1"></span>
         </div>
       </div>
+      <div style="margin:.9rem 0;padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
+        <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Backup &amp; restore</div>
+        <div class="hint" style="margin-bottom:.55rem">Download this box's configs (instances + connected boxes). The file contains secrets — keep it safe. Restoring overwrites the current configs (a timestamped copy is saved first) and may require logging in again.</div>
+        <div class="row" style="align-items:center;gap:.7rem;flex-wrap:wrap">
+          <button class="go" onclick="dlBackup()">⬇ Download backup</button>
+          <input type="file" id="restoreFile" accept="application/json,.json" style="width:auto;font-size:.78rem">
+          <button class="warn" onclick="doRestore(this)">⬆ Restore</button>
+          <span class="msg" id="bkpMsg" style="color:var(--dim);flex:1"></span>
+        </div>
+      </div>
       <div style="display:flex;align-items:center;gap:.6rem;margin:.9rem 0;padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
         <input type="checkbox" id="sysEnable" onchange="toggleSystem()" style="width:18px;height:18px">
         <label for="sysEnable" style="margin:0;color:var(--txt);font-size:.85rem">Enable system actions (reboot / OS update)</label>
@@ -6003,6 +6085,19 @@ async function toggleAutoupdate(cb){
   cb.checked=!!d.enabled;
   $('updMsg').style.color='var(--dim)';
   $('updMsg').textContent=d.enabled?('✓ auto-update on ('+(d.schedule||'daily')+')'):'✓ auto-update off';
+}
+function dlBackup(){ window.location='/api/backup'; }
+async function doRestore(btn){
+  const f=$('restoreFile').files[0];
+  if(!f){ $('bkpMsg').style.color='var(--crash)'; $('bkpMsg').textContent='choose a backup file first'; return; }
+  if(!confirm('Restore configs from this backup? It overwrites the current instances + connected boxes (a timestamped copy is saved first). You may need to log in again.'))return;
+  btn.disabled=true; $('bkpMsg').style.color='var(--dim)'; $('bkpMsg').textContent='restoring…';
+  let bundle; try{ bundle=JSON.parse(await f.text()); }catch(e){ btn.disabled=false; $('bkpMsg').style.color='var(--crash)'; $('bkpMsg').textContent='not a valid backup file'; return; }
+  let d; try{ d=await api('/api/restore','POST',bundle); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false;
+  if(!d||d.error){ $('bkpMsg').style.color='var(--crash)'; $('bkpMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  $('bkpMsg').style.color='var(--dim)'; $('bkpMsg').textContent='✓ restored '+((d.restored||[]).join(', '))+' — reloading…';
+  setTimeout(()=>location.reload(),1200);
 }
 async function toggleSystem(){
   const on=$('sysEnable').checked;
