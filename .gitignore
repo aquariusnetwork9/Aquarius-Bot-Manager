@@ -4,6 +4,9 @@ instances.json
 # Fleet registry (contains the DigitalOcean API token + agent credentials)
 fleet.json
 
+# Node registry (controller mode — contains SSH targets + node web credentials)
+nodes.json
+
 # Python
 __pycache__/
 *.py[cod]

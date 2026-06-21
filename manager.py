@@ -36,9 +36,12 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -1944,6 +1947,261 @@ def reconnect_script(ostype, ip, user, port):
 
 
 # ---------------------------------------------------------------------------
+# Multi-VPS controller: node registry + SSH tunnels
+# ---------------------------------------------------------------------------
+# A "node" is another box running the manager. The controller keeps an SSH tunnel
+# (ssh -N -L <local_port>:127.0.0.1:<remote_port>) to each node so it can reach the
+# node's manager over loopback, then proxies/aggregates it. Nodes stay bound to
+# 127.0.0.1 and are never exposed publicly — the SSH key is the only way in.
+
+DEFAULT_NODES = (os.environ.get("ABM_NODES_CONFIG")
+                 or os.path.join(SCRIPT_DIR, "nodes.json"))
+_LOCAL_PORT_BASE = 8801          # controller-side loopback ports start here
+
+
+def _b64enc(t):
+    """Obfuscate-at-rest (base64). NOT encryption — just not eyeball-plaintext."""
+    t = (t or "").strip()
+    return "b64:" + base64.b64encode(t.encode()).decode() if t else ""
+
+
+def _b64dec(s):
+    s = s or ""
+    if s.startswith("b64:"):
+        try:
+            return base64.b64decode(s[4:]).decode()
+        except Exception:
+            return ""
+    return s
+
+
+def load_nodes(path=DEFAULT_NODES):
+    if not os.path.exists(path):
+        return {"_path": path, "nodes": []}
+    with open(path) as f:
+        raw = json.load(f)
+    raw.setdefault("nodes", [])
+    raw["_path"] = path
+    return raw
+
+
+def save_nodes(reg):
+    path = reg["_path"]
+    out = {k: v for k, v in reg.items() if not k.startswith("_")}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, path)
+    try:                          # creds at rest — restrict perms (best-effort; no-op on Windows)
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def find_node(reg, name):
+    for n in reg["nodes"]:
+        if n.get("name") == name:
+            return n
+    return None
+
+
+def node_creds(node):
+    """Decoded (user, pass) the controller presents to the node's manager when it
+    enforces auth. Empty user => the node runs open behind its tunnel."""
+    return node.get("basic_user") or "", _b64dec(node.get("basic_pass"))
+
+
+def _assign_local_port(reg):
+    used = {n.get("local_port") for n in reg["nodes"]}
+    p = _LOCAL_PORT_BASE
+    while p in used:
+        p += 1
+    return p
+
+
+def add_node(reg, name, ssh_host, ssh_user="ubuntu", ssh_port=22, remote_port=8765,
+             ssh_key=None, basic_user=None, basic_pass=None, local_port=None):
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("node name is required")
+    if not (ssh_host or "").strip():
+        raise ValueError("ssh_host is required")
+    if find_node(reg, name):
+        raise ValueError(f"node already exists: {name}")
+    node = {
+        "name": name,
+        "ssh_host": ssh_host.strip(),
+        "ssh_user": (ssh_user or "ubuntu").strip(),
+        "ssh_port": int(ssh_port or 22),
+        "remote_port": int(remote_port or 8765),
+        "local_port": int(local_port) if local_port else _assign_local_port(reg),
+    }
+    if ssh_key:
+        node["ssh_key"] = ssh_key.strip()
+    if basic_user:
+        node["basic_user"] = basic_user.strip()
+    if basic_pass:
+        node["basic_pass"] = _b64enc(basic_pass)
+    reg["nodes"].append(node)
+    save_nodes(reg)
+    return node
+
+
+def remove_node(reg, name):
+    n = find_node(reg, name)
+    if not n:
+        raise ValueError(f"no such node: {name}")
+    reg["nodes"] = [x for x in reg["nodes"] if x.get("name") != name]
+    save_nodes(reg)
+    return n
+
+
+def node_public_view(node, tunnels=None):
+    """Registry row for the UI/CLI — never echoes the stored credential."""
+    u, _ = node_creds(node)
+    row = {
+        "name": node.get("name"),
+        "ssh_host": node.get("ssh_host"),
+        "ssh_user": node.get("ssh_user"),
+        "ssh_port": node.get("ssh_port", 22),
+        "remote_port": node.get("remote_port", 8765),
+        "local_port": node.get("local_port"),
+        "has_creds": bool(u),
+    }
+    if tunnels is not None:
+        st = tunnels.status().get(node.get("name"))
+        row["tunnel"] = st or {"alive": False, "pid": None}
+    return row
+
+
+def node_request(node, method, path, body=None, timeout=10):
+    """HTTP to a node's manager over its loopback tunnel, adding the node's
+    Basic-auth creds when configured. Raises on transport/HTTP error."""
+    port = node["local_port"]
+    url = f"http://127.0.0.1:{port}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json", "User-Agent": "abm-controller"}
+    u, pw = node_creds(node)
+    if u:
+        headers["Authorization"] = "Basic " + base64.b64encode(f"{u}:{pw}".encode()).decode()
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode()
+        return json.loads(raw) if raw else {}
+
+
+def _port_open(port, host="127.0.0.1", timeout=0.5):
+    with socket.socket() as s:
+        s.settimeout(timeout)
+        return s.connect_ex((host, port)) == 0
+
+
+class TunnelManager:
+    """Maintains one `ssh -N -L` tunnel per registered node and self-heals dead ones.
+    Re-reads nodes.json each supervision tick so add/remove takes effect live."""
+
+    def __init__(self, nodes_path=DEFAULT_NODES, interval=15):
+        self.nodes_path = nodes_path
+        self.interval = interval
+        self._procs = {}              # name -> Popen
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._started = False
+
+    def _ssh_cmd(self, node):
+        cmd = ["ssh", "-N",
+               "-o", "ExitOnForwardFailure=yes",
+               "-o", "ConnectTimeout=10",
+               "-o", "ServerAliveInterval=30",
+               "-o", "ServerAliveCountMax=3",
+               "-o", "StrictHostKeyChecking=accept-new",
+               "-o", "BatchMode=yes",
+               "-p", str(node.get("ssh_port", 22)),
+               "-L", f"127.0.0.1:{node['local_port']}:127.0.0.1:{node.get('remote_port', 8765)}"]
+        if node.get("ssh_key"):
+            cmd += ["-i", node["ssh_key"]]
+        cmd += [f"{node.get('ssh_user', 'ubuntu')}@{node['ssh_host']}"]
+        return cmd
+
+    def ensure(self, node):
+        """Spawn the tunnel for `node` if it isn't already running."""
+        name = node["name"]
+        with self._lock:
+            p = self._procs.get(name)
+            if p and p.poll() is None:
+                return
+            try:
+                self._procs[name] = subprocess.Popen(
+                    self._ssh_cmd(node), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            except Exception:
+                self._procs.pop(name, None)
+
+    def drop(self, name):
+        with self._lock:
+            p = self._procs.pop(name, None)
+        if p:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    def status(self):
+        with self._lock:
+            return {name: {"pid": p.pid, "alive": p.poll() is None}
+                    for name, p in self._procs.items()}
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        reg = load_nodes(self.nodes_path)
+        for n in reg["nodes"]:
+            self.ensure(n)
+        threading.Thread(target=self._supervise, daemon=True).start()
+
+    def _supervise(self):
+        while not self._stop.wait(self.interval):
+            try:
+                reg = load_nodes(self.nodes_path)
+            except Exception:
+                continue
+            names = {n["name"] for n in reg["nodes"]}
+            for gone in [n for n in self.status() if n not in names]:
+                self.drop(gone)
+            for n in reg["nodes"]:
+                self.ensure(n)
+
+    def stop(self):
+        self._stop.set()
+        for name in list(self.status()):
+            self.drop(name)
+
+
+# the live tunnel supervisor (set by serve() when nodes are registered)
+TUNNELS = None
+
+
+def ensure_node_tunnel(node, wait=8.0):
+    """Bring up a node's tunnel and block until its loopback port answers (best-effort).
+    Used after adding a node at runtime — also starts the supervisor so the tunnel
+    self-heals even if the controller had no nodes at boot."""
+    global TUNNELS
+    if TUNNELS is None:
+        TUNNELS = TunnelManager()
+    if not TUNNELS._started:
+        TUNNELS.start()          # ensures all registered nodes + launches the supervisor
+    else:
+        TUNNELS.ensure(node)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _port_open(node["local_port"]):
+            return True
+        time.sleep(0.25)
+    return _port_open(node["local_port"])
+
+
+# ---------------------------------------------------------------------------
 # Web server
 # ---------------------------------------------------------------------------
 
@@ -2116,6 +2374,12 @@ class Handler(BaseHTTPRequestHandler):
             force = q.get("force", ["0"])[0] in ("1", "true", "yes")
             return self._json(update_available(force=force))
 
+        # controller: registered nodes (other boxes) + live tunnel status. Always served
+        # locally (never proxied) so the box-switcher works while a node is selected.
+        if path == "/api/nodes":
+            reg = load_nodes()
+            return self._json({"nodes": [node_public_view(n, TUNNELS) for n in reg["nodes"]]})
+
         if path == "/api/system/info":
             return self._json(_sysinfo())
 
@@ -2260,6 +2524,53 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(e)}, 400)
             except json.JSONDecodeError as e:
                 return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # controller: register a new node (other VPS box). Accepts user@host[:port] in
+        # "target" or explicit fields. Brings the tunnel up and probes it so the UI
+        # can report reachable/not on the spot.
+        if path == "/api/nodes":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            tgt_user, host, tgt_port = _parse_ssh_target(p.get("target") or p.get("ssh_host") or "")
+            reg = load_nodes()
+            try:
+                node = add_node(
+                    reg, p.get("name"), host,
+                    ssh_user=p.get("ssh_user") or tgt_user or "ubuntu",
+                    ssh_port=int(p.get("ssh_port") or tgt_port or 22),
+                    remote_port=int(p.get("remote_port") or 8765),
+                    ssh_key=p.get("ssh_key"), basic_user=p.get("basic_user"),
+                    basic_pass=p.get("basic_pass"), local_port=p.get("local_port"))
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, 400)
+            test = {"reachable": False}
+            try:
+                if ensure_node_tunnel(node):
+                    n = node_request(node, "GET", "/api/instances", timeout=8).get("instances", [])
+                    test = {"reachable": True, "instances": len(n)}
+                else:
+                    test = {"reachable": False,
+                            "error": "tunnel did not come up — check ssh user/host/key"}
+            except Exception as e:
+                test = {"reachable": False, "error": str(e)}
+            return self._json({"ok": True, "node": node_public_view(node, TUNNELS), "test": test})
+
+        # controller: remove a node (POST to stay consistent with the rest of the API)
+        if path == "/api/nodes/remove":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            reg = load_nodes()
+            try:
+                remove_node(reg, p.get("name"))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 404)
+            if TUNNELS is not None:
+                TUNNELS.drop(p.get("name"))
+            return self._json({"ok": True})
 
         # system actions (reboot / update) — gated by settings + auth
         m = re.match(r"^/api/system/(reboot|update)$", path)
@@ -2547,10 +2858,21 @@ def serve(cfg_path, host, port):
         print("WARNING: listening on a non-local address with NO auth. Anyone who can reach "
               f"{host}:{port} has full control. Set a password or bind to 127.0.0.1.")
     print(f"config: {cfg_path}")
+    # controller mode: bring up SSH tunnels to any registered nodes
+    global TUNNELS
+    reg = load_nodes()
+    if reg["nodes"]:
+        TUNNELS = TunnelManager()
+        TUNNELS.start()
+        print(f"controller: starting {len(reg['nodes'])} node tunnel(s): "
+              + ", ".join(n["name"] for n in reg["nodes"]))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        if TUNNELS is not None:
+            TUNNELS.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -2575,6 +2897,99 @@ def cli_status(cfg):
     width = max((len(i["name"]) for i in cfg["instances"]), default=4)
     for i in cfg["instances"]:
         print(f"{i['name']:<{width}}  {instance_status(i)}")
+
+
+def _parse_ssh_target(s):
+    """'ubuntu@1.2.3.4:2222' -> (user, host, port). Missing parts -> (None, host, None)."""
+    user, port = None, None
+    s = (s or "").strip()
+    if "@" in s:
+        user, s = s.split("@", 1)
+    if ":" in s:
+        s, p = s.rsplit(":", 1)
+        if p.isdigit():
+            port = int(p)
+    return (user or None), s, port
+
+
+def _cli_node_test(node, cleanup=True):
+    """Bring the node's tunnel up (transiently for CLI), probe its API, print result."""
+    mgr = TUNNELS or TunnelManager()
+    mgr.ensure(node)
+    up = False
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        if _port_open(node["local_port"]):
+            up = True
+            break
+        time.sleep(0.25)
+    try:
+        if not up:
+            die(f"tunnel to {node['name']} did not come up on 127.0.0.1:{node['local_port']} "
+                "— check ssh user/host/key (try: ssh "
+                f"{node.get('ssh_user', 'ubuntu')}@{node['ssh_host']})")
+        try:
+            inst = node_request(node, "GET", "/api/instances", timeout=8).get("instances", [])
+            print(f"OK  {node['name']}: reachable over the tunnel; {len(inst)} instance(s)")
+        except Exception as e:
+            die(f"tunnel is up but the node API didn't answer: {e}\n"
+                "(is the manager running on the node? if it enforces login, pass "
+                "--basic-user/--basic-pass)")
+    finally:
+        if cleanup and TUNNELS is None:
+            mgr.drop(node["name"])
+
+
+def cli_node(args):
+    reg = load_nodes()
+    act = args.action
+    if act == "list":
+        if not reg["nodes"]:
+            print("no nodes registered.  add one:  abm node add <name> <user@host>")
+            return
+        w = max((len(n["name"]) for n in reg["nodes"]), default=4)
+        for n in reg["nodes"]:
+            v = node_public_view(n)
+            print(f"{v['name']:<{w}}  {v['ssh_user']}@{v['ssh_host']}:{v['ssh_port']}"
+                  f"  ->  127.0.0.1:{v['local_port']}  (remote {v['remote_port']})"
+                  f"  creds={'yes' if v['has_creds'] else 'no'}")
+        return
+    if act == "add":
+        if not args.name or not args.target:
+            die("usage:  abm node add <name> <user@host[:port]> [--key FILE] "
+                "[--basic-user U --basic-pass P]")
+        u, host, port = _parse_ssh_target(args.target)
+        try:
+            node = add_node(reg, args.name, host,
+                            ssh_user=args.user or u or "ubuntu",
+                            ssh_port=args.ssh_port or port or 22,
+                            remote_port=args.remote_port, ssh_key=args.key,
+                            basic_user=args.basic_user, basic_pass=args.basic_pass,
+                            local_port=args.local_port)
+        except ValueError as e:
+            die(str(e))
+        print(f"added node '{node['name']}': {node['ssh_user']}@{node['ssh_host']}:"
+              f"{node['ssh_port']}  ->  127.0.0.1:{node['local_port']}")
+        print("bringing up tunnel + testing ...")
+        return _cli_node_test(node)
+    if act == "remove":
+        if not args.name:
+            die("usage:  abm node remove <name>")
+        try:
+            remove_node(reg, args.name)
+        except ValueError as e:
+            die(str(e))
+        if TUNNELS is not None:
+            TUNNELS.drop(args.name)
+        print(f"removed node '{args.name}'")
+        return
+    if act == "test":
+        if not args.name:
+            die("usage:  abm node test <name>")
+        node = find_node(reg, args.name)
+        if not node:
+            die(f"no such node: {args.name}")
+        return _cli_node_test(node)
 
 
 def main():
@@ -2722,12 +3137,28 @@ def main():
     p.add_argument("--schedule", default="daily",
                    help="systemd OnCalendar value when enabling (default: daily)")
 
+    p = sub.add_parser("node", help="manage controller nodes (other VPS boxes reached over SSH tunnels)")
+    p.add_argument("action", choices=["list", "add", "remove", "test"])
+    p.add_argument("name", nargs="?", help="node name (add/remove/test)")
+    p.add_argument("target", nargs="?", help="user@host[:port] (add)")
+    p.add_argument("--user", default=None, help="ssh user (overrides user@ in target)")
+    p.add_argument("--ssh-port", dest="ssh_port", type=int, default=None)
+    p.add_argument("--remote-port", dest="remote_port", type=int, default=8765,
+                   help="the node manager's bind port (default 8765)")
+    p.add_argument("--key", default=None, help="ssh identity file")
+    p.add_argument("--local-port", dest="local_port", type=int, default=None)
+    p.add_argument("--basic-user", dest="basic_user", default=None,
+                   help="node web username (only if the node enforces login)")
+    p.add_argument("--basic-pass", dest="basic_pass", default=None, help="node web password")
+
     args = ap.parse_args()
 
     if args.cmd == "serve":
         return serve(args.config, args.host, args.port)
     if args.cmd == "discover":
         return discover(args.basedir, args.config)
+    if args.cmd == "node":
+        return cli_node(args)
 
     cfg = load_config(args.config)
 
@@ -3369,6 +3800,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   <div class="bulk">
     <button onclick="openSettings()">⚙ Settings</button>
     <button onclick="openConnection()">🔗 Connect</button>
+    <button onclick="openBoxes()">🖥 Boxes</button>
     <button onclick="openFiles()">📁 Files</button>
     <button onclick="openProxies()">🌐 Proxies</button>
     <button onclick="openScan()">⟲ Scan existing</button>
@@ -3422,6 +3854,54 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 
     <div class="mbar" style="margin-top:1rem"><span class="msg" id="connMsg" style="color:var(--dim);flex:1"></span>
       <button onclick="closeConnection()">Close</button></div>
+  </div>
+</div>
+
+<div class="scrim" id="boxScrim" onclick="closeBoxes(event)">
+  <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Boxes — your VPS fleet</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Connect other boxes running the manager. The controller opens an SSH tunnel to each one (they stay private — never exposed to the internet) so you can view and control them from here.</div>
+
+    <div id="boxList" style="display:flex;flex-direction:column;gap:.4rem;margin-bottom:.8rem"><span class="hint">loading…</span></div>
+
+    <div class="modcard open" id="boxAddCard">
+      <div class="mhd" onclick="document.getElementById('boxAddCard').classList.toggle('open')">
+        <span class="caret">▶</span><span class="mtitle">Connect a box</span>
+      </div>
+      <div class="mbody" style="gap:.7rem">
+        <div style="display:flex;gap:1rem;font-size:.82rem;flex-wrap:wrap">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="boxmode" value="ssh" checked onchange="boxMode()" style="width:auto"> SSH box</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="boxmode" value="do" onchange="boxMode()" style="width:auto"> DigitalOcean</label>
+        </div>
+
+        <div id="boxSsh" style="display:flex;flex-direction:column;gap:.6rem">
+          <label>Name <input id="boxName" placeholder="my-second-box"></label>
+          <label>SSH target <input id="boxTarget" placeholder="ubuntu@15.204.210.247"></label>
+          <div class="hint" style="margin-top:-.2rem">Just <code>user@host</code> — the controller uses its own SSH key. Add <code>:port</code> if SSH isn't on 22.</div>
+          <div class="modcard" id="boxAdvCard">
+            <div class="mhd" onclick="document.getElementById('boxAdvCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Advanced (optional)</span></div>
+            <div class="mbody" style="gap:.55rem">
+              <label>SSH key path <span class="hint" style="font-weight:400">on the controller, if not the default</span><input id="boxKey" placeholder="~/.ssh/id_ed25519"></label>
+              <label>Node manager port <input id="boxRemotePort" placeholder="8765"></label>
+              <div class="hint">If that box's dashboard has a login, give its username/password so the controller can proxy into it:</div>
+              <div style="display:flex;gap:.5rem">
+                <input id="boxBasicUser" placeholder="node username">
+                <input id="boxBasicPass" type="password" placeholder="node password">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="boxDo" style="display:none">
+          <div class="hint">Connect or spin up a DigitalOcean droplet (set up next).</div>
+        </div>
+
+        <div class="mbar"><span class="msg" id="boxMsg" style="color:var(--dim);flex:1"></span>
+          <button class="go" id="boxAddBtn" onclick="addBox(this)">Connect</button></div>
+      </div>
+    </div>
+
+    <div class="mbar" style="margin-top:1rem"><span style="flex:1"></span><button onclick="closeBoxes()">Close</button></div>
   </div>
 </div>
 
@@ -4217,6 +4697,60 @@ async function openConnection(){
   if(localish){ $('connIp').value=CONN.public_ip||''; renderConn(); }
 }
 function closeConnection(e){ if(e&&e.target!==$('connScrim'))return; $('connScrim').classList.remove('open'); }
+
+// ---- Boxes (multi-VPS controller) ----
+async function openBoxes(){ $('boxScrim').classList.add('open'); $('boxMsg').textContent=''; await loadBoxes(); }
+function closeBoxes(e){ if(e&&e.target!==$('boxScrim'))return; $('boxScrim').classList.remove('open'); }
+function boxMode(){
+  const m=(document.querySelector('input[name=boxmode]:checked')||{}).value||'ssh';
+  $('boxSsh').style.display=(m==='ssh')?'flex':'none';
+  $('boxDo').style.display=(m==='do')?'block':'none';
+}
+async function loadBoxes(){
+  const el=$('boxList');
+  let d; try{ d=await api('/api/nodes'); }catch(e){ el.innerHTML='<span class="hint">failed to load</span>'; return; }
+  const nodes=(d&&d.nodes)||[];
+  if(!nodes.length){ el.innerHTML='<span class="hint">No boxes connected yet. This box (the controller) is shown in your dashboard already — add another below.</span>'; return; }
+  el.innerHTML=nodes.map(n=>{
+    const up=n.tunnel&&n.tunnel.alive, col=up?'var(--ok,#3a6f5a)':'var(--crash,#c25)';
+    return `<div style="display:flex;align-items:center;gap:.6rem;padding:.45rem .6rem;border:1px solid var(--line);border-radius:9px">
+      <span style="width:9px;height:9px;border-radius:50%;background:${col};flex:none" title="${up?'tunnel up':'tunnel down'}"></span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600">${esc(n.name)}</div>
+        <div class="hint" style="font-family:var(--mono)">${esc(n.ssh_user)}@${esc(n.ssh_host)}:${n.ssh_port} → 127.0.0.1:${n.local_port}</div>
+      </div>
+      <button class="danger" onclick="removeBox('${esc(n.name)}',this)">Remove</button>
+    </div>`;
+  }).join('');
+}
+async function addBox(btn){
+  const mode=(document.querySelector('input[name=boxmode]:checked')||{}).value||'ssh';
+  if(mode==='do'){ $('boxMsg').style.color='var(--dim)'; $('boxMsg').textContent='DigitalOcean support is coming in the next step.'; return; }
+  const name=$('boxName').value.trim(), target=$('boxTarget').value.trim();
+  if(!name||!target){ $('boxMsg').style.color='var(--crash)'; $('boxMsg').textContent='Name and SSH target are required.'; return; }
+  const body={name, target,
+    ssh_key:$('boxKey').value.trim()||undefined,
+    remote_port:($('boxRemotePort').value.trim()||undefined),
+    basic_user:$('boxBasicUser').value.trim()||undefined,
+    basic_pass:$('boxBasicPass').value||undefined};
+  const orig=btn.textContent; btn.disabled=true; btn.innerHTML='<span class="spin"></span> connecting…';
+  $('boxMsg').style.color='var(--dim)'; $('boxMsg').textContent='opening SSH tunnel + testing…';
+  let d; try{ d=await api('/api/nodes','POST',body); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false; btn.textContent=orig;
+  if(!d||d.error){ $('boxMsg').style.color='var(--crash)'; $('boxMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  const t=d.test||{};
+  if(t.reachable){ $('boxMsg').style.color='var(--dim)'; $('boxMsg').textContent='✓ connected — '+(t.instances||0)+' bot(s) on '+d.node.name; }
+  else { $('boxMsg').style.color='var(--warn)'; $('boxMsg').textContent='added, but tunnel/API not reachable yet: '+(t.error||'?')+' (it will keep retrying)'; }
+  $('boxName').value=''; $('boxTarget').value=''; $('boxKey').value=''; $('boxRemotePort').value=''; $('boxBasicUser').value=''; $('boxBasicPass').value='';
+  loadBoxes();
+}
+async function removeBox(name,btn){
+  if(!confirm('Disconnect box "'+name+'"? (Its bots keep running on that VPS; only the tunnel/registration here is removed.)'))return;
+  btn.disabled=true;
+  let d; try{ d=await api('/api/nodes/remove','POST',{name}); }catch(e){ d={error:String(e)}; }
+  if(!d||d.error){ btn.disabled=false; $('boxMsg').style.color='var(--crash)'; $('boxMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  loadBoxes();
+}
 function renderConn(){
   const ip=($('connIp').value.trim()||'YOUR_VPS_IP'), p=CONN.port||8765, u=CONN.user||'ubuntu';
   $('connSsh').value=`ssh -L ${p}:127.0.0.1:${p} ${u}@${ip}`;

@@ -1,0 +1,24 @@
+{
+  "_comment": "Controller mode: other VPS boxes this manager reaches over SSH tunnels. Copy to nodes.json (gitignored) or manage via `abm node ...` / the dashboard 'Boxes' button. The node web password, if any, is stored base64-obfuscated under basic_pass.",
+  "nodes": [
+    {
+      "name": "oldmanmango",
+      "ssh_host": "15.204.210.247",
+      "ssh_user": "ubuntu",
+      "ssh_port": 22,
+      "remote_port": 8765,
+      "local_port": 8801
+    },
+    {
+      "name": "box2",
+      "ssh_host": "158.69.219.29",
+      "ssh_user": "ubuntu",
+      "ssh_port": 22,
+      "ssh_key": "/home/ubuntu/.ssh/id_ed25519",
+      "remote_port": 8765,
+      "local_port": 8802,
+      "basic_user": "admin",
+      "basic_pass": "b64:c3VwZXJzZWNyZXQ="
+    }
+  ]
+}
