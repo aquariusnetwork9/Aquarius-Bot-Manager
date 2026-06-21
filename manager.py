@@ -2091,6 +2091,90 @@ def node_request(node, method, path, body=None, timeout=10):
         return json.loads(raw) if raw else {}
 
 
+CONTROLLER_ROW = "(this box)"          # the controller's own row name in the Fleet view
+
+
+def fleet_aggregate(cfg, timeout=8):
+    """The controller + every node, summarized for the Fleet view. Never raises
+    per-row — unreachable boxes are reported as such."""
+    rows = []
+    try:
+        insts = cfg["instances"]
+        rows.append({"name": CONTROLLER_ROW, "controller": True, "reachable": True,
+                     "bots": len(insts),
+                     "running": sum(1 for i in insts if instance_status(i) == "running"),
+                     "host": _sysinfo()})
+    except Exception as e:
+        rows.append({"name": CONTROLLER_ROW, "controller": True, "reachable": False,
+                     "error": str(e), "bots": 0, "running": 0})
+    for n in load_nodes()["nodes"]:
+        row = node_public_view(n, TUNNELS)
+        row["controller"] = False
+        try:
+            inst = node_request(n, "GET", "/api/instances", timeout=timeout).get("instances", [])
+            row["reachable"] = True
+            row["bots"] = len(inst)
+            row["running"] = sum(1 for i in inst if i.get("status") == "running")
+            try:
+                row["host"] = node_request(n, "GET", "/api/system/info", timeout=timeout)
+            except Exception:
+                row["host"] = None
+        except Exception as e:
+            row.update(reachable=False, error=str(e), bots=0, running=0)
+        rows.append(row)
+    return rows
+
+
+def fleet_action(cfg, action, targets):
+    """start/stop/restart-all across the controller and/or nodes. targets is a list of
+    names (CONTROLLER_ROW for this box) or ['all']. Returns per-target results."""
+    if action not in ("start", "stop", "restart"):
+        raise ValueError("action must be start, stop or restart")
+    fn = {"start": start, "stop": stop, "restart": restart}[action]
+    reg = load_nodes()
+    allnames = [CONTROLLER_ROW] + [n["name"] for n in reg["nodes"]]
+    want = allnames if (not targets or "all" in targets) else targets
+    results = []
+    for name in want:
+        if name == CONTROLLER_ROW:
+            try:
+                results.append({"name": name, "ok": True,
+                                "results": {i["name"]: fn(i) for i in cfg["instances"]}})
+            except Exception as e:
+                results.append({"name": name, "ok": False, "error": str(e)})
+            continue
+        n = find_node(reg, name)
+        if not n:
+            results.append({"name": name, "ok": False, "error": "no such node"})
+            continue
+        try:
+            r = node_request(n, "POST", f"/api/{action}_all", timeout=25)
+            results.append({"name": name, "ok": True, "results": r.get("results")})
+        except Exception as e:
+            results.append({"name": name, "ok": False, "error": str(e)})
+    return results
+
+
+def fleet_update(targets):
+    """Trigger selfupdate on node targets. The controller is intentionally excluded —
+    it has its own update button, and restarting it would drop this request."""
+    reg = load_nodes()
+    want = [n["name"] for n in reg["nodes"]] if (not targets or "all" in targets) else \
+        [t for t in targets if t != CONTROLLER_ROW]
+    results = []
+    for name in want:
+        n = find_node(reg, name)
+        if not n:
+            results.append({"name": name, "ok": False, "error": "no such node"})
+            continue
+        try:
+            r = node_request(n, "POST", "/api/selfupdate", body={"restart": True}, timeout=60)
+            results.append({"name": name, "ok": True, **r})
+        except Exception as e:
+            results.append({"name": name, "ok": False, "error": str(e)})
+    return results
+
+
 def _port_open(port, host="127.0.0.1", timeout=0.5):
     with socket.socket() as s:
         s.settimeout(timeout)
@@ -2361,7 +2445,8 @@ class Handler(BaseHTTPRequestHandler):
         # even while a remote node is selected
         return (path in ("/logout", "/api/authstatus", "/api/node/select",
                          "/api/nodes", "/api/nodes/remove", "/api/nodes/do")
-                or path.startswith("/api/node/"))
+                or path.startswith("/api/node/")
+                or path.startswith("/api/fleet/"))
 
     def _inject_switcher_str(self, text, current):
         if "<body>" not in text or "abmNodeBar" in text:
@@ -2519,6 +2604,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/nodes":
             reg = load_nodes()
             return self._json({"nodes": [node_public_view(n, TUNNELS) for n in reg["nodes"]]})
+
+        # controller: aggregated status of this box + every node (the Fleet view)
+        if path == "/api/fleet/status":
+            return self._json({"fleet": fleet_aggregate(self._cfg())})
 
         if path == "/api/system/info":
             return self._json(_sysinfo())
@@ -2738,6 +2827,26 @@ class Handler(BaseHTTPRequestHandler):
             if TUNNELS is not None:
                 TUNNELS.drop(p.get("name"))
             return self._json({"ok": True})
+
+        # controller: bulk start/stop/restart across this box + nodes
+        if path == "/api/fleet/action":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            try:
+                res = fleet_action(cfg, p.get("action", ""), p.get("targets") or ["all"])
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True, "results": res})
+
+        # controller: push self-update to all (or selected) nodes
+        if path == "/api/fleet/update":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            return self._json({"ok": True, "results": fleet_update(p.get("targets") or ["all"])})
 
         # system actions (reboot / update) — gated by settings + auth
         m = re.match(r"^/api/system/(reboot|update)$", path)
@@ -4027,7 +4136,15 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 <div class="scrim" id="boxScrim" onclick="closeBoxes(event)">
   <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
     <div class="mhead">Boxes — your VPS fleet</div>
-    <div class="hint" style="margin:-.3rem 0 .6rem">Connect other boxes running the manager. The controller opens an SSH tunnel to each one (they stay private — never exposed to the internet) so you can view and control them from here.</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Connect other boxes running the manager. The controller opens an SSH tunnel to each one (they stay private — never exposed to the internet) so you can view and control them from here. Click <b>Open</b> on any box to drive its full dashboard in this tab.</div>
+
+    <div id="boxBulk" style="display:none;gap:.4rem;flex-wrap:wrap;align-items:center;margin-bottom:.6rem">
+      <button class="go" onclick="fleetAction('start',this)">▶ Start all</button>
+      <button class="warn" onclick="fleetAction('restart',this)">⟳ Restart all</button>
+      <button class="danger" onclick="fleetAction('stop',this)">■ Stop all</button>
+      <button onclick="fleetUpdate(this)">🔄 Update all nodes</button>
+      <span class="msg" id="boxBulkMsg" style="color:var(--dim);flex:1"></span>
+    </div>
 
     <div id="boxList" style="display:flex;flex-direction:column;gap:.4rem;margin-bottom:.8rem"><span class="hint">loading…</span></div>
 
@@ -4873,22 +4990,57 @@ function boxMode(){
   $('boxSsh').style.display=(m==='ssh')?'flex':'none';
   $('boxDo').style.display=(m==='do')?'block':'none';
 }
+function hostBit(h){
+  if(!h)return '';
+  let s='';
+  if(h.load&&h.load.length)s+=' · load '+(+h.load[0]).toFixed(2);
+  if(h.mem_total)s+=' · mem '+Math.round(100*(h.mem_used||0)/h.mem_total)+'%';
+  return s;
+}
 async function loadBoxes(){
   const el=$('boxList');
-  let d; try{ d=await api('/api/nodes'); }catch(e){ el.innerHTML='<span class="hint">failed to load</span>'; return; }
-  const nodes=(d&&d.nodes)||[];
-  if(!nodes.length){ el.innerHTML='<span class="hint">No boxes connected yet. This box (the controller) is shown in your dashboard already — add another below.</span>'; return; }
-  el.innerHTML=nodes.map(n=>{
-    const up=n.tunnel&&n.tunnel.alive, col=up?'var(--ok,#3a6f5a)':'var(--crash,#c25)';
+  let d; try{ d=await api('/api/fleet/status'); }catch(e){ el.innerHTML='<span class="hint">failed to load</span>'; return; }
+  const rows=(d&&d.fleet)||[];
+  const nodes=rows.filter(r=>!r.controller);
+  $('boxBulk').style.display=nodes.length?'flex':'none';
+  if(!nodes.length){ el.innerHTML='<span class="hint">No other boxes connected yet — this box (the controller) is your current dashboard. Add another below.</span>'; return; }
+  el.innerHTML=rows.map(r=>{
+    const up=r.reachable, col=up?'var(--ok,#3a6f5a)':'var(--crash,#c25)';
+    const meta=up?((r.running||0)+'/'+(r.bots||0)+' bots running'+hostBit(r.host)):('offline'+(r.error?(' — '+esc(r.error)):''));
+    const sub=r.controller?'this box':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
+    const right=r.controller?'<span class="hint">controller</span>':
+      `<button onclick="openNode('${esc(r.name)}')">Open</button> <button class="danger" onclick="removeBox('${esc(r.name)}',this)">Remove</button>`;
     return `<div style="display:flex;align-items:center;gap:.6rem;padding:.45rem .6rem;border:1px solid var(--line);border-radius:9px">
-      <span style="width:9px;height:9px;border-radius:50%;background:${col};flex:none" title="${up?'tunnel up':'tunnel down'}"></span>
+      <span style="width:9px;height:9px;border-radius:50%;background:${col};flex:none"></span>
       <div style="flex:1;min-width:0">
-        <div style="font-weight:600">${esc(n.name)}</div>
-        <div class="hint" style="font-family:var(--mono)">${esc(n.ssh_user)}@${esc(n.ssh_host)}:${n.ssh_port} → 127.0.0.1:${n.local_port}</div>
-      </div>
-      <button class="danger" onclick="removeBox('${esc(n.name)}',this)">Remove</button>
-    </div>`;
+        <div style="font-weight:600">${esc(r.name)} <span class="hint" style="font-weight:400;font-family:var(--mono)">${sub}</span></div>
+        <div class="hint">${meta}</div>
+      </div>${right}</div>`;
   }).join('');
+}
+async function openNode(name){
+  try{ await api('/api/node/select','POST',{name}); }catch(e){}
+  location.href='/';
+}
+async function fleetAction(action,btn){
+  if(action==='stop'&&!confirm('Stop ALL bots on ALL boxes?'))return;
+  btn.disabled=true; $('boxBulkMsg').style.color='var(--dim)'; $('boxBulkMsg').textContent=action+'ing all boxes…';
+  let d; try{ d=await api('/api/fleet/action','POST',{action,targets:['all']}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false;
+  if(!d||d.error){ $('boxBulkMsg').style.color='var(--crash)'; $('boxBulkMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  const ok=(d.results||[]).filter(r=>r.ok).length, n=(d.results||[]).length;
+  $('boxBulkMsg').style.color='var(--dim)'; $('boxBulkMsg').textContent='✓ '+action+' sent to '+ok+'/'+n+' boxes';
+  loadBoxes();
+}
+async function fleetUpdate(btn){
+  if(!confirm('Run self-update (git pull + restart) on all connected nodes?'))return;
+  btn.disabled=true; $('boxBulkMsg').style.color='var(--dim)'; $('boxBulkMsg').textContent='updating all nodes…';
+  let d; try{ d=await api('/api/fleet/update','POST',{targets:['all']}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false;
+  if(!d||d.error){ $('boxBulkMsg').style.color='var(--crash)'; $('boxBulkMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  const res=d.results||[], ok=res.filter(r=>r.ok).length, upd=res.filter(r=>r.ok&&r.updated).length;
+  $('boxBulkMsg').style.color='var(--dim)'; $('boxBulkMsg').textContent='✓ '+ok+'/'+res.length+' ok, '+upd+' updated';
+  loadBoxes();
 }
 async function addBox(btn){
   const mode=(document.querySelector('input[name=boxmode]:checked')||{}).value||'ssh';
