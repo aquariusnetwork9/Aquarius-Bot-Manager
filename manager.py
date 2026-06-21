@@ -1585,6 +1585,12 @@ THEME_PRESETS = {
     "ice":       {"bg": "#0a0f14", "panel": "#101820", "accent": "#5cc8ff"},
     "amethyst":  {"bg": "#0e0a14", "panel": "#17111f", "accent": "#b388ff"},
     "paper":     {"bg": "#f4f1ea", "panel": "#fffdf7", "accent": "#1f7a55"},
+    "obsidian":  {"bg": "#000000", "panel": "#0c0c0c", "accent": "#e6e6e6"},
+    "forest":    {"bg": "#0a120d", "panel": "#101c14", "accent": "#5fd17a"},
+    "rose":      {"bg": "#140a0f", "panel": "#1f1117", "accent": "#ff6f9c"},
+    "ocean":     {"bg": "#08101a", "panel": "#0e1a28", "accent": "#39b8d6"},
+    "gold":      {"bg": "#100d06", "panel": "#1b160c", "accent": "#e8b53a"},
+    "sand":      {"bg": "#faf6ee", "panel": "#fffdf8", "accent": "#c2691c"},
 }
 HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
@@ -1609,6 +1615,9 @@ def get_settings(cfg):
         "theme": {
             "preset": s.get("theme", {}).get("preset", "midnight"),
             "accent": s.get("theme", {}).get("accent", ""),
+            "bg_image": s.get("theme", {}).get("bg_image", ""),
+            "bg_dim": s.get("theme", {}).get("bg_dim", 0.6),
+            "density": s.get("theme", {}).get("density", ""),
         },
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
@@ -1637,6 +1646,23 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             if a and not HEX_RE.match(a):
                 raise ValueError("accent must be a hex color like #3ddc97")
             t["accent"] = a
+        if "bg_image" in theme:
+            img = (theme["bg_image"] or "").strip()
+            if img and not re.match(r"^https?://", img):
+                raise ValueError("background must be an http(s) image URL")
+            if len(img) > 2000:
+                raise ValueError("background URL is too long")
+            t["bg_image"] = img
+        if "bg_dim" in theme:
+            try:
+                t["bg_dim"] = max(0.0, min(0.95, float(theme["bg_dim"])))
+            except (TypeError, ValueError):
+                raise ValueError("bg_dim must be a number between 0 and 0.95")
+        if "density" in theme:
+            d = (theme["density"] or "").strip()
+            if d not in ("", "compact", "spacious"):
+                raise ValueError("density must be '', 'compact' or 'spacious'")
+            t["density"] = d
     if system_actions_enabled is not None:
         s["system_actions_enabled"] = bool(system_actions_enabled)
     if console_presets is not None:
@@ -4829,14 +4855,28 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <div id="stAp">
       <div class="hint" style="margin-bottom:.5rem">Theme preset</div>
       <div id="presetRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.9rem"></div>
-      <label>Accent override <span class="hint">blank = preset default</span>
+      <label>Accent colour <span class="hint">blank = preset default</span>
         <div style="display:flex;gap:.5rem;align-items:center">
           <input type="color" id="accentPick" style="width:48px;height:38px;padding:2px;background:#06090c;border:1px solid var(--line);border-radius:9px">
           <input id="accentHex" placeholder="#3ddc97" style="flex:1" autocomplete="off">
-          <button onclick="document.getElementById('accentHex').value='';document.getElementById('accentPick').value='#3ddc97';previewTheme()">Clear</button>
+          <button onclick="document.getElementById('accentHex').value='';document.getElementById('accentPick').value='#3ddc97';SELACCENT='';previewTheme()">Clear</button>
         </div>
       </label>
-      <div class="mbar">
+      <div id="accentSwatches" style="display:flex;gap:.4rem;flex-wrap:wrap;margin:.45rem 0 .9rem"></div>
+
+      <div class="hint" style="margin-bottom:.4rem">Density</div>
+      <div id="densityRow" style="display:flex;gap:1rem;margin-bottom:.9rem;font-size:.84rem">
+        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="" style="width:auto" onchange="SELDENSITY='';previewTheme()"> Comfortable</label>
+        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="compact" style="width:auto" onchange="SELDENSITY='compact';previewTheme()"> Compact</label>
+        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="spacious" style="width:auto" onchange="SELDENSITY='spacious';previewTheme()"> Spacious</label>
+      </div>
+
+      <label>Background image URL <span class="hint">blank = solid theme colour</span>
+        <input id="bgImage" placeholder="https://…/wallpaper.jpg" autocomplete="off" oninput="SELBG=this.value.trim();previewTheme()"></label>
+      <label style="margin-top:.5rem">Background dim <span class="hint" id="bgDimVal"></span>
+        <input type="range" id="bgDim" min="0" max="95" value="60" style="width:100%" oninput="SELBGDIM=this.value/100;document.getElementById('bgDimVal').textContent=this.value+'%';previewTheme()"></label>
+
+      <div class="mbar" style="margin-top:.8rem">
         <span class="msg" id="apMsg" style="color:var(--dim)"></span>
         <button class="go" onclick="saveAppearance()">Save appearance</button>
       </div>
@@ -5442,6 +5482,18 @@ function applyTheme(s){
   const light=p.bg && parseInt(p.bg.slice(1,3),16)>140;
   setVar('--txt', light?'#1a2026':'#dfe7ee');
   setVar('--dim', light?'#5a6b78':'#7b8a98');
+  // custom background image (with a readability overlay tinted to the theme bg)
+  const img=((s.theme.bg_image)||'').trim().replace(/["\\]/g,'');
+  const b=document.body;
+  if(img){
+    let dim=(s.theme.bg_dim==null)?0.6:parseFloat(s.theme.bg_dim); if(isNaN(dim))dim=0.6;
+    const ov=light?`rgba(244,241,234,${dim})`:`rgba(8,11,14,${dim})`;
+    b.style.backgroundImage=`linear-gradient(${ov},${ov}), url("${img}")`;
+    b.style.backgroundSize='cover'; b.style.backgroundPosition='center'; b.style.backgroundAttachment='fixed';
+  } else { b.style.backgroundImage=''; }
+  // density scales rem-based sizing via the root font-size
+  document.documentElement.style.fontSize =
+    (s.theme.density==='compact')?'14px':((s.theme.density==='spacious')?'17.5px':'');
 }
 async function loadSettings(){
   SETTINGS=await api('/api/settings');
@@ -6006,9 +6058,12 @@ async function savePresets(){
   SETTINGS=d.settings; renderPresetBar();
   $('preMsg').style.color='var(--dim)'; $('preMsg').textContent='✓ saved ('+presets.length+')';
 }
-let SELPRESET=null, SELACCENT='';
+let SELPRESET=null, SELACCENT='', SELBG='', SELBGDIM=0.6, SELDENSITY='';
+const ACCENT_SWATCHES=['#3ddc97','#5cc8ff','#ff7a45','#b388ff','#ff6f9c','#e8b53a','#39b8d6','#5fd17a','#ff5d5d','#e6e6e6'];
 function renderPresets(){
-  SELPRESET=SETTINGS.theme.preset; SELACCENT=SETTINGS.theme.accent||'';
+  const t=SETTINGS.theme;
+  SELPRESET=t.preset; SELACCENT=t.accent||''; SELBG=t.bg_image||'';
+  SELBGDIM=(t.bg_dim==null?0.6:t.bg_dim); SELDENSITY=t.density||'';
   const presets=SETTINGS.presets;
   $('presetRow').innerHTML=Object.keys(presets).map(k=>`
     <div class="chip ${k===SELPRESET?'sel':''}" data-k="${k}" onclick="pickPreset('${k}')">
@@ -6017,19 +6072,24 @@ function renderPresets(){
   $('accentPick').value=SELACCENT||presets[SELPRESET].accent;
   $('accentHex').oninput=()=>{SELACCENT=$('accentHex').value.trim();$('accentPick').value=SELACCENT||presets[SELPRESET].accent;previewTheme();};
   $('accentPick').oninput=()=>{SELACCENT=$('accentPick').value;$('accentHex').value=SELACCENT;previewTheme();};
+  $('accentSwatches').innerHTML=ACCENT_SWATCHES.map(c=>`<span title="${c}" onclick="pickAccent('${c}')" style="width:22px;height:22px;border-radius:6px;cursor:pointer;background:${c};border:1px solid var(--line)"></span>`).join('');
+  $('bgImage').value=SELBG;
+  $('bgDim').value=Math.round(SELBGDIM*100); $('bgDimVal').textContent=Math.round(SELBGDIM*100)+'%';
+  document.querySelectorAll('#densityRow input[name=density]').forEach(r=>{r.checked=(r.value===SELDENSITY);});
 }
+function pickAccent(c){ SELACCENT=c; $('accentHex').value=c; $('accentPick').value=c; previewTheme(); }
 function pickPreset(k){
   SELPRESET=k;
   document.querySelectorAll('#presetRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.k===k));
   previewTheme();
 }
-function previewTheme(){ applyTheme({presets:SETTINGS.presets,theme:{preset:SELPRESET,accent:SELACCENT}}); }
+function previewTheme(){ applyTheme({presets:SETTINGS.presets,theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY}}); }
 async function saveAppearance(){
   $('apMsg').textContent='saving…';
-  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT}});
-  if(d.error){$('apMsg').textContent='✗ '+d.error;return;}
+  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY}});
+  if(d.error){$('apMsg').style.color='var(--crash)';$('apMsg').textContent='✗ '+d.error;return;}
   SETTINGS=d.settings; applyTheme(SETTINGS);
-  $('apMsg').textContent='✓ saved';
+  $('apMsg').style.color='var(--dim)';$('apMsg').textContent='✓ saved';
 }
 
 function fmtGB(n){return n?(n/1e9).toFixed(1)+' GB':'?';}
