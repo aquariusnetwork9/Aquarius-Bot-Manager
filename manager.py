@@ -1978,12 +1978,23 @@ def _b64dec(s):
 
 def load_nodes(path=DEFAULT_NODES):
     if not os.path.exists(path):
-        return {"_path": path, "nodes": []}
+        return {"_path": path, "nodes": [], "settings": {}}
     with open(path) as f:
         raw = json.load(f)
     raw.setdefault("nodes", [])
+    raw.setdefault("settings", {})
     raw["_path"] = path
     return raw
+
+
+def do_token_saved(reg):
+    """The DigitalOcean API token (decoded), or '' if none saved."""
+    return _b64dec(reg.get("settings", {}).get("do_token", ""))
+
+
+def set_do_token(reg, token):
+    reg.setdefault("settings", {})["do_token"] = _b64enc(token)
+    save_nodes(reg)
 
 
 def save_nodes(reg):
@@ -2068,6 +2079,7 @@ def node_public_view(node, tunnels=None):
         "remote_port": node.get("remote_port", 8765),
         "local_port": node.get("local_port"),
         "has_creds": bool(u),
+        "do": bool(node.get("do_droplet_id")),
     }
     if tunnels is not None:
         st = tunnels.status().get(node.get("name"))
@@ -2179,6 +2191,195 @@ def _port_open(port, host="127.0.0.1", timeout=0.5):
     with socket.socket() as s:
         s.settimeout(timeout)
         return s.connect_ex((host, port)) == 0
+
+
+# ---- DigitalOcean: connect existing droplets + provision node-mode droplets ----
+# Reuses fleet.py's DO client (imported lazily so the manager stays standalone if
+# fleet.py isn't present). New droplets install the manager in node mode via cloud-init
+# and trust the controller's own SSH key so the tunnel comes up automatically.
+
+DO_NODE_IMAGE = "ubuntu-24-04-x64"
+DO_NODE_SIZE = "s-1vcpu-1gb"           # 1GB default; the manager is tiny, the bot's JVM is capped
+
+
+def _fleet_mod():
+    try:
+        import fleet
+        return fleet
+    except Exception as e:
+        raise ValueError(f"DigitalOcean support needs fleet.py alongside the manager: {e}")
+
+
+def controller_ssh_pubkey():
+    """The controller's SSH public key text + matching private key path. Reuses an
+    existing key if present, else generates an ed25519 one. (None, None) on failure."""
+    sshdir = os.path.expanduser("~/.ssh")
+    for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+        pub, priv = os.path.join(sshdir, name + ".pub"), os.path.join(sshdir, name)
+        if os.path.exists(pub) and os.path.exists(priv):
+            with open(pub) as f:
+                return f.read().strip(), priv
+    try:
+        os.makedirs(sshdir, exist_ok=True)
+        priv = os.path.join(sshdir, "id_ed25519")
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", priv, "-q"], check=True)
+        with open(priv + ".pub") as f:
+            return f.read().strip(), priv
+    except Exception:
+        return None, None
+
+
+def do_ensure_controller_key(token):
+    """Make sure the controller's public key is registered in the DO account; return
+    (do_key_id, private_key_path) so new droplets trust it and the tunnel just works."""
+    fleet = _fleet_mod()
+    pub, priv = controller_ssh_pubkey()
+    if not pub:
+        raise ValueError("controller has no SSH key and couldn't generate one (install ssh-keygen)")
+    body = pub.split()[1] if len(pub.split()) >= 2 else pub
+    for k in fleet.do_list_ssh_keys(token):
+        kp = k.get("public_key") or ""
+        if len(kp.split()) >= 2 and kp.split()[1] == body:
+            return k.get("id"), priv
+    name = f"aquarius-controller-{socket.gethostname()}"
+    created = fleet._do_request(token, "POST", "/account/keys",
+                               {"name": name, "public_key": pub})
+    return created.get("ssh_key", {}).get("id"), priv
+
+
+def node_cloud_init(install_url=None):
+    """cloud-init that turns a fresh droplet into a node-mode manager (binds 127.0.0.1,
+    no Caddy). The controller reaches it over the SSH tunnel it trusts."""
+    install_url = install_url or ("https://raw.githubusercontent.com/aquariusnetwork9/"
+                                  "Aquarius-Bot-Manager/main/install.sh")
+    return ("#cloud-config\n"
+            "package_update: true\n"
+            "packages: [python3, tmux, unzip, wget, git, curl]\n"
+            "runcmd:\n"
+            f"  - 'curl -fsSL {install_url} | ABM_ACCESS=node bash'\n")
+
+
+def do_provision_node(reg, token, name, region, size, log, image=DO_NODE_IMAGE, vpc_uuid=None):
+    """Create a node-mode droplet, wait for its IP, register it as an SSH-tunnel node.
+    `log` is a callback for progress lines. Returns the node's public view."""
+    fleet = _fleet_mod()
+    if find_node(reg, name):
+        raise ValueError(f"a node named {name} already exists")
+    log("ensuring the controller's SSH key is in your DigitalOcean account…")
+    key_id, priv = do_ensure_controller_key(token)
+    log(f"creating droplet '{name}' ({size}, {region}, {image})…")
+    dro = fleet.do_create_droplet(token, name, region, size, image,
+                                  ssh_keys=[key_id] if key_id else [],
+                                  user_data=node_cloud_init(), tags=["aquarius-node"],
+                                  vpc_uuid=vpc_uuid)
+    did = dro.get("id")
+    log(f"droplet id {did}; waiting for it to become active…")
+    pub = ""
+    for i in range(72):                # up to ~6 min
+        time.sleep(5)
+        d = fleet.do_get_droplet(token, did)
+        st = (d or {}).get("status", "?")
+        if d and st == "active":
+            pub, _priv = fleet.droplet_ips(d)
+            if pub:
+                break
+        if i % 3 == 0:
+            log(f"  …status={st} ({(i + 1) * 5}s)")
+    if not pub:
+        raise ValueError(f"droplet created (id {did}) but no public IP after ~6 min — "
+                         "connect it later from the droplet list")
+    log(f"public IP {pub}; registering as a node (ssh root@{pub})…")
+    node = add_node(reg, name, pub, ssh_user="root", ssh_port=22,
+                    remote_port=8765, ssh_key=priv)
+    node["do_droplet_id"] = did        # so it can be destroyed from here later
+    save_nodes(reg)
+    log("bringing up the SSH tunnel (cloud-init may still be installing — it self-heals)…")
+    try:
+        ensure_node_tunnel(node, wait=10)
+    except Exception:
+        pass
+    log("done — the node will come online once cloud-init finishes the install (~1-2 min).")
+    return node_public_view(node, TUNNELS)
+
+
+class ProvisionJob:
+    """Tracks one in-flight DigitalOcean provision (runs in a background thread)."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "idle"           # idle | running | done | error
+        self.name = None
+        self.lines = []
+        self.node = None
+        self.started = None
+        self.finished = None
+
+    def snapshot(self):
+        with self.lock:
+            return {"status": self.status, "name": self.name, "node": self.node,
+                    "started": self.started, "finished": self.finished,
+                    "output": "".join(self.lines[-400:])}
+
+    def _log(self, msg):
+        with self.lock:
+            self.lines.append(str(msg).rstrip("\n") + "\n")
+
+    def start(self, name, fn):
+        with self.lock:
+            if self.status == "running":
+                raise ValueError("a provision is already running")
+            self.status, self.name, self.lines = "running", name, []
+            self.node, self.started, self.finished = None, time.time(), None
+
+        def run():
+            try:
+                node = fn(self._log)
+                with self.lock:
+                    self.status, self.node, self.finished = "done", node, time.time()
+            except Exception as e:
+                self._log(f"[error] {e}")
+                with self.lock:
+                    self.status, self.finished = "error", time.time()
+        threading.Thread(target=run, daemon=True).start()
+
+
+PROVISION_JOB = ProvisionJob()
+
+
+def do_connect_existing(reg, token, droplet_id, name=None, ssh_user="root"):
+    """Register an already-running DO droplet as an SSH-tunnel node. The droplet must
+    already trust an SSH key the controller holds (we don't push keys to existing boxes)."""
+    fleet = _fleet_mod()
+    d = fleet.do_get_droplet(token, droplet_id)
+    if not d:
+        raise ValueError(f"droplet {droplet_id} not found")
+    pub, _priv = fleet.droplet_ips(d)
+    if not pub:
+        raise ValueError("droplet has no public IP")
+    name = name or d.get("name") or f"droplet-{droplet_id}"
+    _pub, priv = controller_ssh_pubkey()
+    node = add_node(reg, name, pub, ssh_user=ssh_user or "root", ssh_port=22,
+                    remote_port=8765, ssh_key=priv)
+    node["do_droplet_id"] = d.get("id")
+    save_nodes(reg)
+    return node
+
+
+def do_destroy_node(reg, token, name):
+    """Destroy the DigitalOcean droplet backing a node, then remove the node. Only
+    works for nodes provisioned/connected here (they carry do_droplet_id)."""
+    n = find_node(reg, name)
+    if not n:
+        raise ValueError(f"no such node: {name}")
+    did = n.get("do_droplet_id")
+    if not did:
+        raise ValueError(f"node '{name}' isn't a DigitalOcean droplet managed here "
+                         "(remove it instead — destroying would need its droplet id)")
+    fleet = _fleet_mod()
+    fleet.do_destroy_droplet(token, did)
+    if TUNNELS is not None:
+        TUNNELS.drop(name)
+    remove_node(reg, name)
+    return {"destroyed_droplet": did, "name": name}
 
 
 class TunnelManager:
@@ -2443,9 +2644,9 @@ class Handler(BaseHTTPRequestHandler):
     def _is_switcher_path(self, path):
         # controller-level paths always served locally so box-switching keeps working
         # even while a remote node is selected
-        return (path in ("/logout", "/api/authstatus", "/api/node/select",
-                         "/api/nodes", "/api/nodes/remove", "/api/nodes/do")
-                or path.startswith("/api/node/")
+        return (path in ("/logout", "/api/authstatus")
+                or path.startswith("/api/node/")     # /api/node/select
+                or path.startswith("/api/nodes")     # /api/nodes, .../remove, .../do*
                 or path.startswith("/api/fleet/"))
 
     def _inject_switcher_str(self, text, current):
@@ -2608,6 +2809,41 @@ class Handler(BaseHTTPRequestHandler):
         # controller: aggregated status of this box + every node (the Fleet view)
         if path == "/api/fleet/status":
             return self._json({"fleet": fleet_aggregate(self._cfg())})
+
+        # controller: DigitalOcean droplets + regions/sizes for the connect/provision UI
+        if path == "/api/nodes/do":
+            reg = load_nodes()
+            tok = do_token_saved(reg)
+            if not tok:
+                return self._json({"token_saved": False})
+            try:
+                fleet = _fleet_mod()
+                droplets = []
+                for d in fleet.do_list_droplets(tok):
+                    pub, _priv = fleet.droplet_ips(d)
+                    droplets.append({"id": d.get("id"), "name": d.get("name"),
+                                     "region": (d.get("region") or {}).get("slug"),
+                                     "status": d.get("status"),
+                                     "size": (d.get("size") or {}).get("slug") or d.get("size_slug"),
+                                     "public_ip": pub})
+                regions = [{"slug": r.get("slug"), "name": r.get("name")}
+                           for r in fleet.do_list_regions(tok)]
+                sizes = sorted(
+                    ({"slug": s.get("slug"), "memory": s.get("memory"),
+                      "vcpus": s.get("vcpus"), "price": s.get("price_monthly")}
+                     for s in fleet.do_list_sizes(tok) if str(s.get("slug", "")).startswith("s-")),
+                    key=lambda s: (s.get("price") or 0))
+                return self._json({"token_saved": True, "droplets": droplets,
+                                   "regions": regions, "sizes": sizes,
+                                   "default_size": DO_NODE_SIZE})
+            except ValueError as e:
+                # token is saved but the DO call failed (bad token / network) — surface
+                # the message in-band so the UI can show it (200, not an HTTP error)
+                return self._json({"token_saved": True, "error": str(e)})
+
+        # controller: progress of an in-flight droplet provision
+        if path == "/api/nodes/do/job":
+            return self._json(PROVISION_JOB.snapshot())
 
         if path == "/api/system/info":
             return self._json(_sysinfo())
@@ -2847,6 +3083,81 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 return self._json({"error": "bad request"}, 400)
             return self._json({"ok": True, "results": fleet_update(p.get("targets") or ["all"])})
+
+        # controller: save the DigitalOcean API token (stored b64-obfuscated)
+        if path == "/api/nodes/do/token":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            reg = load_nodes()
+            set_do_token(reg, (p.get("token") or "").strip())
+            return self._json({"ok": True, "token_saved": bool(do_token_saved(reg))})
+
+        # controller: register an existing droplet as an SSH-tunnel node
+        if path == "/api/nodes/do/connect":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            reg = load_nodes()
+            tok = do_token_saved(reg)
+            if not tok:
+                return self._json({"error": "no DigitalOcean token saved"}, 400)
+            try:
+                node = do_connect_existing(reg, tok, p.get("droplet_id"),
+                                           p.get("name"), p.get("ssh_user") or "root")
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, 400)
+            test = {"reachable": False}
+            try:
+                if ensure_node_tunnel(node):
+                    n = node_request(node, "GET", "/api/instances", timeout=8).get("instances", [])
+                    test = {"reachable": True, "instances": len(n)}
+                else:
+                    test = {"reachable": False, "error": "tunnel did not come up "
+                            "(does the droplet trust the controller's SSH key?)"}
+            except Exception as e:
+                test = {"reachable": False, "error": str(e)}
+            return self._json({"ok": True, "node": node_public_view(node, TUNNELS), "test": test})
+
+        # controller: provision a new node-mode droplet (runs as a background job)
+        if path == "/api/nodes/do/provision":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            tok = do_token_saved(load_nodes())
+            if not tok:
+                return self._json({"error": "no DigitalOcean token saved"}, 400)
+            name = (p.get("name") or "").strip()
+            region = (p.get("region") or "").strip()
+            size = (p.get("size") or DO_NODE_SIZE).strip()
+            if not name or not region:
+                return self._json({"error": "name and region are required"}, 400)
+            image = (p.get("image") or DO_NODE_IMAGE).strip()
+            vpc = p.get("vpc") or None
+            try:
+                PROVISION_JOB.start(name, lambda log: do_provision_node(
+                    load_nodes(), tok, name, region, size, log, image=image, vpc_uuid=vpc))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 409)
+            return self._json({"ok": True, "started": True})
+
+        # controller: destroy the droplet behind a node, then remove the node
+        if path == "/api/nodes/do/destroy":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            reg = load_nodes()
+            tok = do_token_saved(reg)
+            if not tok:
+                return self._json({"error": "no DigitalOcean token saved"}, 400)
+            try:
+                return self._json({"ok": True, **do_destroy_node(reg, tok, p.get("name"))})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
 
         # system actions (reboot / update) — gated by settings + auth
         m = re.match(r"^/api/system/(reboot|update)$", path)
@@ -4176,11 +4487,42 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
           </div>
         </div>
 
-        <div id="boxDo" style="display:none">
-          <div class="hint">Connect or spin up a DigitalOcean droplet (set up next).</div>
+        <div id="boxDo" style="display:none;flex-direction:column;gap:.6rem">
+          <div id="doTokenBox">
+            <label>DigitalOcean API token <span class="hint" style="font-weight:400">stored on the controller, obfuscated</span>
+              <input id="doToken" type="password" placeholder="dop_v1_…"></label>
+            <div class="mbar" style="margin-top:.4rem"><span class="msg" id="doTokenMsg" style="color:var(--dim);flex:1"></span>
+              <button class="go" onclick="saveDoToken(this)">Save token</button></div>
+          </div>
+          <div id="doMain" style="display:none;flex-direction:column;gap:.7rem">
+            <div class="modcard open" id="doProvCard">
+              <div class="mhd" onclick="document.getElementById('doProvCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Spin up a new droplet</span></div>
+              <div class="mbody" style="gap:.55rem">
+                <label>Name <input id="doNewName" placeholder="aquarius-node-3"></label>
+                <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+                  <label style="flex:1;min-width:160px">Region <select id="doRegion" style="width:100%"></select></label>
+                  <label style="flex:1;min-width:160px">Size <select id="doSize" style="width:100%"></select></label>
+                </div>
+                <div class="hint">Installs the manager in lightweight node mode and registers it automatically. 1GB is plenty for the manager + one capped bot.</div>
+                <div class="mbar"><span class="msg" id="doProvMsg" style="color:var(--dim);flex:1"></span>
+                  <button class="go" onclick="doProvision(this)">Create droplet</button></div>
+                <pre id="doProvLog" class="log" style="display:none;min-height:60px;max-height:26vh"></pre>
+              </div>
+            </div>
+            <div class="modcard" id="doConnCard">
+              <div class="mhd" onclick="document.getElementById('doConnCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Connect an existing droplet</span></div>
+              <div class="mbody" style="gap:.5rem">
+                <div class="hint">The droplet must already trust an SSH key the controller holds.</div>
+                <div id="doDropletList" style="display:flex;flex-direction:column;gap:.3rem;font-size:.8rem"><span class="hint">loading droplets…</span></div>
+                <div class="mbar"><span class="msg" id="doConnMsg" style="color:var(--dim);flex:1"></span>
+                  <button onclick="loadDo(true)">Refresh</button>
+                  <button onclick="forgetDoToken(this)">Change token</button></div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div class="mbar"><span class="msg" id="boxMsg" style="color:var(--dim);flex:1"></span>
+        <div class="mbar" id="boxSshBar"><span class="msg" id="boxMsg" style="color:var(--dim);flex:1"></span>
           <button class="go" id="boxAddBtn" onclick="addBox(this)">Connect</button></div>
       </div>
     </div>
@@ -4988,7 +5330,9 @@ function closeBoxes(e){ if(e&&e.target!==$('boxScrim'))return; $('boxScrim').cla
 function boxMode(){
   const m=(document.querySelector('input[name=boxmode]:checked')||{}).value||'ssh';
   $('boxSsh').style.display=(m==='ssh')?'flex':'none';
-  $('boxDo').style.display=(m==='do')?'block':'none';
+  $('boxSshBar').style.display=(m==='ssh')?'flex':'none';
+  $('boxDo').style.display=(m==='do')?'flex':'none';
+  if(m==='do')loadDo(false);
 }
 function hostBit(h){
   if(!h)return '';
@@ -5009,7 +5353,9 @@ async function loadBoxes(){
     const meta=up?((r.running||0)+'/'+(r.bots||0)+' bots running'+hostBit(r.host)):('offline'+(r.error?(' — '+esc(r.error)):''));
     const sub=r.controller?'this box':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
     const right=r.controller?'<span class="hint">controller</span>':
-      `<button onclick="openNode('${esc(r.name)}')">Open</button> <button class="danger" onclick="removeBox('${esc(r.name)}',this)">Remove</button>`;
+      (`<button onclick="openNode('${esc(r.name)}')">Open</button> `+
+       (r.do?`<button class="danger" onclick="destroyBox('${esc(r.name)}',this)">Destroy</button> `:'')+
+       `<button class="danger" onclick="removeBox('${esc(r.name)}',this)">Remove</button>`);
     return `<div style="display:flex;align-items:center;gap:.6rem;padding:.45rem .6rem;border:1px solid var(--line);border-radius:9px">
       <span style="width:9px;height:9px;border-radius:50%;background:${col};flex:none"></span>
       <div style="flex:1;min-width:0">
@@ -5069,6 +5415,91 @@ async function removeBox(name,btn){
   let d; try{ d=await api('/api/nodes/remove','POST',{name}); }catch(e){ d={error:String(e)}; }
   if(!d||d.error){ btn.disabled=false; $('boxMsg').style.color='var(--crash)'; $('boxMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
   loadBoxes();
+}
+async function destroyBox(name,btn){
+  if(!confirm('DESTROY the DigitalOcean droplet behind "'+name+'"?\n\nThis permanently deletes the VPS and every bot on it. This cannot be undone.'))return;
+  if(prompt('Type the box name to confirm permanent destruction:')!==name){ return; }
+  btn.disabled=true;
+  let d; try{ d=await api('/api/nodes/do/destroy','POST',{name}); }catch(e){ d={error:String(e)}; }
+  if(!d||d.error){ btn.disabled=false; alert('Destroy failed: '+((d&&d.error)||'?')); return; }
+  loadBoxes();
+}
+
+// ---- DigitalOcean ----
+let DO_PROV_TIMER=null;
+async function loadDo(force){
+  let d; try{ d=await api('/api/nodes/do'+(force?'?_='+Date.now():'')); }catch(e){ d={error:String(e)}; }
+  if(!d||!d.token_saved){
+    $('doTokenBox').style.display='block'; $('doMain').style.display='none';
+    if(d&&d.error)$('doTokenMsg').textContent=d.error;
+    return;
+  }
+  $('doTokenBox').style.display='none'; $('doMain').style.display='flex';
+  if(d.error){ $('doConnMsg').style.color='var(--crash)'; $('doConnMsg').textContent=d.error; return; }
+  // regions
+  const rs=$('doRegion'); if(rs)rs.innerHTML=(d.regions||[]).map(r=>`<option value="${esc(r.slug)}">${esc(r.name)} (${esc(r.slug)})</option>`).join('');
+  // sizes (default to 1GB)
+  const ss=$('doSize'); if(ss){
+    ss.innerHTML=(d.sizes||[]).map(s=>{
+      const gb=Math.round((s.memory||0)/1024*10)/10;
+      return `<option value="${esc(s.slug)}"${s.slug===d.default_size?' selected':''}>${esc(s.slug)} — ${gb}GB / ${s.vcpus} vCPU — $${s.price}/mo</option>`;
+    }).join('');
+  }
+  // existing droplets
+  const dl=$('doDropletList');
+  const ds=(d.droplets||[]);
+  dl.innerHTML=ds.length? ds.map(x=>
+    `<div style="display:flex;align-items:center;gap:.5rem;padding:.35rem .5rem;border:1px solid var(--line);border-radius:8px">
+      <div style="flex:1;min-width:0"><b>${esc(x.name)}</b> <span class="hint" style="font-family:var(--mono)">${esc(x.public_ip||'no-ip')} · ${esc(x.region||'')} · ${esc(x.status||'')}</span></div>
+      <button onclick="doConnect(${x.id},'${esc(x.name)}',this)">Connect</button>
+    </div>`).join('') : '<span class="hint">no droplets in this account</span>';
+}
+async function saveDoToken(btn){
+  const token=$('doToken').value.trim();
+  if(!token){ $('doTokenMsg').style.color='var(--crash)'; $('doTokenMsg').textContent='paste a token first'; return; }
+  btn.disabled=true; $('doTokenMsg').style.color='var(--dim)'; $('doTokenMsg').textContent='saving…';
+  let d; try{ d=await api('/api/nodes/do/token','POST',{token}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false; $('doToken').value='';
+  if(!d||d.error||!d.token_saved){ $('doTokenMsg').style.color='var(--crash)'; $('doTokenMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  loadDo(true);
+}
+async function forgetDoToken(){
+  if(!confirm('Forget the saved DigitalOcean token?'))return;
+  try{ await api('/api/nodes/do/token','POST',{token:''}); }catch(e){}
+  loadDo(true);
+}
+async function doConnect(id,name,btn){
+  btn.disabled=true; $('doConnMsg').style.color='var(--dim)'; $('doConnMsg').textContent='connecting '+name+'…';
+  let d; try{ d=await api('/api/nodes/do/connect','POST',{droplet_id:id,name}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false;
+  if(!d||d.error){ $('doConnMsg').style.color='var(--crash)'; $('doConnMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  const t=d.test||{};
+  $('doConnMsg').style.color=t.reachable?'var(--dim)':'var(--warn)';
+  $('doConnMsg').textContent=t.reachable?('✓ connected — '+(t.instances||0)+' bot(s)'):('added, not reachable yet: '+(t.error||'?'));
+  loadBoxes();
+}
+async function doProvision(btn){
+  const name=$('doNewName').value.trim(), region=$('doRegion').value, size=$('doSize').value;
+  if(!name||!region){ $('doProvMsg').style.color='var(--crash)'; $('doProvMsg').textContent='name and region required'; return; }
+  if(!confirm('Create a new DigitalOcean droplet "'+name+'" ('+size+')? This starts billing for the VPS.'))return;
+  btn.disabled=true; $('doProvMsg').style.color='var(--dim)'; $('doProvMsg').textContent='starting…';
+  let d; try{ d=await api('/api/nodes/do/provision','POST',{name,region,size}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false;
+  if(!d||d.error){ $('doProvMsg').style.color='var(--crash)'; $('doProvMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  $('doProvMsg').textContent='provisioning…'; $('doProvLog').style.display='block';
+  if(DO_PROV_TIMER)clearInterval(DO_PROV_TIMER);
+  DO_PROV_TIMER=setInterval(pollProvision,3000); pollProvision();
+}
+async function pollProvision(){
+  let j; try{ j=await api('/api/nodes/do/job'); }catch(e){ return; }
+  if(!j)return;
+  $('doProvLog').textContent=j.output||'';
+  if(j.status==='done'||j.status==='error'){
+    clearInterval(DO_PROV_TIMER); DO_PROV_TIMER=null;
+    $('doProvMsg').style.color=(j.status==='done')?'var(--dim)':'var(--crash)';
+    $('doProvMsg').textContent=(j.status==='done')?'✓ done':'✗ failed';
+    loadBoxes();
+  }
 }
 function renderConn(){
   const ip=($('connIp').value.trim()||'YOUR_VPS_IP'), p=CONN.port||8765, u=CONN.user||'ubuntu';
