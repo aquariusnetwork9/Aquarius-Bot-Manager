@@ -1947,6 +1947,43 @@ def reconnect_script(ostype, ip, user, port):
     return name, "application/octet-stream", text
 
 
+def multi_reconnect_script(ostype, conn, nodes):
+    """A launcher that opens one SSH tunnel per box (the controller + each node) on
+    distinct local ports and opens every dashboard — the direct-access fallback for
+    when the controller itself isn't up. Returns (filename, mimetype, text)."""
+    cip = (conn.get("ip") or "").strip() or "CONTROLLER_VPS_IP"
+    cuser = (conn.get("user") or _run_user()).strip()
+    try:
+        base = int(conn.get("port") or 8765)
+    except (TypeError, ValueError):
+        base = 8765
+    # rows: (user, host, ssh_port, remote_port, local_port)
+    rows = [(cuser, cip, 22, base, base)]
+    lp = base
+    for n in nodes:
+        lp += 1
+        rows.append((n.get("ssh_user") or "ubuntu", n.get("ssh_host") or "NODE_IP",
+                     int(n.get("ssh_port") or 22), int(n.get("remote_port") or 8765), lp))
+    if ostype == "windows":
+        out = ["@echo off",
+               "REM Aquarius Bot Manager - open every box's tunnel + dashboard"]
+        for u, h, sp, rp, l in rows:
+            out.append(f'start "" ssh -N -p {sp} -L {l}:127.0.0.1:{rp} {u}@{h}')
+        out.append("timeout /t 2 >nul")
+        for u, h, sp, rp, l in rows:
+            out.append(f'start "" http://localhost:{l}')
+        return "reconnect-all-aquarius.bat", "application/octet-stream", "\r\n".join(out) + "\r\n"
+    opener = "open" if ostype == "mac" else "xdg-open"
+    name = "reconnect-all-aquarius.command" if ostype == "mac" else "reconnect-all-aquarius.sh"
+    out = ["#!/bin/bash", "# Aquarius Bot Manager - open every box's tunnel + dashboard"]
+    for u, h, sp, rp, l in rows:
+        out.append(f"ssh -fNL {l}:127.0.0.1:{rp} -p {sp} {u}@{h} 2>/dev/null || true")
+    out.append("sleep 1")
+    for u, h, sp, rp, l in rows:
+        out.append(f"{opener} http://localhost:{l} >/dev/null 2>&1 &")
+    return name, "application/octet-stream", "\n".join(out) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Multi-VPS controller: node registry + SSH tunnels
 # ---------------------------------------------------------------------------
@@ -2861,6 +2898,23 @@ class Handler(BaseHTTPRequestHandler):
             fname, mime, text = reconnect_script(
                 ostype, q.get("ip", [""])[0], q.get("user", [""])[0],
                 q.get("port", [str(self.bind_port)])[0])
+            body = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # download a launcher that tunnels into EVERY box (controller + nodes)
+        if path == "/api/connection/multiscript":
+            ostype = q.get("os", ["windows"])[0]
+            if ostype not in ("windows", "mac", "linux"):
+                return self._json({"error": "os must be windows|mac|linux"}, 400)
+            conn = {"ip": q.get("ip", [""])[0], "user": q.get("user", [""])[0],
+                    "port": q.get("port", [str(self.bind_port)])[0]}
+            fname, mime, text = multi_reconnect_script(ostype, conn, load_nodes()["nodes"])
             body = text.encode()
             self.send_response(200)
             self.send_header("Content-Type", mime)
@@ -4433,6 +4487,14 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
         <button onclick="dlReconnect('linux')">⬇ Linux (.sh)</button>
       </div>
       <div class="hint" style="margin-top:.4rem;opacity:.75">Save it on your PC; double-click to reconnect. (macOS/Linux: <code>chmod +x</code> it first.)</div>
+      <div id="connMulti" style="display:none">
+        <div class="hint" style="margin:.9rem 0 .35rem">Or a launcher that tunnels into <b>every box</b> (controller + nodes) on its own port — a direct-access fallback for when the controller is down:</div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+          <button onclick="dlMulti('windows')">⬇ All boxes (.bat)</button>
+          <button onclick="dlMulti('mac')">⬇ All boxes (.command)</button>
+          <button onclick="dlMulti('linux')">⬇ All boxes (.sh)</button>
+        </div>
+      </div>
     </div>
 
     <div id="connDirect" style="display:none">
@@ -5321,6 +5383,7 @@ async function openConnection(){
   $('connTunnel').style.display=localish?'block':'none';
   $('connDirect').style.display=localish?'none':'block';
   if(localish){ $('connIp').value=CONN.public_ip||''; renderConn(); }
+  try{ const nd=await api('/api/nodes'); if($('connMulti'))$('connMulti').style.display=(localish&&nd&&nd.nodes&&nd.nodes.length)?'block':'none'; }catch(e){}
 }
 function closeConnection(e){ if(e&&e.target!==$('connScrim'))return; $('connScrim').classList.remove('open'); }
 
@@ -5510,6 +5573,12 @@ function dlReconnect(os){
   if(!ip){ $('connMsg').style.color='var(--crash)'; $('connMsg').textContent='enter the VPS IP first'; return; }
   $('connMsg').style.color='var(--dim)'; $('connMsg').textContent='downloading shortcut…';
   window.location=`/api/connection/script?os=${os}&ip=${ip}&port=${CONN.port||8765}&user=${encodeURIComponent(CONN.user||'')}`;
+}
+function dlMulti(os){
+  const ip=encodeURIComponent($('connIp').value.trim());
+  if(!ip){ $('connMsg').style.color='var(--crash)'; $('connMsg').textContent='enter the controller VPS IP first'; return; }
+  $('connMsg').style.color='var(--dim)'; $('connMsg').textContent='downloading all-boxes launcher…';
+  window.location=`/api/connection/multiscript?os=${os}&ip=${ip}&port=${CONN.port||8765}&user=${encodeURIComponent(CONN.user||'')}`;
 }
 function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); loadWebshareHint(); }
 function closeProxies(e){ if(e&&e.target!==$('proxScrim'))return; $('proxScrim').classList.remove('open'); }
