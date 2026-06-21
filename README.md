@@ -4,7 +4,7 @@ A control plane for a whole VPS of **AquariusProxy** and **ZenithProxy** bots �
 
 AquariusProxy is a ZenithProxy fork, so they share the same launch model and config structure; this manager drives either (or a custom fork) on the same host.
 
-**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer.
+**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer · **multi-VPS controller** (connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, fleet-wide bulk actions, DigitalOcean connect/provision/destroy) · in-place self-update · config backup/restore · themes + custom background.
 
 ## Files
 - `manager.py` — the program (CLI + web server, single source of truth)
@@ -16,6 +16,7 @@ AquariusProxy is a ZenithProxy fork, so they share the same launch model and con
 - `aquarius-bot-manager.service` — systemd unit for the web UI
 - `aquarius-bot-manager-boot.service` — systemd oneshot unit that starts autostart instances on boot
 - `instances.example.json` — config schema example
+- `nodes.example.json` — controller node-registry example (other boxes reached over SSH tunnels)
 
 ## Requirements
 - `python3` (3.8+) and `tmux`: `sudo apt install tmux`
@@ -107,11 +108,19 @@ abm deploy  bot1 --source aquarius        # or zenith, or custom --repo owner/re
 abm limits  bot1 --memory 2G --cpu 200    # enforce caps (--clear to remove; no flags to view)
 abm files   [path]                        # list files under the allowed roots (jailed)
 
-# host / settings / auth
+# multi-VPS controller (other boxes reached over SSH tunnels)
+abm node list                             # registered nodes + tunnel status
+abm node add box2 ubuntu@1.2.3.4[:port]  # register + bring up the tunnel + test [--key F --basic-user U --basic-pass P]
+abm node test box2                        # probe a node over its tunnel
+abm node remove box2                      # drop a node (its bots keep running on that VPS)
+
+# host / settings / auth / self-update
 abm sysinfo
 abm settings [--theme ember] [--accent "#ff7a45"] [--enable-system | --disable-system]
 abm update                                # apt-get update && upgrade (system actions must be enabled)
 abm reboot                                # reboot the host (system actions must be enabled)
+abm selfupdate                            # update the manager in place (git pull + restart; bots untouched)
+abm autoupdate on|off|status             # daily self-update systemd timer
 abm setpassword                           # set the web UI login (prompts for user + password)
 abm logout-all                            # invalidate active web sessions
 ```
@@ -127,9 +136,21 @@ Browse to http://127.0.0.1:8765.
 - **📁 Files** — a jailed file manager (browse/create/edit/rename/delete) over the allowed roots.
 - **+ New instance** — register an existing dir via a form (incl. optional resource caps).
 - **⟲ Scan existing** — detect unmanaged tmux sessions and adopt them.
-- **⚙ Settings** — Appearance (theme presets + accent) and System (host dashboard + reboot/update).
+- **🖥 Boxes** — connect and drive other VPSes from this one (see _Multi-VPS controller_ below).
+- **⚙ Settings** — Appearance (themes, custom background, density), System (host dashboard, manager self-update, backup/restore, reboot/update).
 - **🌐 Proxies** — quick host/port **and user/password** editor for instances using `client.connection.proxy`. Each row has host, port, optional username + password (blank password keeps the existing one; clearing the username drops the saved credentials), with **Save** and **⟳** (save **& restart**). A **Bulk assign / rotate** panel lets you paste a list of `host:port` proxies and apply them across selected instances — **round-robin** (cycle the list across targets) or **same to all** — with an optional restart-after.
 - Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin) plus **quick-command preset buttons**; **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback and **Save** / **Save & Restart**; **Limits** tab sets the memory/CPU caps. The ★ on each card toggles autostart.
+
+## Multi-VPS controller (Boxes, Fleet, DigitalOcean)
+One manager can act as a **controller** for your other boxes. Each other box runs the same manager (in lightweight **node mode**), and the controller reaches it over a **controller-managed SSH tunnel** — nodes stay bound to `127.0.0.1` and are never exposed to the internet. Open it with the header's **🖥 Boxes** button.
+
+- **Connect a box (SSH):** paste `user@host` (add `:port` if SSH isn't on 22). The controller opens a self-healing `ssh -N -L` tunnel to that box and registers it. Optional advanced fields: SSH key path, the node's manager port, and the node's web login (only if it enforces one — the controller presents it automatically when proxying).
+- **In-page box switcher:** a sticky bar at the top lets you switch which box you're viewing. Selecting a box **reverse-proxies its full native dashboard into the same tab** — console, config, files, proxies, everything — no extra tunnel or browser tab.
+- **Fleet view:** the Boxes panel shows every box at a glance (reachable, bots running, host load/mem) with one-click **Start / Restart / Stop all** across the fleet and **Update all nodes** (pushes `selfupdate` to each).
+- **DigitalOcean:** save a DO API token, then **connect existing droplets** or **spin up a new 1GB node-mode droplet** (region/size picker, default `s-1vcpu-1gb`) — the controller auto-uploads its own SSH key, installs the manager via cloud-init, and registers the new box. DO-backed boxes also get a **Destroy** button (deletes the droplet, with a typed confirmation).
+- **All-boxes launcher:** under **🔗 Connect**, download a one-double-click script that opens an SSH tunnel to every box (controller + nodes) on distinct local ports — a direct-access fallback for when the controller itself is down.
+
+Node registry lives in `nodes.json` (gitignored; SSH targets + the DO token + any node web creds, stored base64-obfuscated). Manage nodes headless with `abm node list|add|remove|test`, e.g. `abm node add box2 ubuntu@1.2.3.4`. Install a box as a node with `curl -fsSL …/install.sh | ABM_ACCESS=node bash`.
 
 ### Console presets
 The buttons above the console command bar are editable in **Settings → Console** (label + the command it types). They're stored under `settings.console_presets` in `instances.json`. Defaults are `Reconnect` (`connect`), `Disconnect` (`disconnect`), and `Status` (`info`) — adjust them to your proxy's commands.
@@ -172,7 +193,13 @@ Give an instance a memory and/or CPU cap (New-instance form, the drawer's **Limi
 **🚀 Deploy** stands up a new proxy from scratch: pick **AquariusProxy**, **ZenithProxy**, or a **custom** GitHub `owner/repo` (any fork that publishes a `launcher-v3` release), give it a name and dir, and the manager downloads that fork's platform launcher, unzips it, and registers the instance. The launcher self-bootstraps Java and the proxy jar on first start — so deploying needs nothing pre-installed. Same headless: `abm deploy <name> --source aquarius|zenith|custom [--repo owner/repo]`.
 
 ## Settings — appearance
-Theme presets: `midnight` (default), `ember`, `ice`, `amethyst`, `paper`. Optional accent override (any hex). Persisted in `instances.json`, applied on load.
+Theme presets: `midnight` (default), `ember`, `ice`, `amethyst`, `paper`, `obsidian`, `forest`, `rose`, `ocean`, `gold`, `sand`. Accent colour via a picker, hex field, or one-click swatches. A **custom background image** (any http/https URL) with a readability **dim** slider, and a **density** control (comfortable / compact / spacious). Everything previews live and persists in `instances.json`.
+
+## Settings — backup & restore
+**Settings → System → Backup & restore.** Download a portable bundle of this box's configs (`instances.json` + the node registry) — the file contains secrets, so keep it safe. Restoring overwrites the current configs (a timestamped `.pre-restore-*.bak` copy is saved first) and may require logging in again. When you're viewing a node via the box switcher, backup/restore targets that node.
+
+## Settings — manager self-update
+**Settings → System → Manager updates.** Update the manager in place (`git pull --ff-only` + restart the web UI — bots are untouched thanks to `KillMode=process`) with the **🔄 Update manager now** button, which shows an **"update available"** badge when the box is behind. Toggle **Auto-update daily** to install a systemd timer. Headless: `abm selfupdate`, `abm autoupdate on|off`.
 
 ## Settings — system actions (reboot / OS update)
 **Off by default.** Enable in the Settings → System tab, or `abm settings --enable-system`.

@@ -17,28 +17,26 @@ Aquarius Bot Manager is a **single-host control plane**. It manages the bots tha
 ![Jailed file manager](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/files.png)
 *The file manager is realpath-jailed to the allowlisted local roots — it can't escape to the rest of the box.*
 
-It has **no concept of remote hosts.** It does not SSH out to other servers, it has no agent/controller split, and it does not aggregate multiple machines into one view. One manager = one VPS = the bots on that VPS.
+Each manager is still single-host at its core — **one manager = one VPS = the bots on that VPS.** What changed in **v1.4.0**: a manager can additionally act as a **controller** that connects to *other* boxes' managers over SSH tunnels and drives them from one dashboard (see **[[Multi-VPS Controller]]**). The per-box model below is unchanged; the controller is a layer on top, not a different engine.
 
-**Its intended design:** put **many bots on one reasonably-sized VPS**, and give each bot a distinct outbound IP using **[[Proxies]]** (including one-click Webshare import). That's how you get IP diversity without a fleet of servers.
+**Its intended design:** put **many bots on one reasonably-sized VPS**, and give each bot a distinct outbound IP using **[[Proxies]]** (including one-click Webshare import). That's how you get IP diversity without a fleet of servers. If you do prefer multiple boxes, the controller now stitches them into a single pane.
 
 ---
 
-## ❌ Not compatible: one bot per server (e.g. DigitalOcean droplet-per-bot)
+## One bot per server (e.g. DigitalOcean droplet-per-bot)
 
-A common alternative architecture is **one bot per server** — for example, a separate **DigitalOcean droplet** (or any VPS) for each bot, so every bot has its own machine and its own IP.
+A common alternative architecture is **one bot per server** — a separate VPS (or **DigitalOcean droplet**) for each bot, so every bot has its own machine and its own IP.
 
-**Aquarius Bot Manager does not support that model.** A manager running on droplet A cannot see, control, monitor, or deploy the bot on droplet B. There is no central dashboard that spans droplets.
-
-If your setup is one-bot-per-droplet, your options are:
+As of **v1.4.0 this is supported** through the **[[Multi-VPS Controller]]**: install the manager in node mode on each box, connect them to one controller over SSH tunnels, and you get a single dashboard that spans every box — switch into any box's full UI, see them all in the Fleet view, run fleet-wide actions, and (for DigitalOcean) provision/destroy droplets from the controller. Your options:
 
 | Option | Reality |
 |--------|---------|
-| **Use the Fleet controller** (experimental) | A **[[Fleet (DigitalOcean)]]** layer provisions droplets via the DigitalOcean API and aggregates each droplet's agent into one place. This is the supported path for multi-droplet — see that page (prototype, CLI-driven, not yet live-tested). |
-| **Install a separate manager on each droplet** | Works without the fleet layer, but each is its own island — separate URL, login, dashboard. |
-| **Switch to the consolidated model** | Run multiple bots on **one** bigger VPS and use **proxies** for per-bot IPs. Usually far cheaper than N droplets. |
-| **Don't use this tool** | If you need a model none of the above fit. |
+| **Use the built-in [[Multi-VPS Controller]]** | The supported, provider-agnostic path: one controller, many node-mode boxes over SSH tunnels, one dashboard. Includes DigitalOcean connect/provision/destroy. |
+| **Use the [[Fleet (DigitalOcean)]] tool** (experimental) | A CLI-only DigitalOcean-specific provisioner/aggregator (`abmfleet`). Predates the controller; the controller covers most of its use cases from the UI. |
+| **Install a separate manager on each box, unlinked** | Works without the controller, but each is its own island — separate URL, login, dashboard. |
+| **Switch to the consolidated model** | Run multiple bots on **one** bigger VPS and use **proxies** for per-bot IPs. Often cheaper than N boxes. |
 
-> The fleet controller does **not** change the core: each droplet still runs the single-host manager. It adds provisioning + aggregation on top. See **[[Fleet (DigitalOcean)]]**.
+> Neither layer changes the core: each box still runs the single-host manager. The controller adds tunnels + a reverse-proxy switcher + aggregation on top. See **[[Multi-VPS Controller]]**.
 
 ### Why one-bot-per-droplet at all?
 People do it for **IP diversity** (each droplet has a unique IP, avoiding shared-IP detection/bans), **resource isolation**, and **blast radius** (one bot dying doesn't touch the others). This tool's answer to the first is **proxies**; to the second, **cgroup limits**; the third (true host isolation) it deliberately does not provide.

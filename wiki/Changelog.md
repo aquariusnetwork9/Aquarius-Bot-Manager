@@ -2,7 +2,19 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.3.0 — *latest*
+## v1.4.0 — *latest*
+
+- **Multi-VPS controller** — one manager can drive your other boxes. Each other box runs the same manager in lightweight **node mode** (`ABM_ACCESS=node`, bound to `127.0.0.1`), reached over a self-healing **controller-managed SSH tunnel** — nodes are never exposed publicly. See **[[Multi-VPS Controller]]**.
+  - **🖥 Boxes** panel: connect a box by pasting `user@host`, list/remove boxes, and a live **Fleet view** (reachable, bots running, host load/mem) with fleet-wide **Start / Restart / Stop all** and **Update all nodes**.
+  - **In-page box switcher** — a sticky top bar reverse-proxies any connected box's full native dashboard into the same browser tab (console, config, files, everything); no extra tunnel or tab.
+  - **DigitalOcean** — save a token, then **connect existing droplets** or **provision a new 1GB node-mode droplet** (auto-uploads the controller's SSH key + cloud-init install), and **Destroy** DO-backed boxes.
+  - **All-boxes launcher** under 🔗 Connect — one script that tunnels into every box on distinct local ports (direct-access fallback).
+  - CLI: `abm node list|add|remove|test`.
+- **"Update available" indicator** — the 🔄 self-update button now shows a badge when the box is behind its upstream (a quiet `git fetch`, no pull).
+- **Config backup & restore** — download a portable bundle of a box's configs (instances + node registry) and restore it later (a timestamped pre-restore snapshot is saved first). Settings → System.
+- **Theming** — six new presets (`obsidian`, `forest`, `rose`, `ocean`, `gold`, `sand`), a **custom background image** with a dim slider, a **density** control (comfortable / compact / spacious), and one-click accent **colour swatches**.
+
+## v1.3.0
 
 - **Proxy health & auto-fix** — scans each running bot's console for proxy errors (dead / Webshare-removed IPs) and shows which bots are broken (with the matching console line as evidence). One click re-imports fresh IPs from Webshare and reassigns them to the broken bots, then restarts. Fix scope: **errored only**, selected, or all; assignment: **random**, round-robin, or same. Detection patterns are tunable in the config (`settings.proxy_health.patterns`). New `Errored` quick-select in the bulk panel; new CLI `abm proxyhealth`, plus `--mode random` and `--targets errored` on `abm proxybulk` / `abm webshare`.
 - **Self-update / auto-update** — update the manager in place with **`abm selfupdate`** (`git pull` + restart, no reinstall) or the **🔄 Update manager** button in Settings → System. Enable **`abm autoupdate on`** (or the "Auto-update daily" toggle) to install a systemd timer that keeps it current automatically.
