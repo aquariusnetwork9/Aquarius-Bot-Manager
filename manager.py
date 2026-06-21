@@ -42,7 +42,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -758,6 +758,51 @@ def autoupdate_status():
         return {"enabled": False, "state": "unavailable"}
     state = r.stdout.strip() or r.stderr.strip()
     return {"enabled": r.returncode == 0 and state == "enabled", "state": state}
+
+
+# cache so the dashboard's "update available?" check doesn't hit the git remote on every
+# settings load — a quiet fetch happens at most once per _UPDATE_TTL seconds.
+_UPDATE_TTL = 600
+_UPDATE_CHECK = {"ts": 0.0, "data": None}
+
+
+def update_available(force=False):
+    """Best-effort 'is the manager behind its upstream branch?' check. Does a quiet
+    `git fetch` (cached for _UPDATE_TTL s) and counts commits HEAD..@{u} WITHOUT pulling,
+    so it never changes the working tree. Never raises — returns
+    {available, behind, current, latest, state}."""
+    now = time.time()
+    cached = _UPDATE_CHECK["data"]
+    if not force and cached is not None and now - _UPDATE_CHECK["ts"] < _UPDATE_TTL:
+        return cached
+    data = {"available": False, "behind": 0, "current": "?", "latest": "?", "state": "ok"}
+    try:
+        if not os.path.isdir(os.path.join(MANAGER_DIR, ".git")):
+            data["state"] = "no-git"
+        else:
+            cur = _git(["rev-parse", "--short", "HEAD"])
+            if cur.returncode == 0:
+                data["current"] = cur.stdout.strip()
+            f = _git(["fetch", "--quiet"], timeout=30)
+            if f.returncode != 0:
+                data["state"] = "fetch-failed"
+            else:
+                up = _git(["rev-parse", "--short", "@{u}"])
+                if up.returncode != 0:
+                    data["state"] = "no-upstream"
+                else:
+                    data["latest"] = up.stdout.strip()
+                    cnt = _git(["rev-list", "--count", "HEAD..@{u}"])
+                    n = cnt.stdout.strip()
+                    if cnt.returncode == 0 and n.isdigit():
+                        data["behind"] = int(n)
+                        data["available"] = int(n) > 0
+    except Exception as e:
+        data["state"] = "error"
+        data["error"] = str(e)
+    _UPDATE_CHECK["ts"] = now
+    _UPDATE_CHECK["data"] = data
+    return data
 
 
 def autoupdate_set(enable, schedule="daily"):
@@ -1568,6 +1613,8 @@ def get_settings(cfg):
         "presets": THEME_PRESETS,
         "webshare_saved": bool(s.get("webshare", {}).get("token")),
         "autoupdate": autoupdate_status(),
+        # non-blocking cached snapshot; the UI refreshes it via /api/update/check
+        "update": _UPDATE_CHECK["data"] or {"state": "checking"},
     }
 
 
@@ -2063,6 +2110,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             return self._json(get_settings(self._cfg()))
+
+        # is the manager behind its upstream branch? (cached quiet git fetch; no pull)
+        if path == "/api/update/check":
+            force = q.get("force", ["0"])[0] in ("1", "true", "yes")
+            return self._json(update_available(force=force))
 
         if path == "/api/system/info":
             return self._json(_sysinfo())
@@ -3572,6 +3624,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
         <div class="hint" style="margin-bottom:.55rem">Update the manager in place (<code>git pull</code> + restart the web UI) — no reinstall. Enable auto-update to run it on a daily schedule.</div>
         <div class="row" style="align-items:center;gap:.7rem;flex-wrap:wrap">
           <button class="go" onclick="selfUpdate(this)">🔄 Update manager now</button>
+          <span id="updAvail" style="display:none"></span>
           <label style="flex-direction:row;align-items:center;gap:.4rem;color:var(--txt);font-weight:400;margin:0"><input type="checkbox" id="autoUpd" onchange="toggleAutoupdate(this)" style="width:auto"> Auto-update daily</label>
           <span class="msg" id="updMsg" style="color:var(--dim);flex:1"></span>
         </div>
@@ -4566,6 +4619,15 @@ function renderSysToggle(){
   $('sysDanger').style.pointerEvents=on?'auto':'none';
   const au=SETTINGS&&SETTINGS.autoupdate;
   if($('autoUpd')){ $('autoUpd').checked=!!(au&&au.enabled); $('autoUpd').disabled=!!(au&&au.state==='unavailable'); }
+  refreshUpdateBadge();
+}
+async function refreshUpdateBadge(){
+  const el=$('updAvail'); if(!el)return;
+  let d; try{ d=await api('/api/update/check'); }catch(e){ return; }
+  if(!d||!d.available){ el.style.display='none'; return; }
+  el.style.cssText='display:inline-block;background:var(--accent,#3a6f5a);color:#fff;border-radius:8px;padding:.15rem .55rem;font-size:.75rem;font-weight:600';
+  el.textContent='⬆ Update available · '+d.behind+' behind'+((d.latest&&d.latest!=='?')?(' ('+d.latest+')'):'');
+  el.title='Current '+d.current+' → latest '+d.latest;
 }
 async function selfUpdate(btn){
   if(!confirm('Update the manager now (git pull + restart the web UI)? The dashboard will blink for a moment.'))return;
