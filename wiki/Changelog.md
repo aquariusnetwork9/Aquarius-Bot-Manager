@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.6.0 — *latest*
+## v1.7.0 — *latest*
+
+- **Automation: pick the target bot from a dropdown.** The "Target bot" field on the Automation page is now a dropdown of every bot on the selected box — **running or not** — plus an **All bots** option, instead of a free-text name. It tracks the **Box** selector: choosing a connected box lists that box's bots, and **All boxes** collapses to just *All bots*. No more typos in bot names.
+- **10 selectable fonts.** A new **Font** picker in **Settings → Appearance** swaps the whole UI's display + monospace pairing: **Aquarius** (default · Sora / Space Mono), **System** (no web fetch), **Inter**, **Roboto**, **Rounded** (Nunito / Fira Code), **Grotesk** (Space Grotesk / IBM Plex Mono), **Terminal** (all-mono), **Geometric** (Poppins / Source Code Pro), **Classic** (Work Sans / Ubuntu Mono), and **Editorial** (Libre Franklin / Spline Sans Mono). The choice previews live, persists in `settings.theme.font`, lazy-loads its Google Font, and is also settable via `abm settings --font <name>`.
+
+## v1.6.0
 
 - **Automation — scheduled actions + an on-crash watchdog.** A new **Automation** page (stored in `settings.schedules`) runs jobs on the controller every ~30 s:
   - **Time schedules** — cron (`0 4 * * *`), `every:30m` / `every:2h`, or `daily:HH:MM`.

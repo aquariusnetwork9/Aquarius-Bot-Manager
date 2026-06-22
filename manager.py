@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -80,6 +80,7 @@ def load_config(path):
     theme = s.setdefault("theme", {})
     theme.setdefault("preset", "midnight")
     theme.setdefault("accent", "")          # "" = use the preset's accent
+    theme.setdefault("font", "aquarius")    # font pairing (see FONT_PRESETS)
     s.setdefault("system_actions_enabled", False)
     return {"raw": data, "instances": insts, "by_name": by_name, "path": path}
 
@@ -1596,6 +1597,23 @@ THEME_PRESETS = {
 }
 HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
+# Font pairings selectable in Settings -> Appearance. Each entry is a
+# (display/sans, monospace) pairing applied to the --sans / --mono CSS vars.
+# "q" is the Google Fonts css2 query fragment (families to fetch); "" means the
+# pairing is system-only and needs no network fetch. Stored under theme.font.
+FONT_PRESETS = {
+    "aquarius":  {"label": "Aquarius",  "sans": "'Sora',system-ui,sans-serif",                          "mono": "'Space Mono',ui-monospace,monospace",      "q": "family=Sora:wght@400;600;700;800&family=Space+Mono:wght@400;700"},
+    "system":    {"label": "System",    "sans": "system-ui,-apple-system,'Segoe UI',Roboto,sans-serif", "mono": "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace", "q": ""},
+    "inter":     {"label": "Inter",     "sans": "'Inter',system-ui,sans-serif",                         "mono": "'JetBrains Mono',ui-monospace,monospace",  "q": "family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700"},
+    "roboto":    {"label": "Roboto",    "sans": "'Roboto',system-ui,sans-serif",                        "mono": "'Roboto Mono',ui-monospace,monospace",     "q": "family=Roboto:wght@400;500;700;900&family=Roboto+Mono:wght@400;700"},
+    "rounded":   {"label": "Rounded",   "sans": "'Nunito',system-ui,sans-serif",                        "mono": "'Fira Code',ui-monospace,monospace",       "q": "family=Nunito:wght@400;600;700;800;900&family=Fira+Code:wght@400;700"},
+    "grotesk":   {"label": "Grotesk",   "sans": "'Space Grotesk',system-ui,sans-serif",                 "mono": "'IBM Plex Mono',ui-monospace,monospace",   "q": "family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600"},
+    "terminal":  {"label": "Terminal",  "sans": "'IBM Plex Mono',ui-monospace,monospace",               "mono": "'IBM Plex Mono',ui-monospace,monospace",   "q": "family=IBM+Plex+Mono:wght@400;500;600;700"},
+    "geometric": {"label": "Geometric", "sans": "'Poppins',system-ui,sans-serif",                       "mono": "'Source Code Pro',ui-monospace,monospace", "q": "family=Poppins:wght@400;500;600;700;800&family=Source+Code+Pro:wght@400;600"},
+    "classic":   {"label": "Classic",   "sans": "'Work Sans',system-ui,sans-serif",                     "mono": "'Ubuntu Mono',ui-monospace,monospace",     "q": "family=Work+Sans:wght@400;500;600;700;800&family=Ubuntu+Mono:wght@400;700"},
+    "editorial": {"label": "Editorial", "sans": "'Libre Franklin',system-ui,sans-serif",                "mono": "'Spline Sans Mono',ui-monospace,monospace","q": "family=Libre+Franklin:wght@400;500;600;700;800&family=Spline+Sans+Mono:wght@400;600"},
+}
+
 # Quick-command buttons shown in each instance's Console tab. Editable in the UI
 # (Settings -> Console) and stored under settings.console_presets. These defaults
 # are sensible AquariusProxy/ZenithProxy console commands; change them to taste.
@@ -1620,6 +1638,7 @@ def get_settings(cfg):
             "bg_image": s.get("theme", {}).get("bg_image", ""),
             "bg_dim": s.get("theme", {}).get("bg_dim", 0.6),
             "density": s.get("theme", {}).get("density", ""),
+            "font": s.get("theme", {}).get("font", "aquarius"),
         },
         "ui": {
             "sidebar": s.get("ui", {}).get("sidebar", "full"),
@@ -1631,6 +1650,7 @@ def get_settings(cfg):
         "schedules": s.get("schedules") or {"notify_webhook": "", "jobs": []},
         "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
+        "fonts": FONT_PRESETS,
         "webshare_saved": bool(s.get("webshare", {}).get("token")),
         "autoupdate": autoupdate_status(),
         # non-blocking cached snapshot; the UI refreshes it via /api/update/check
@@ -1670,6 +1690,11 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             if d not in ("", "compact", "spacious"):
                 raise ValueError("density must be '', 'compact' or 'spacious'")
             t["density"] = d
+        if "font" in theme:
+            fk = (theme["font"] or "").strip()
+            if fk not in FONT_PRESETS:
+                raise ValueError(f"unknown font: {fk}")
+            t["font"] = fk
     if system_actions_enabled is not None:
         s["system_actions_enabled"] = bool(system_actions_enabled)
     if console_presets is not None:
@@ -4265,6 +4290,7 @@ def main():
     p = sub.add_parser("settings")
     p.add_argument("--theme", default=None, help="preset name: " + ", ".join(THEME_PRESETS))
     p.add_argument("--accent", default=None, help="hex accent, e.g. #3ddc97")
+    p.add_argument("--font", default=None, help="font pairing: " + ", ".join(FONT_PRESETS))
     p.add_argument("--enable-system", dest="enable_system", action="store_true")
     p.add_argument("--disable-system", dest="disable_system", action="store_true")
 
@@ -4572,11 +4598,14 @@ def main():
             theme["preset"] = args.theme
         if args.accent is not None:
             theme["accent"] = args.accent
+        if args.font is not None:
+            theme["font"] = args.font
         en = True if args.enable_system else (False if args.disable_system else None)
         try:
             out = save_settings(cfg, theme=theme or None, system_actions_enabled=en)
             print(f"theme preset:   {out['theme']['preset']}")
             print(f"theme accent:   {out['theme']['accent'] or '(preset default)'}")
+            print(f"theme font:     {out['theme'].get('font', 'aquarius')}")
             print(f"system actions: {'enabled' if out['system_actions_enabled'] else 'disabled'}")
         except ValueError as e:
             die(str(e))
@@ -5417,6 +5446,10 @@ table.tbl tr:hover td{background:#ffffff05}
         <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="spacious" style="width:auto" onchange="SELDENSITY='spacious';previewTheme()"> Spacious</label>
       </div>
 
+      <label>Font <span class="hint">display + monospace pairing</span>
+        <select id="fontSel" onchange="SELFONT=this.value;previewTheme()" style="font-family:var(--sans);font-size:.84rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem;width:100%;cursor:pointer"></select>
+      </label>
+
       <label>Background image URL <span class="hint">blank = solid theme colour</span>
         <input id="bgImage" placeholder="https://…/wallpaper.jpg" autocomplete="off" oninput="SELBG=this.value.trim();previewTheme()"></label>
       <label style="margin-top:.5rem">Background dim <span class="hint" id="bgDimVal"></span>
@@ -6078,6 +6111,21 @@ function applyTheme(s){
   // density scales rem-based sizing via the root font-size
   document.documentElement.style.fontSize =
     (s.theme.density==='compact')?'14px':((s.theme.density==='spacious')?'17.5px':'');
+  // font pairing → --sans / --mono (lazily fetch the Google Fonts stylesheet)
+  const fonts=s.fonts||{};
+  const fkey=(s.theme.font&&fonts[s.theme.font])?s.theme.font:'aquarius';
+  const f=fonts[fkey];
+  if(f){
+    if(f.q){
+      const id='gf-'+fkey;
+      if(!document.getElementById(id)){
+        const l=document.createElement('link'); l.id=id; l.rel='stylesheet';
+        l.href='https://fonts.googleapis.com/css2?'+f.q+'&display=swap';
+        document.head.appendChild(l);
+      }
+    }
+    setVar('--sans',f.sans); setVar('--mono',f.mono);
+  }
 }
 async function loadSettings(){
   SETTINGS=await api('/api/settings');
@@ -6377,15 +6425,41 @@ function telTick(){
   const tt=$('telTiles'); if(tt)tt.innerHTML=telTilesHtml(i);
   telDrawChart(); telTailNow();
 }
-let SCHEDJOBS=[], SCHEDHOOK='', SCHEDRT={}, SCHEDBOXES=[];
+let SCHEDJOBS=[], SCHEDHOOK='', SCHEDRT={}, SCHEDBOXES=[], SCHEDBOTS={};
 async function renderAutomationView(){
   const el=$('viewAutomation');
   el.innerHTML='<div class="pagehd"><h1>Automation</h1><span class="sub">loading…</span></div>';
   let d; try{ d=await api('/api/schedules'); }catch(e){ el.innerHTML='<div class="pagehd"><h1>Automation</h1></div><div class="panel hint">failed to load</div>'; return; }
   SCHEDJOBS=(d.schedules&&d.schedules.jobs)||[]; SCHEDHOOK=(d.schedules&&d.schedules.notify_webhook)||''; SCHEDRT=d.runtime||{};
-  SCHEDBOXES=[{v:'',l:'This box'}];
-  try{ const n=await api('/api/nodes'); const ns=(n&&n.nodes)||[]; ns.forEach(x=>SCHEDBOXES.push({v:x.name,l:x.name})); if(ns.length)SCHEDBOXES.push({v:'*',l:'All boxes'}); }catch(e){}
+  SCHEDBOXES=[{v:'',l:'This box'}]; SCHEDBOTS={'':[]};
+  // this box's bots (running or not) — authoritative local instance list
+  try{ const il=await api('/api/instances'); SCHEDBOTS['']=((il&&il.instances)||[]).map(i=>i.name).filter(Boolean).sort(); }catch(e){}
+  // connected boxes + their bots (best-effort; one fleet sweep)
+  try{
+    const fs=await api('/api/fleet/status'); let nodes=0;
+    ((fs&&fs.fleet)||[]).forEach(r=>{
+      if(r.controller)return; nodes++;
+      SCHEDBOXES.push({v:r.name,l:r.name});
+      SCHEDBOTS[r.name]=Array.isArray(r.bot_names)?r.bot_names.filter(Boolean).slice().sort():[];
+    });
+    if(nodes)SCHEDBOXES.push({v:'*',l:'All boxes'});
+  }catch(e){}
   schedDraw();
+}
+// options for the target-bot dropdown given the selected box
+function schedBotOpts(box,sel){
+  const opts=[`<option value="all"${sel==='all'?' selected':''}>All bots</option>`];
+  if(box==='*')return opts.join('');   // across all boxes only "all" is meaningful
+  (SCHEDBOTS[box]||[]).forEach(nm=>opts.push(`<option value="${esc(nm)}"${nm===sel?' selected':''}>${esc(nm)}</option>`));
+  return opts.join('');
+}
+// repopulate the target-bot dropdown when the box changes
+function schedBoxSync(){
+  const box=$('njBox')?$('njBox').value:'', sel=$('njTarget'); if(!sel)return;
+  const cur=sel.value;
+  sel.innerHTML=schedBotOpts(box,cur);
+  if(![...sel.options].some(o=>o.value===cur))sel.value='all';
+  sel.disabled=(box==='*');
 }
 function schedRel(ts){ const ms=ts*1000-Date.now(); if(ms<0)return'due'; const m=Math.round(ms/60000); if(m<60)return'in '+m+'m'; const h=Math.floor(m/60); return 'in '+h+'h '+(m%60)+'m'; }
 function schedDraw(){
@@ -6414,8 +6488,8 @@ function schedDraw(){
         <div class="frow"><div class="flabel">Trigger</div><div class="fctrl"><select id="njTrig" onchange="schedFormSync()"><option value="time">Time schedule</option><option value="on_crash">On crash (watchdog)</option></select></div></div>
         <div class="frow" id="njWhenRow"><div class="flabel">When <span class="unit">cron / every / daily</span></div><div class="fctrl"><input type="text" id="njWhen" placeholder="0 4 * * *   ·   every:2h   ·   daily:04:00"></div></div>
         <div class="frow" id="njTriesRow" style="display:none"><div class="flabel">Max restarts · cooldown s</div><div class="fctrl"><input type="text" id="njTries" value="3" class="snum"> <input type="text" id="njCool" value="60" class="snum"></div></div>
-        <div class="frow"><div class="flabel">Box</div><div class="fctrl"><select id="njBox">${boxopts}</select></div></div>
-        <div class="frow"><div class="flabel">Target bot <span class="unit">name or all</span></div><div class="fctrl"><input type="text" id="njTarget" value="all"></div></div>
+        <div class="frow"><div class="flabel">Box</div><div class="fctrl"><select id="njBox" onchange="schedBoxSync()">${boxopts}</select></div></div>
+        <div class="frow"><div class="flabel">Target bot <span class="unit">running or not</span></div><div class="fctrl"><select id="njTarget">${schedBotOpts('','all')}</select></div></div>
         <div class="frow"><div class="flabel">Action</div><div class="fctrl"><select id="njAction" onchange="schedFormSync()"><option value="restart">Restart</option><option value="start">Start</option><option value="stop">Stop</option><option value="command">Send command</option></select></div></div>
         <div class="frow" id="njCmdRow" style="display:none"><div class="flabel">Command</div><div class="fctrl"><input type="text" id="njCmd" placeholder="fly resupplyspares"></div></div>
         <div class="frow"><div class="flabel">Name <span class="unit">optional</span></div><div class="fctrl"><input type="text" id="njName" placeholder="Nightly restart"></div></div>
@@ -6427,7 +6501,7 @@ function schedDraw(){
         <div class="mbar" style="margin-top:.6rem"><span class="msg" id="hookMsg" style="color:var(--dim);flex:1"></span><button onclick="schedSaveHook()">Save webhook</button></div>
         <div class="hint" style="margin-top:.9rem">Schedule examples: <code>every:30m</code>, <code>daily:04:00</code>, cron <code>0 */6 * * *</code> (every 6h). For resupply, use action <b>Send command</b> with <code>fly resupplyspares</code>.</div></div>
     </div>`;
-  schedFormSync();
+  schedFormSync(); schedBoxSync();
 }
 function schedFormSync(){
   if(!$('njTrig'))return;
@@ -7078,12 +7152,16 @@ async function savePresets(){
   SETTINGS=d.settings; renderPresetBar();
   $('preMsg').style.color='var(--dim)'; $('preMsg').textContent='✓ saved ('+presets.length+')';
 }
-let SELPRESET=null, SELACCENT='', SELBG='', SELBGDIM=0.6, SELDENSITY='';
+let SELPRESET=null, SELACCENT='', SELBG='', SELBGDIM=0.6, SELDENSITY='', SELFONT='aquarius';
 const ACCENT_SWATCHES=['#3ddc97','#5cc8ff','#ff7a45','#b388ff','#ff6f9c','#e8b53a','#39b8d6','#5fd17a','#ff5d5d','#e6e6e6'];
 function renderPresets(){
   const t=SETTINGS.theme;
   SELPRESET=t.preset; SELACCENT=t.accent||''; SELBG=t.bg_image||'';
   SELBGDIM=(t.bg_dim==null?0.6:t.bg_dim); SELDENSITY=t.density||'';
+  SELFONT=t.font||'aquarius';
+  const fonts=SETTINGS.fonts||{};
+  if(!fonts[SELFONT])SELFONT='aquarius';
+  if($('fontSel'))$('fontSel').innerHTML=Object.keys(fonts).map(k=>`<option value="${k}"${k===SELFONT?' selected':''}>${esc(fonts[k].label||k)}</option>`).join('');
   const presets=SETTINGS.presets;
   $('presetRow').innerHTML=Object.keys(presets).map(k=>`
     <div class="chip ${k===SELPRESET?'sel':''}" data-k="${k}" onclick="pickPreset('${k}')">
@@ -7107,10 +7185,10 @@ function pickPreset(k){
   document.querySelectorAll('#presetRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.k===k));
   previewTheme();
 }
-function previewTheme(){ applyTheme({presets:SETTINGS.presets,theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY}}); }
+function previewTheme(){ applyTheme({presets:SETTINGS.presets,fonts:SETTINGS.fonts,theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY,font:SELFONT}}); }
 async function saveAppearance(){
   $('apMsg').textContent='saving…';
-  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY},ui:{sidebar:SELSIDEBAR,sidebar_side:SELSIDE}});
+  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY,font:SELFONT},ui:{sidebar:SELSIDEBAR,sidebar_side:SELSIDE}});
   if(d.error){$('apMsg').style.color='var(--crash)';$('apMsg').textContent='✗ '+d.error;return;}
   SETTINGS=d.settings; applyTheme(SETTINGS); renderSidebar();
   $('apMsg').style.color='var(--dim)';$('apMsg').textContent='✓ saved';
