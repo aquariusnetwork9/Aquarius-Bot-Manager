@@ -43,11 +43,12 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1627,6 +1628,7 @@ def get_settings(cfg):
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
+        "schedules": s.get("schedules") or {"notify_webhook": "", "jobs": []},
         "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
         "webshare_saved": bool(s.get("webshare", {}).get("token")),
@@ -1637,7 +1639,7 @@ def get_settings(cfg):
 
 
 def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None,
-                  thresholds=None, ui=None):
+                  thresholds=None, ui=None, schedules=None):
     s = cfg["raw"].setdefault("settings", {})
     if theme is not None:
         t = s.setdefault("theme", {})
@@ -1708,7 +1710,14 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             if sd not in ("left", "right"):
                 raise ValueError("sidebar_side must be left or right")
             u["sidebar_side"] = sd
+    if schedules is not None:
+        s["schedules"] = validate_schedule(schedules)
     save_config(cfg)
+    if schedules is not None and SCHEDULER is not None:
+        try:
+            SCHEDULER._reschedule_all()      # pick up new/changed time jobs immediately
+        except Exception:
+            pass
     return get_settings(cfg)
 
 
@@ -2637,6 +2646,315 @@ class TunnelManager:
 TUNNELS = None
 
 
+# ---------------------------------------------------------------------------
+# Automation scheduler (v1.6): time-based jobs (cron / interval / daily) and an
+# on-crash watchdog, targeting this box or any connected node, with optional
+# Discord notifications. Job *definitions* persist in settings.schedules; runtime
+# state (next/last run, watchdog attempts) is kept in-memory by the Scheduler.
+# ---------------------------------------------------------------------------
+SCHED_ACTIONS = ("restart", "start", "stop", "command")
+
+
+def _cron_field(expr, lo, hi):
+    """Parse one cron field (supports '*', 'a', 'a-b', 'a,b', '*/n', 'a-b/n') -> set of ints."""
+    out = set()
+    for part in str(expr).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            part, s = part.split("/", 1)
+            step = max(1, int(s))
+        if part in ("*", ""):
+            seq = range(lo, hi + 1, step)
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            seq = range(int(a), int(b) + 1, step)
+        else:
+            v = int(part)
+            seq = range(v, v + 1)
+        for v in seq:
+            if lo <= v <= hi:
+                out.add(v)
+    if not out:
+        raise ValueError(f"empty cron field: {expr!r}")
+    return out
+
+
+def parse_cron(spec):
+    """'min hour dom mon dow' -> tuple of 5 sets (dow 0=Sun..6=Sat, 7=Sun too). Raises ValueError."""
+    f = spec.split()
+    if len(f) != 5:
+        raise ValueError("cron needs 5 fields: 'min hour day month weekday'")
+    dows = _cron_field(f[4], 0, 7)
+    if 7 in dows:
+        dows = (dows - {7}) | {0}
+    return (_cron_field(f[0], 0, 59), _cron_field(f[1], 0, 23),
+            _cron_field(f[2], 1, 31), _cron_field(f[3], 1, 12), dows)
+
+
+def _cron_match(parsed, t):
+    lt = time.localtime(t)
+    mins, hrs, doms, mons, dows = parsed
+    return (lt.tm_min in mins and lt.tm_hour in hrs and lt.tm_mon in mons
+            and lt.tm_mday in doms and ((lt.tm_wday + 1) % 7) in dows)
+
+
+def normalize_when(when):
+    """Accept 'every:Nm|Nh|Nd', 'daily:HH:MM', or a 5-field cron. Returns ('interval', secs)
+    or ('cron', parsed). Raises ValueError on bad input."""
+    w = (when or "").strip()
+    if w.startswith("every:"):
+        v = w[6:].strip().lower()
+        unit = v[-1] if v and v[-1] in "smhd" else "m"
+        num = int(v[:-1] if v and v[-1] in "smhd" else v)
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        secs = max(30, num * mult)
+        return ("interval", secs)
+    if w.startswith("daily:"):
+        hh, mm = w[6:].split(":")
+        return ("cron", parse_cron(f"{int(mm)} {int(hh)} * * *"))
+    return ("cron", parse_cron(w))
+
+
+def next_fire(when, after_ts, last_run=None):
+    """Next epoch time a time-trigger should fire strictly after `after_ts`."""
+    kind, val = normalize_when(when)
+    if kind == "interval":
+        base = last_run if last_run else after_ts
+        nxt = base + val
+        return nxt if nxt > after_ts else after_ts + val
+    t = (int(after_ts) // 60) * 60 + 60          # next minute boundary
+    for _ in range(367 * 24 * 60):               # search up to ~1 year
+        if _cron_match(val, t):
+            return t
+        t += 60
+    raise ValueError("cron schedule never matches")
+
+
+def validate_schedule(sched):
+    """Validate + normalize a settings.schedules object. Returns the cleaned dict."""
+    if not isinstance(sched, dict):
+        raise ValueError("schedules must be an object")
+    hook = (sched.get("notify_webhook") or "").strip()
+    if hook and not re.match(r"^https://", hook):
+        raise ValueError("notify_webhook must be an https URL")
+    jobs = sched.get("jobs") or []
+    if not isinstance(jobs, list):
+        raise ValueError("schedules.jobs must be a list")
+    clean = []
+    for j in jobs:
+        if not isinstance(j, dict):
+            raise ValueError("each job must be an object")
+        trigger = j.get("trigger", "time")
+        if trigger not in ("time", "on_crash"):
+            raise ValueError("job trigger must be 'time' or 'on_crash'")
+        action = j.get("action", "restart")
+        if action not in SCHED_ACTIONS:
+            raise ValueError(f"job action must be one of {', '.join(SCHED_ACTIONS)}")
+        cj = {
+            "id": str(j.get("id") or ("j_" + secrets.token_hex(4))),
+            "name": str(j.get("name", "")).strip(),
+            "enabled": bool(j.get("enabled", True)),
+            "trigger": trigger,
+            "box": str(j.get("box", "")).strip(),            # "" = this box, "*" = all, else node name
+            "target": str(j.get("target", "all")).strip() or "all",   # "all" or a bot name
+            "action": action,
+            "command": str(j.get("command", "")).strip(),
+            "notify": bool(j.get("notify", False)),
+        }
+        if action == "command" and not cj["command"]:
+            raise ValueError("a 'command' job needs a command")
+        if trigger == "time":
+            cj["when"] = str(j.get("when", "")).strip()
+            next_fire(cj["when"], time.time())              # validates the schedule
+        else:
+            cj["max_tries"] = max(1, int(j.get("max_tries", 3)))
+            cj["cooldown"] = max(10, int(j.get("cooldown", 60)))
+        clean.append(cj)
+    return {"notify_webhook": hook, "jobs": clean}
+
+
+def _discord_notify(webhook, text):
+    if not webhook:
+        return
+    try:
+        data = json.dumps({"content": text[:1900]}).encode()
+        req = urllib.request.Request(webhook, data=data, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8).read()
+    except Exception:
+        pass
+
+
+class Scheduler:
+    """Background runner for settings.schedules. Re-reads the config each tick so edits
+    take effect live; never throws out of the loop (a bad job is reported, not fatal)."""
+
+    def __init__(self, cfg_path, interval=30):
+        self.cfg_path = cfg_path
+        self.interval = interval
+        self._stop = threading.Event()
+        self._started = False
+        self._rt = {}            # job id -> {next_run,last_run,last_result,tries}
+        self._lock = threading.Lock()
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        # prime next_run for time jobs so we don't fire everything immediately on boot
+        self._reschedule_all()
+        while not self._stop.wait(self.interval):
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[scheduler] tick error: {e}")
+
+    def _reschedule_all(self):
+        try:
+            sched = validate_schedule(load_config(self.cfg_path)["raw"]
+                                      .get("settings", {}).get("schedules", {}))
+        except Exception:
+            return
+        now = time.time()
+        with self._lock:
+            for j in sched["jobs"]:
+                if j["trigger"] == "time":
+                    rt = self._rt.setdefault(j["id"], {})
+                    rt["next_run"] = next_fire(j["when"], now, rt.get("last_run"))
+
+    def snapshot(self):
+        with self._lock:
+            return {k: dict(v) for k, v in self._rt.items()}
+
+    def run_now(self, cfg, job_id):
+        sched = validate_schedule(cfg["raw"].get("settings", {}).get("schedules", {}))
+        job = next((j for j in sched["jobs"] if j["id"] == job_id), None)
+        if not job:
+            raise ValueError("no such job")
+        return self._fire(cfg, job, sched.get("notify_webhook", ""), manual=True)
+
+    def _tick(self):
+        cfg = load_config(self.cfg_path)
+        sched = validate_schedule(cfg["raw"].get("settings", {}).get("schedules", {}))
+        hook = sched.get("notify_webhook", "")
+        now = time.time()
+        ids = {j["id"] for j in sched["jobs"]}
+        with self._lock:                       # forget runtime for deleted jobs
+            for gone in [k for k in self._rt if k not in ids]:
+                self._rt.pop(gone, None)
+        for job in sched["jobs"]:
+            if not job.get("enabled"):
+                continue
+            try:
+                if job["trigger"] == "time":
+                    rt = self._rt.setdefault(job["id"], {})
+                    if "next_run" not in rt:
+                        rt["next_run"] = next_fire(job["when"], now, rt.get("last_run"))
+                    if now >= rt["next_run"]:
+                        self._fire(cfg, job, hook)
+                        rt["last_run"] = now
+                        rt["next_run"] = next_fire(job["when"], now, now)
+                else:
+                    self._watchdog(cfg, job, hook, now)
+            except Exception as e:
+                self._rt.setdefault(job["id"], {})["last_result"] = f"error: {e}"
+
+    def _statuses(self, cfg, box):
+        """Map bot name -> status for a box ('' = this box, else node name)."""
+        if not box or box == "(this box)":
+            return {i["name"]: instance_status(i) for i in cfg["instances"]}
+        node = next((n for n in load_nodes()["nodes"] if n["name"] == box), None)
+        if not node:
+            return {}
+        try:
+            inst = node_request(node, "GET", "/api/instances", timeout=8).get("instances", [])
+            return {i.get("name"): i.get("status") for i in inst}
+        except Exception:
+            return {}
+
+    def _boxes_for(self, job):
+        if job["box"] == "*":
+            return [""] + [n["name"] for n in load_nodes()["nodes"]]
+        return [job["box"]]
+
+    def _watchdog(self, cfg, job, hook, now):
+        for box in self._boxes_for(job):
+            statuses = self._statuses(cfg, box)
+            targets = ([job["target"]] if job["target"] != "all" else list(statuses))
+            for bot in targets:
+                st = statuses.get(bot)
+                key = f"{job['id']}@{box}/{bot}"
+                rt = self._rt.setdefault(key, {})
+                if st == "running":
+                    rt["tries"] = 0          # healthy -> reset
+                    continue
+                if st != "crashed":
+                    continue
+                if rt.get("tries", 0) >= job["max_tries"]:
+                    continue
+                if now - rt.get("last_run", 0) < job["cooldown"]:
+                    continue
+                rt["tries"] = rt.get("tries", 0) + 1
+                rt["last_run"] = now
+                res = self._dispatch(cfg, box, bot, "restart", "")
+                rt["last_result"] = res
+                self._rt.setdefault(job["id"], {})["last_result"] = (
+                    f"watchdog: {bot} {res} (try {rt['tries']}/{job['max_tries']})")
+                if job.get("notify"):
+                    _discord_notify(hook, f"🔁 watchdog restarted **{bot}**"
+                                    + (f" on {box}" if box else "")
+                                    + f" (try {rt['tries']}/{job['max_tries']}) — {res}")
+
+    def _fire(self, cfg, job, hook, manual=False):
+        results = []
+        for box in self._boxes_for(job):
+            statuses = self._statuses(cfg, box)
+            targets = ([job["target"]] if job["target"] != "all" else list(statuses))
+            for bot in targets:
+                results.append(f"{bot}:{self._dispatch(cfg, box, bot, job['action'], job['command'])}")
+        summary = ("manual " if manual else "") + f"{job['action']} -> " + ", ".join(results or ["(no targets)"])
+        self._rt.setdefault(job["id"], {})["last_result"] = summary
+        if job.get("notify"):
+            label = job.get("name") or job["action"]
+            _discord_notify(hook, f"⏱ **{label}** ran — {summary}")
+        return summary
+
+    def _dispatch(self, cfg, box, bot, action, command):
+        """Run one action on one bot, locally or on a node. Returns a short status string."""
+        try:
+            if not box or box == "(this box)":
+                inst = cfg["by_name"].get(bot)
+                if not inst:
+                    return "no-such-bot"
+                if action == "command":
+                    send_command(inst, command)
+                    return "sent"
+                return {"start": start, "stop": stop, "restart": restart}[action](inst)
+            node = next((n for n in load_nodes()["nodes"] if n["name"] == box), None)
+            if not node:
+                return "no-such-box"
+            if action == "command":
+                node_request(node, "POST", f"/api/instances/{urllib.parse.quote(bot)}/command",
+                             {"command": command}, timeout=12)
+                return "sent"
+            node_request(node, "POST", f"/api/instances/{urllib.parse.quote(bot)}/{action}", timeout=12)
+            return "ok"
+        except Exception as e:
+            return f"error:{e}"
+
+
+SCHEDULER = None
+
+
 def ensure_node_tunnel(node, wait=8.0):
     """Bring up a node's tunnel and block until its loopback port answers (best-effort).
     Used after adding a node at runtime — also starts the supervisor so the tunnel
@@ -2975,6 +3293,12 @@ class Handler(BaseHTTPRequestHandler):
             reg = load_nodes()
             return self._json({"nodes": [node_public_view(n, TUNNELS) for n in reg["nodes"]]})
 
+        # automation: job definitions + live runtime (next/last run, watchdog tries)
+        if path == "/api/schedules":
+            sched = self._cfg()["raw"].get("settings", {}).get("schedules") or {"notify_webhook": "", "jobs": []}
+            rt = SCHEDULER.snapshot() if SCHEDULER is not None else {}
+            return self._json({"schedules": sched, "runtime": rt})
+
         # controller: aggregated status of this box + every node (the Fleet view)
         if path == "/api/fleet/status":
             return self._json({"fleet": fleet_aggregate(self._cfg())})
@@ -3209,8 +3533,21 @@ class Handler(BaseHTTPRequestHandler):
                                     system_actions_enabled=p.get("system_actions_enabled"),
                                     console_presets=p.get("console_presets"),
                                     thresholds=p.get("thresholds"),
-                                    ui=p.get("ui"))
+                                    ui=p.get("ui"),
+                                    schedules=p.get("schedules"))
                 return self._json({"ok": True, "settings": out})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # automation: fire a job right now ("Run now")
+        if path == "/api/schedules/run":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                if SCHEDULER is None:
+                    return self._json({"error": "scheduler not running"}, 503)
+                return self._json({"ok": True, "result": SCHEDULER.run_now(cfg, p.get("id", ""))})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
             except json.JSONDecodeError as e:
@@ -3663,6 +4000,13 @@ def serve(cfg_path, host, port):
         TUNNELS.start()
         print(f"controller: starting {len(reg['nodes'])} node tunnel(s): "
               + ", ".join(n["name"] for n in reg["nodes"]))
+    # automation: start the schedule runner (time jobs + on-crash watchdog)
+    global SCHEDULER
+    SCHEDULER = Scheduler(cfg_path)
+    SCHEDULER.start()
+    njobs = len((cfg["raw"].get("settings", {}).get("schedules") or {}).get("jobs", []))
+    if njobs:
+        print(f"scheduler: {njobs} job(s) loaded")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -3670,6 +4014,8 @@ def serve(cfg_path, host, port):
     finally:
         if TUNNELS is not None:
             TUNNELS.stop()
+        if SCHEDULER is not None:
+            SCHEDULER.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -5815,7 +6161,7 @@ function renderSlimTop(){
   const top=$('slimTop'); if(!top||top.style.display==='none')return;
   const T={dashboard:['Dashboard','your bots on this box'],fleet:['Fleet','multi-box overview'],
     activity:['Activity & alerts','live snapshot'],telemetry:['Telemetry','bot detail'],
-    automation:['Automation','schedules · preview']};
+    automation:['Automation','scheduled actions & auto-recovery']};
   const t=T[CURVIEW]||['Dashboard',''];
   top.innerHTML=`<div><div class="pt">${esc(t[0])}</div><div class="sub">${esc(t[1])}</div></div><div class="sp"></div>`
     +'<button class="go" onclick="bulk(\'start\')">▶ Start all</button>'
@@ -6031,24 +6377,85 @@ function telTick(){
   const tt=$('telTiles'); if(tt)tt.innerHTML=telTilesHtml(i);
   telDrawChart(); telTailNow();
 }
-function renderAutomationView(){
-  const el=$('viewAutomation'); if(el.__built)return; el.__built=true;
-  const jobs=[['Every day 04:00','all bots','Restart all'],['Every 2h','a bot','fly resupplyspares'],
-    ['Mon/Thu 12:00','a bot','send a console command'],['On crash','any bot','notify + auto-restart (Nx)']];
-  const rows=jobs.map(j=>`<tr><td style="font-family:var(--mono);font-size:.76rem">${j[0]}</td><td style="font-weight:600">${j[1]}</td><td style="font-family:var(--mono);font-size:.76rem;color:var(--dim)">${j[2]}</td><td><div class="tgl on"></div></td></tr>`).join('');
-  el.innerHTML=`<div class="pagehd"><h1>Automation</h1><span class="sub">scheduled actions &amp; auto-recovery</span></div>
-    <div class="previewbanner">⏱ Preview — the scheduler backend isn't wired up yet. This is the planned layout (target v1.6); the controls below are inert.</div>
-    <div class="cols" style="grid-template-columns:1.6fr 1fr">
-      <div class="panel"><h3>Scheduled jobs<span class="sub">example</span></h3>
-        <table class="tbl"><thead><tr><th>When</th><th>Target</th><th>Action</th><th>On</th></tr></thead><tbody>${rows}</tbody></table></div>
-      <div class="panel"><h3>New scheduled job</h3>
-        <div class="frow"><div class="flabel">Target</div><div class="fctrl"><select disabled><option>all bots</option></select></div></div>
-        <div class="frow"><div class="flabel">Action</div><div class="fctrl"><select disabled><option>Restart</option></select></div></div>
-        <div class="frow"><div class="flabel">Schedule <span class="unit">cron</span></div><div class="fctrl"><input type="text" value="0 4 * * *" disabled></div></div>
-        <div class="frow"><div class="flabel">Notify on Discord</div><div class="fctrl"><div class="tgl on"></div></div></div>
-        <div class="mbar" style="margin-top:.8rem"><span class="sp" style="flex:1"></span><button class="go" disabled>+ Add job</button></div></div>
-    </div>`;
+let SCHEDJOBS=[], SCHEDHOOK='', SCHEDRT={}, SCHEDBOXES=[];
+async function renderAutomationView(){
+  const el=$('viewAutomation');
+  el.innerHTML='<div class="pagehd"><h1>Automation</h1><span class="sub">loading…</span></div>';
+  let d; try{ d=await api('/api/schedules'); }catch(e){ el.innerHTML='<div class="pagehd"><h1>Automation</h1></div><div class="panel hint">failed to load</div>'; return; }
+  SCHEDJOBS=(d.schedules&&d.schedules.jobs)||[]; SCHEDHOOK=(d.schedules&&d.schedules.notify_webhook)||''; SCHEDRT=d.runtime||{};
+  SCHEDBOXES=[{v:'',l:'This box'}];
+  try{ const n=await api('/api/nodes'); const ns=(n&&n.nodes)||[]; ns.forEach(x=>SCHEDBOXES.push({v:x.name,l:x.name})); if(ns.length)SCHEDBOXES.push({v:'*',l:'All boxes'}); }catch(e){}
+  schedDraw();
 }
+function schedRel(ts){ const ms=ts*1000-Date.now(); if(ms<0)return'due'; const m=Math.round(ms/60000); if(m<60)return'in '+m+'m'; const h=Math.floor(m/60); return 'in '+h+'h '+(m%60)+'m'; }
+function schedDraw(){
+  const el=$('viewAutomation');
+  const rows=SCHEDJOBS.length?SCHEDJOBS.map(j=>{
+    const rt=SCHEDRT[j.id]||{};
+    const when=j.trigger==='on_crash'?('on crash · up to '+(j.max_tries||3)+'×'):esc(j.when||'');
+    const tgt=(j.box==='*'?'all boxes':(j.box?esc(j.box):'this box'))+' · '+esc(j.target||'all');
+    const act=esc(j.action)+(j.action==='command'?(': '+esc(j.command||'')):'');
+    const nxt=j.trigger==='on_crash'?'watching':(rt.next_run?schedRel(rt.next_run):'—');
+    return `<tr>
+      <td><div class="tgl ${j.enabled?'on':''}" onclick="schedToggle('${j.id}')"></div></td>
+      <td style="font-weight:600">${esc(j.name||act)}<div class="hint" style="font-family:var(--mono);font-size:.6rem">${when}</div></td>
+      <td style="font-family:var(--mono);font-size:.73rem;color:var(--dim)">${tgt}</td>
+      <td style="font-family:var(--mono);font-size:.73rem">${act}</td>
+      <td style="font-family:var(--mono);font-size:.72rem;color:var(--acc)">${nxt}</td>
+      <td style="font-family:var(--mono);font-size:.66rem;color:var(--dim);max-width:230px;overflow:hidden;text-overflow:ellipsis">${rt.last_result?esc(rt.last_result):'—'}</td>
+      <td style="white-space:nowrap"><button onclick="schedRun('${j.id}')">Run</button> <button class="danger" onclick="schedDelete('${j.id}')">✕</button></td></tr>`;
+  }).join(''):'<tr><td colspan="7" class="hint">No jobs yet — add one below.</td></tr>';
+  const boxopts=SCHEDBOXES.map(b=>`<option value="${esc(b.v)}">${esc(b.l)}</option>`).join('');
+  el.innerHTML=`<div class="pagehd"><h1>Automation</h1><span class="sub">${SCHEDJOBS.length} job(s) · ${SCHEDJOBS.filter(j=>j.enabled).length} active · runner ticks ~30s</span></div>
+    <div class="panel" style="margin-bottom:1rem"><h3>Scheduled jobs<span class="sub">restart / command / watchdog · this box or any connected box</span></h3>
+      <table class="tbl"><thead><tr><th>On</th><th>Job</th><th>Target</th><th>Action</th><th>Next</th><th>Last result</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="cols" style="grid-template-columns:1.4fr 1fr">
+      <div class="panel"><h3>New job</h3>
+        <div class="frow"><div class="flabel">Trigger</div><div class="fctrl"><select id="njTrig" onchange="schedFormSync()"><option value="time">Time schedule</option><option value="on_crash">On crash (watchdog)</option></select></div></div>
+        <div class="frow" id="njWhenRow"><div class="flabel">When <span class="unit">cron / every / daily</span></div><div class="fctrl"><input type="text" id="njWhen" placeholder="0 4 * * *   ·   every:2h   ·   daily:04:00"></div></div>
+        <div class="frow" id="njTriesRow" style="display:none"><div class="flabel">Max restarts · cooldown s</div><div class="fctrl"><input type="text" id="njTries" value="3" class="snum"> <input type="text" id="njCool" value="60" class="snum"></div></div>
+        <div class="frow"><div class="flabel">Box</div><div class="fctrl"><select id="njBox">${boxopts}</select></div></div>
+        <div class="frow"><div class="flabel">Target bot <span class="unit">name or all</span></div><div class="fctrl"><input type="text" id="njTarget" value="all"></div></div>
+        <div class="frow"><div class="flabel">Action</div><div class="fctrl"><select id="njAction" onchange="schedFormSync()"><option value="restart">Restart</option><option value="start">Start</option><option value="stop">Stop</option><option value="command">Send command</option></select></div></div>
+        <div class="frow" id="njCmdRow" style="display:none"><div class="flabel">Command</div><div class="fctrl"><input type="text" id="njCmd" placeholder="fly resupplyspares"></div></div>
+        <div class="frow"><div class="flabel">Name <span class="unit">optional</span></div><div class="fctrl"><input type="text" id="njName" placeholder="Nightly restart"></div></div>
+        <div class="frow"><div class="flabel">Notify on Discord</div><div class="fctrl"><div class="tgl" id="njNotify" onclick="this.classList.toggle('on')"></div></div></div>
+        <div class="mbar" style="margin-top:.6rem"><span class="msg" id="njMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="schedAdd()">+ Add job</button></div></div>
+      <div class="panel"><h3>Discord notifications</h3>
+        <div class="hint" style="margin-bottom:.5rem">Webhook pinged when a job runs/fails or the watchdog restarts a bot (only jobs with <b>Notify</b> on).</div>
+        <input type="text" id="njHook" placeholder="https://discord.com/api/webhooks/…" value="${esc(SCHEDHOOK)}" style="width:100%;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.5rem .6rem">
+        <div class="mbar" style="margin-top:.6rem"><span class="msg" id="hookMsg" style="color:var(--dim);flex:1"></span><button onclick="schedSaveHook()">Save webhook</button></div>
+        <div class="hint" style="margin-top:.9rem">Schedule examples: <code>every:30m</code>, <code>daily:04:00</code>, cron <code>0 */6 * * *</code> (every 6h). For resupply, use action <b>Send command</b> with <code>fly resupplyspares</code>.</div></div>
+    </div>`;
+  schedFormSync();
+}
+function schedFormSync(){
+  if(!$('njTrig'))return;
+  $('njWhenRow').style.display=($('njTrig').value==='time')?'':'none';
+  $('njTriesRow').style.display=($('njTrig').value==='on_crash')?'':'none';
+  $('njCmdRow').style.display=($('njAction').value==='command')?'':'none';
+}
+async function schedPersist(msgEl){
+  const d=await api('/api/settings','POST',{schedules:{notify_webhook:SCHEDHOOK, jobs:SCHEDJOBS}});
+  if(d.error){ if(msgEl){msgEl.style.color='var(--crash)';msgEl.textContent='✗ '+d.error;} return false; }
+  if(d.settings&&d.settings.schedules){ SCHEDJOBS=d.settings.schedules.jobs||SCHEDJOBS; SCHEDHOOK=d.settings.schedules.notify_webhook||''; }
+  return true;
+}
+async function schedAdd(){
+  const t=$('njTrig').value, action=$('njAction').value;
+  const job={trigger:t, box:$('njBox').value, target:($('njTarget').value.trim()||'all'),
+    action:action, command:$('njCmd')?$('njCmd').value.trim():'', name:$('njName').value.trim(),
+    notify:$('njNotify').classList.contains('on'), enabled:true};
+  if(t==='time'){ job.when=$('njWhen').value.trim(); if(!job.when){ $('njMsg').style.color='var(--crash)'; $('njMsg').textContent='enter a schedule'; return; } }
+  else { job.max_tries=parseInt($('njTries').value)||3; job.cooldown=parseInt($('njCool').value)||60; }
+  if(action==='command'&&!job.command){ $('njMsg').style.color='var(--crash)'; $('njMsg').textContent='enter a command'; return; }
+  SCHEDJOBS.push(job); $('njMsg').style.color='var(--dim)'; $('njMsg').textContent='saving…';
+  if(await schedPersist($('njMsg'))) renderAutomationView(); else SCHEDJOBS.pop();
+}
+async function schedToggle(id){ const j=SCHEDJOBS.find(x=>x.id===id); if(!j)return; j.enabled=!j.enabled; if(await schedPersist())schedDraw(); }
+async function schedDelete(id){ if(!confirm('Delete this job?'))return; SCHEDJOBS=SCHEDJOBS.filter(x=>x.id!==id); if(await schedPersist())renderAutomationView(); }
+async function schedRun(id){ const d=await api('/api/schedules/run','POST',{id}); if(d.error)alert('Run failed: '+d.error); else setTimeout(renderAutomationView,500); }
+async function schedSaveHook(){ SCHEDHOOK=$('njHook').value.trim(); $('hookMsg').textContent='saving…'; if(await schedPersist($('hookMsg'))){ $('hookMsg').style.color='var(--dim)'; $('hookMsg').textContent='✓ saved'; } }
 
 /* settings → appearance: sidebar picker */
 function pickSidebar(v){ SELSIDEBAR=v; document.querySelectorAll('#sidebarRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.sb===v)); previewLayout(); }

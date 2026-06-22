@@ -4,7 +4,7 @@ A control plane for a whole VPS of **AquariusProxy** and **ZenithProxy** bots �
 
 AquariusProxy is a ZenithProxy fork, so they share the same launch model and config structure; this manager drives either (or a custom fork) on the same host.
 
-**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer · **multi-VPS controller** (connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, fleet-wide bulk actions, DigitalOcean connect/provision/destroy) · in-place self-update · config backup/restore · themes + custom background · **selectable sidebar navigation** (icon rail / full / command center, left- or right-oriented) with dedicated **Fleet, Activity and per-bot Telemetry** pages and a **⌘K command palette** that searches your bots across every connected box.
+**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer · **multi-VPS controller** (connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, fleet-wide bulk actions, DigitalOcean connect/provision/destroy) · in-place self-update · config backup/restore · themes + custom background · **selectable sidebar navigation** (icon rail / full / command center, left- or right-oriented) with dedicated **Fleet, Activity and per-bot Telemetry** pages and a **⌘K command palette** that searches your bots across every connected box · an **Automation** scheduler (cron / interval / daily jobs + an on-crash auto-restart watchdog, this box or cross-box, with optional Discord notifications).
 
 ![Aquarius Bot Manager dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard.png)
 
@@ -17,6 +17,10 @@ Pick a layout in **Settings → Appearance** — the classic header, or a sideba
 Hit **⌘K** (Ctrl-K) anywhere to search bots — on this box *and* every connected box — and jump straight to a bot or a page:
 
 ![⌘K command palette](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/command-palette.png)
+
+Schedule restarts/commands (cron · `every:2h` · `daily:04:00`), auto-restart crashed bots, and get pinged on Discord — on this box or across your fleet — from the **Automation** page:
+
+![Automation scheduler](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/automation.png)
 
 ## Files
 - `manager.py` — the program (CLI + web server, single source of truth)

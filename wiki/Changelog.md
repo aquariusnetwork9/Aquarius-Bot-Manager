@@ -2,7 +2,17 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.5.1 — *latest*
+## v1.6.0 — *latest*
+
+- **Automation — scheduled actions + an on-crash watchdog.** A new **Automation** page (stored in `settings.schedules`) runs jobs on the controller every ~30 s:
+  - **Time schedules** — cron (`0 4 * * *`), `every:30m` / `every:2h`, or `daily:HH:MM`.
+  - **On-crash watchdog** — auto-restart a crashed bot up to *N* times with a cooldown, then back off.
+  - **Actions** — restart / start / stop / send a console command (e.g. `fly resupplyspares`), against one bot or all.
+  - **Cross-box** — target this box, a specific connected box, or **all boxes** (runs over the controller's node tunnels).
+  - **Discord notifications** — an optional webhook pinged when a job runs/fails or the watchdog restarts a bot.
+  - Add / enable / disable / delete jobs and **Run now** from the UI; jobs ride along with config backup/restore.
+
+## v1.5.1
 
 - **Fixed: a connected box could show "offline" in the Fleet view while it was actually reachable.** After a manager restart (e.g. `abm selfupdate`), the previous SSH tunnel was orphaned but kept holding the loopback port, so the new managed tunnel couldn't bind — the supervisor then reported the box as down and couldn't self-heal if the orphan later died. The tunnel supervisor now reaps any stale/orphaned tunnel on the port before spawning, so boxes reconnect cleanly after every restart (and zombie `ssh` children are reaped).
 - **The command-center search bar now works** — press **⌘K** (Ctrl-K) anywhere to open a command palette that searches bots on this box *and* on every connected box, then jumps to a bot's telemetry/console or any page.
