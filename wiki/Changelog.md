@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.5.0 — *latest*
+## v1.5.1 — *latest*
+
+- **Fixed: a connected box could show "offline" in the Fleet view while it was actually reachable.** After a manager restart (e.g. `abm selfupdate`), the previous SSH tunnel was orphaned but kept holding the loopback port, so the new managed tunnel couldn't bind — the supervisor then reported the box as down and couldn't self-heal if the orphan later died. The tunnel supervisor now reaps any stale/orphaned tunnel on the port before spawning, so boxes reconnect cleanly after every restart (and zombie `ssh` children are reaped).
+- **The command-center search bar now works** — press **⌘K** (Ctrl-K) anywhere to open a command palette that searches bots on this box *and* on every connected box, then jumps to a bot's telemetry/console or any page.
+
+## v1.5.0
 
 - **Selectable sidebar navigation** — choose a layout in **Settings → Appearance**: the classic header (*off*), a compact **icon rail**, a **full** labeled sidebar with pinned live CPU / memory / disk vitals, or a **command center** with a search palette, a live crash alert and a live bot roster — each **left- or right-oriented**. Defaults to the full sidebar on the left; switch back to the classic header anytime (nothing is removed).
 - **Fleet page** — a full-page multi-box overview: per-box health gauges and bot counts (offline boxes included), fleet totals, and a table of the bots on this box. Promotes the Boxes status view to a first-class page.

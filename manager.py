@@ -36,6 +36,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -46,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2245,6 +2246,7 @@ def fleet_aggregate(cfg, timeout=8):
         rows.append({"name": CONTROLLER_ROW, "controller": True, "reachable": True,
                      "bots": len(insts),
                      "running": sum(1 for i in insts if instance_status(i) == "running"),
+                     "bot_names": [i.get("name") for i in insts],
                      "host": _sysinfo()})
     except Exception as e:
         rows.append({"name": CONTROLLER_ROW, "controller": True, "reachable": False,
@@ -2257,6 +2259,7 @@ def fleet_aggregate(cfg, timeout=8):
             row["reachable"] = True
             row["bots"] = len(inst)
             row["running"] = sum(1 for i in inst if i.get("status") == "running")
+            row["bot_names"] = [i.get("name") for i in inst]
             try:
                 row["host"] = node_request(n, "GET", "/api/system/info", timeout=timeout)
             except Exception:
@@ -2546,12 +2549,48 @@ class TunnelManager:
             p = self._procs.get(name)
             if p and p.poll() is None:
                 return
+            if p:
+                try:
+                    p.wait(timeout=0)        # reap our dead child so it isn't left a zombie
+                except Exception:
+                    pass
+            # A prior manager that exited under systemd KillMode=process leaves its
+            # `ssh -N -L 127.0.0.1:<port>` tunnel orphaned (reparented to init) but still
+            # holding the loopback port. With ExitOnForwardFailure=yes a fresh tunnel then
+            # can't bind, so the supervisor would loop forever spawning dead children while
+            # the unmanaged orphan does the forwarding (tunnel reported down, no self-heal
+            # if it dies). Reap any stale tunnel on this port first so our managed one binds.
+            self._kill_stale(node.get("local_port"))
             try:
                 self._procs[name] = subprocess.Popen(
                     self._ssh_cmd(node), stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
             except Exception:
                 self._procs.pop(name, None)
+
+    def _kill_stale(self, port):
+        """SIGTERM any ssh tunnel forwarding this loopback port that we don't own
+        (orphaned by a KillMode=process restart), so a fresh managed tunnel can bind."""
+        if not port:
+            return
+        ours = {pp.pid for pp in self._procs.values() if pp and pp.poll() is None}
+        try:
+            out = subprocess.run(["pgrep", "-f", f"ssh -N.*-L 127.0.0.1:{port}:"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 timeout=5).stdout.decode()
+        except Exception:
+            return
+        for tok in out.split():
+            try:
+                pid = int(tok)
+            except ValueError:
+                continue
+            if pid in ours:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
 
     def drop(self, name):
         with self._lock:
@@ -4659,6 +4698,19 @@ table.tbl tr:hover td{background:#ffffff05}
 .ev .eb .tag{font-family:var(--mono);font-size:.61rem;color:var(--dim);margin-right:.4rem;border:1px solid var(--line);border-radius:5px;padding:.02rem .35rem}
 .filters{display:flex;gap:.4rem;flex-wrap:wrap;margin:.7rem 0 .4rem}
 .previewbanner{display:flex;align-items:center;gap:.6rem;border:1px dashed #5a3b1f;background:#ffb4540d;color:var(--warn);border-radius:10px;padding:.6rem .8rem;margin:.8rem 0;font-size:.82rem}
+/* command palette (⌘K search) */
+.palscrim{position:fixed;inset:0;background:#000a;backdrop-filter:blur(3px);display:none;z-index:40}
+.palscrim.open{display:block}
+.palbox{position:fixed;left:50%;top:13vh;transform:translateX(-50%);width:min(640px,94vw);background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 60px #000b;z-index:41;overflow:hidden}
+.palbox input{width:100%;border:none;border-bottom:1px solid var(--line);background:#06090c;color:var(--txt);font-family:var(--sans);font-size:1rem;padding:.9rem 1rem;outline:none}
+.palresults{max-height:52vh;overflow:auto;padding:.35rem}
+.palitem{display:flex;align-items:center;gap:.6rem;padding:.55rem .7rem;border-radius:9px;cursor:pointer}
+.palitem.sel{background:#3ddc9714}
+.palitem .pic{width:1.2rem;text-align:center;flex:none}
+.palitem .pl{flex:1;font-size:.88rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.palitem .pd{font-family:var(--mono);font-size:.66rem;color:var(--dim)}
+.palitem .pk{font-family:var(--mono);font-size:.6rem;color:var(--dim);border:1px solid var(--line);border-radius:5px;padding:.05rem .35rem;white-space:nowrap}
+.palhint{padding:.45rem .85rem;font-family:var(--mono);font-size:.62rem;color:#586675;border-top:1px solid var(--line);display:flex;gap:1rem}
 </style>
 </head>
 <body>
@@ -5180,6 +5232,14 @@ table.tbl tr:hover td{background:#ffffff05}
     <button id="cfgSave" class="go" style="display:none" onclick="saveCfg()">Save</button>
   </div>
 </aside>
+
+<div class="palscrim" id="palScrim" onclick="closePalette(event)">
+  <div class="palbox" onclick="event.stopPropagation()">
+    <input id="palInput" placeholder="Search bots &amp; jump to a page…  (type a bot name)" autocomplete="off" spellcheck="false" oninput="palRender()" onkeydown="palKey(event)">
+    <div class="palresults" id="palResults"></div>
+    <div class="palhint"><span>↑↓ navigate</span><span>↵ open</span><span>esc close</span><span id="palScope" style="margin-left:auto"></span></div>
+  </div>
+</div>
 
 <script>
 let CUR=null, TAB='logs', logTimer=null, INSTMAP={};
@@ -5736,7 +5796,7 @@ function renderSidebar(ui){
   let h=sbBrand();
   if(style!=='cmd') h+=sbBox();
   if(style==='cmd'){
-    h+='<div class="spalette">🔍 Search bots… <span class="kbd">⌘K</span></div>';
+    h+='<div class="spalette" onclick="openPalette()">🔍 Search bots… <span class="kbd">⌘K</span></div>';
     h+='<div class="salert" id="sbAlert" onclick="showView(\'activity\')">checking…</div>';
   }
   h+=navHtml();
@@ -5994,6 +6054,65 @@ function renderAutomationView(){
 function pickSidebar(v){ SELSIDEBAR=v; document.querySelectorAll('#sidebarRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.sb===v)); previewLayout(); }
 function pickSide(v){ SELSIDE=v; previewLayout(); }
 function previewLayout(){ renderSidebar({sidebar:SELSIDEBAR,sidebar_side:SELSIDE}); }
+
+/* ⌘K command palette — search bots (this box + across connected boxes) + jump to pages */
+let PAL=[], PALSEL=0, PALFLEET=null;
+function palHasSidebar(){ return !!(SETTINGS&&SETTINGS.ui&&SETTINGS.ui.sidebar&&SETTINGS.ui.sidebar!=='off'); }
+async function openPalette(){
+  $('palScrim').classList.add('open');
+  const i=$('palInput'); i.value=''; PALSEL=0; palRender();
+  setTimeout(()=>i.focus(),30);
+  try{ const d=await api('/api/fleet/status'); PALFLEET=(d&&d.fleet)||[]; palRender(); }catch(e){}
+}
+function closePalette(e){ if(e&&e.target!==$('palScrim'))return; $('palScrim').classList.remove('open'); }
+function palItems(){
+  const items=[], side=palHasSidebar();
+  Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{}).forEach(b=>{
+    items.push({kind:'bot',lbl:b.name,box:'this box',dot:b.status,
+      go:()=>{ side?showView('telemetry',b.name):openDrawer(b.name); }});
+  });
+  (PALFLEET||[]).filter(r=>!r.controller&&r.reachable&&Array.isArray(r.bot_names)).forEach(r=>{
+    r.bot_names.forEach(nm=>{ if(nm) items.push({kind:'xbot',lbl:nm,box:r.name,go:()=>openNode(r.name)}); });
+  });
+  const modal=[
+    {ic:'🖥',lbl:'Boxes',go:()=>openBoxes()},{ic:'🌐',lbl:'Proxies',go:()=>openProxies()},
+    {ic:'🚀',lbl:'Deploy',go:()=>openDeploy()},{ic:'📁',lbl:'Files',go:()=>openFiles()},
+    {ic:'🔗',lbl:'Connect',go:()=>openConnection()},{ic:'⟲',lbl:'Scan existing',go:()=>openScan()},
+    {ic:'⚙',lbl:'Settings',go:()=>openSettings()},
+  ];
+  const views=[
+    {ic:'▦',lbl:'Dashboard',go:()=>showView('dashboard')},{ic:'❖',lbl:'Fleet',go:()=>showView('fleet')},
+    {ic:'⚡',lbl:'Activity & alerts',go:()=>showView('activity')},{ic:'⏱',lbl:'Automation',go:()=>showView('automation')},
+  ];
+  (side?views.concat(modal):modal).forEach(p=>items.push(Object.assign({kind:'page'},p)));
+  const q=($('palInput').value||'').trim().toLowerCase();
+  return q?items.filter(it=>it.lbl.toLowerCase().includes(q)||(it.box&&it.box.toLowerCase().includes(q))):items;
+}
+function palRender(){
+  PAL=palItems(); if(PALSEL>=PAL.length)PALSEL=Math.max(0,PAL.length-1);
+  const box=$('palResults');
+  if(!PAL.length){ box.innerHTML='<div class="palhint" style="border:none">No matches.</div>'; }
+  else box.innerHTML=PAL.map((it,idx)=>{
+    let ic, tag;
+    if(it.kind==='page'){ ic=it.ic; tag='<span class="pk">page</span>'; }
+    else if(it.kind==='bot'){ const c=it.dot==='running'?'var(--run)':(it.dot==='crashed'?'var(--crash)':'var(--dim)');
+      ic=`<span style="color:${c}">●</span>`; tag='<span class="pk">bot · this box</span>'; }
+    else { ic='<span style="color:var(--dim)">●</span>'; tag=`<span class="pk">bot · ${esc(it.box)}</span>`; }
+    return `<div class="palitem ${idx===PALSEL?'sel':''}" onclick="palPick(${idx})" onmousemove="if(PALSEL!=${idx}){PALSEL=${idx};palHi();}"><span class="pic">${ic}</span><span class="pl">${esc(it.lbl)}</span>${tag}</div>`;
+  }).join('');
+  const sc=$('palScope'); if(sc) sc.textContent=PALFLEET?(PALFLEET.filter(r=>r.reachable).length+' box(es)'):'this box';
+}
+function palHi(){ document.querySelectorAll('#palResults .palitem').forEach((el,idx)=>el.classList.toggle('sel',idx===PALSEL)); const s=document.querySelector('#palResults .palitem.sel'); if(s)s.scrollIntoView({block:'nearest'}); }
+function palPick(idx){ const it=PAL[idx]; if(!it)return; closePalette(); try{ it.go(); }catch(e){} }
+function palKey(e){
+  if(e.key==='Escape'){ closePalette(); }
+  else if(e.key==='ArrowDown'){ e.preventDefault(); PALSEL=Math.min(PAL.length-1,PALSEL+1); palHi(); }
+  else if(e.key==='ArrowUp'){ e.preventDefault(); PALSEL=Math.max(0,PALSEL-1); palHi(); }
+  else if(e.key==='Enter'){ e.preventDefault(); palPick(PALSEL); }
+}
+document.addEventListener('keydown',function(e){
+  if((e.metaKey||e.ctrlKey)&&(e.key==='k'||e.key==='K')){ e.preventDefault(); openPalette(); }
+});
 
 let PROXROWS=[], BULKSEL=new Set();
 let CONN={port:8765,user:'ubuntu',public_ip:''};

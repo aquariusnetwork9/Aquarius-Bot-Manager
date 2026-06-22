@@ -4,11 +4,19 @@ A control plane for a whole VPS of **AquariusProxy** and **ZenithProxy** bots �
 
 AquariusProxy is a ZenithProxy fork, so they share the same launch model and config structure; this manager drives either (or a custom fork) on the same host.
 
-**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer · **multi-VPS controller** (connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, fleet-wide bulk actions, DigitalOcean connect/provision/destroy) · in-place self-update · config backup/restore · themes + custom background.
+**Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer · **multi-VPS controller** (connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, fleet-wide bulk actions, DigitalOcean connect/provision/destroy) · in-place self-update · config backup/restore · themes + custom background · **selectable sidebar navigation** (icon rail / full / command center, left- or right-oriented) with dedicated **Fleet, Activity and per-bot Telemetry** pages and a **⌘K command palette** that searches your bots across every connected box.
 
 ![Aquarius Bot Manager dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard.png)
 
-*One card per bot (status, live CPU/RAM, start/stop/restart) under a host gauge strip; the header carries Deploy, Proxies, Files, **Boxes**, Settings and bulk lifecycle. Full screenshot tour in the [wiki](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki).*
+*One card per bot (status, live CPU/RAM, start/stop/restart) under a host gauge strip; bulk lifecycle, Deploy, Proxies, Files, **Boxes** and Settings are one click away. Full screenshot tour in the [wiki](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki).*
+
+Pick a layout in **Settings → Appearance** — the classic header, or a sidebar (icon rail / full with pinned host vitals / command center with a live bot roster), left or right:
+
+![Sidebar layout with the Fleet page](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/sidebar-full.png)
+
+Hit **⌘K** (Ctrl-K) anywhere to search bots — on this box *and* every connected box — and jump straight to a bot or a page:
+
+![⌘K command palette](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/command-palette.png)
 
 ## Files
 - `manager.py` — the program (CLI + web server, single source of truth)
