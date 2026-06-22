@@ -2,7 +2,16 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.4.0 — *latest*
+## v1.5.0 — *latest*
+
+- **Selectable sidebar navigation** — choose a layout in **Settings → Appearance**: the classic header (*off*), a compact **icon rail**, a **full** labeled sidebar with pinned live CPU / memory / disk vitals, or a **command center** with a search palette, a live crash alert and a live bot roster — each **left- or right-oriented**. Defaults to the full sidebar on the left; switch back to the classic header anytime (nothing is removed).
+- **Fleet page** — a full-page multi-box overview: per-box health gauges and bot counts (offline boxes included), fleet totals, and a table of the bots on this box. Promotes the Boxes status view to a first-class page.
+- **Activity & alerts page** — a live snapshot across the box: crashes, resource-threshold breaches, and proxy-console issues, with at-a-glance counts. (A persistent historical event log is coming next.)
+- **Telemetry page** — per-bot detail: live status / CPU / memory / process tiles, a live CPU chart, and an embedded console tail, with a bot switcher. Open it by clicking a bot in the Fleet table or the command-center roster.
+- **Automation page** *(preview)* — the planned layout for scheduled actions and auto-recovery is visible as a preview; the scheduler backend lands in a later release.
+- **Console log fix** — each instance's live console is now its own scroll area, so a long log no longer clips the top/bottom or pushes the command bar off-screen, and the command bar stays pinned. Scrolling up **pauses** auto-follow (so you can read back) and a **"jump to latest"** pill returns you to the live tail.
+
+## v1.4.0
 
 - **Multi-VPS controller** — one manager can drive your other boxes. Each other box runs the same manager in lightweight **node mode** (`ABM_ACCESS=node`, bound to `127.0.0.1`), reached over a self-healing **controller-managed SSH tunnel** — nodes are never exposed publicly. See **[[Multi-VPS Controller]]**.
   - **🖥 Boxes** panel: connect a box by pasting `user@host`, list/remove boxes, and a live **Fleet view** (reachable, bots running, host load/mem) with fleet-wide **Start / Restart / Stop all** and **Update all nodes**.

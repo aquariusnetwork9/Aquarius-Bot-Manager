@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1619,6 +1619,10 @@ def get_settings(cfg):
             "bg_dim": s.get("theme", {}).get("bg_dim", 0.6),
             "density": s.get("theme", {}).get("density", ""),
         },
+        "ui": {
+            "sidebar": s.get("ui", {}).get("sidebar", "full"),
+            "sidebar_side": s.get("ui", {}).get("sidebar_side", "left"),
+        },
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
@@ -1632,7 +1636,7 @@ def get_settings(cfg):
 
 
 def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None,
-                  thresholds=None):
+                  thresholds=None, ui=None):
     s = cfg["raw"].setdefault("settings", {})
     if theme is not None:
         t = s.setdefault("theme", {})
@@ -1689,6 +1693,20 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
                     raise ValueError(f"{k} must be a number")
                 cur[k] = max(1, min(100, v))
         s["thresholds"] = cur
+    if ui is not None:
+        if not isinstance(ui, dict):
+            raise ValueError("ui must be an object")
+        u = s.setdefault("ui", {})
+        if "sidebar" in ui:
+            sb = (ui["sidebar"] or "").strip()
+            if sb not in ("off", "rail", "full", "cmd"):
+                raise ValueError("sidebar must be off, rail, full or cmd")
+            u["sidebar"] = sb
+        if "sidebar_side" in ui:
+            sd = (ui["sidebar_side"] or "").strip()
+            if sd not in ("left", "right"):
+                raise ValueError("sidebar_side must be left or right")
+            u["sidebar_side"] = sd
     save_config(cfg)
     return get_settings(cfg)
 
@@ -3151,7 +3169,8 @@ class Handler(BaseHTTPRequestHandler):
                 out = save_settings(cfg, theme=p.get("theme"),
                                     system_actions_enabled=p.get("system_actions_enabled"),
                                     console_presets=p.get("console_presets"),
-                                    thresholds=p.get("thresholds"))
+                                    thresholds=p.get("thresholds"),
+                                    ui=p.get("ui"))
                 return self._json({"ok": True, "settings": out})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
@@ -4420,8 +4439,20 @@ main{padding:1.6rem;max-width:1200px;margin:0 auto}
   cursor:pointer;font-weight:600;font-size:.85rem}
 .tab.active{color:var(--acc);border-color:var(--acc)}
 .drawer .body{flex:1;overflow:auto;padding:1.2rem}
+/* console tab: log box is its own internal scroller so the command bar stays pinned
+   and a long log never pushes content past the drawer (no more top/bottom cutoff) */
+#tabLogs{display:flex;flex-direction:column;height:100%}
+#logWrap{position:relative;flex:1;min-height:0;display:flex}
 pre.log{font-family:var(--mono);font-size:.74rem;line-height:1.5;white-space:pre-wrap;word-break:break-word;
-  background:#06090c;border:1px solid var(--line);border-radius:10px;padding:.9rem;margin:0;color:#b9c7d2}
+  background:#06090c;border:1px solid var(--line);border-radius:10px;padding:.9rem;margin:0;color:#b9c7d2;
+  flex:1;min-height:0;overflow:auto;overflow-anchor:none}
+/* follow-tail "jump to latest" pill — shown only when the user has scrolled up (paused) */
+.logpill{position:absolute;left:50%;bottom:.8rem;transform:translateX(-50%);
+  background:var(--acc);color:#062014;border:1px solid var(--acc);border-radius:20px;
+  padding:.34rem .8rem;font-size:.72rem;font-weight:700;cursor:pointer;
+  box-shadow:0 6px 18px #000a;display:flex;align-items:center;gap:.35rem;animation:pillin .18s ease-out}
+.logpill:hover{transform:translateX(-50%) translateY(-1px);border-color:var(--acc)}
+@keyframes pillin{from{opacity:0;transform:translateX(-50%) translateY(6px)}}
 textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;line-height:1.5;
   background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:10px;padding:.9rem;resize:vertical}
 /* live command bar */
@@ -4531,10 +4562,108 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .cstats .cs .b{height:4px;border-radius:3px;background:#ffffff14;margin-top:.25rem;overflow:hidden}
 .cstats .cs .b i{display:block;height:100%;background:var(--acc);transition:width .4s}
 .cstats .cs.warn .b i{background:var(--warn)} .cstats .cs.crit .b i{background:var(--crash)}
+/* ===== sidebar shell (v1.5 — selectable in Settings → Appearance) ===== */
+.app{display:flex;min-height:100vh;align-items:stretch}
+.app.right{flex-direction:row-reverse}
+.content{flex:1;min-width:0;display:flex;flex-direction:column}
+.app.has-side .content main{max-width:none;margin:0;width:100%}
+.side{flex:none;background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;width:238px}
+.app.right .side{border-right:none;border-left:1px solid var(--line)}
+.sbrand{display:flex;align-items:center;gap:.6rem;padding:1.05rem 1rem .7rem;font-weight:800;letter-spacing:-.02em;font-size:1.02rem}
+.sbrand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc);flex:none}
+.sbrand .txt small{display:block;font-family:var(--mono);font-weight:400;color:var(--dim);font-size:.6rem;letter-spacing:0}
+.boxchip{margin:0 .8rem .55rem;display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;border:1px solid var(--line);border-radius:10px;background:var(--panel-2);cursor:pointer;font-size:.8rem}
+.boxchip .bdot{width:8px;height:8px;border-radius:50%;background:var(--run);box-shadow:0 0 8px var(--run);flex:none}
+.boxchip .car{margin-left:auto;color:var(--dim);font-size:.7rem}
+.nav{display:flex;flex-direction:column;gap:.12rem;padding:.3rem .6rem}
+.navg{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.14em;color:#586675;padding:.7rem .65rem .25rem}
+.nav a{display:flex;align-items:center;gap:.75rem;padding:.55rem .65rem;border-radius:9px;color:var(--dim);font-weight:600;font-size:.86rem;text-decoration:none;cursor:pointer;position:relative;white-space:nowrap}
+.nav a:hover{background:#ffffff08;color:var(--txt)}
+.nav a.active{background:#3ddc9714;color:var(--acc)}
+.nav a .ic{width:1.15rem;text-align:center;font-size:1.02rem;flex:none}
+.nav a .pip{margin-left:auto;font-family:var(--mono);font-size:.58rem;color:var(--dim);background:#ffffff10;border-radius:10px;padding:.05rem .42rem}
+.nav a.active .pip{color:var(--acc);background:#3ddc9722}
+.nav a .pip.warn{color:var(--warn);background:#ffb45420}
+.sgrow{flex:1}
+.sfoot{padding:.5rem .6rem;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:.12rem}
+.side.rail{width:64px}
+.side.rail .sbrand{justify-content:center;padding:1.05rem 0 .7rem}
+.side.rail .sbrand .txt,.side.rail .navg,.side.rail .nav a .lbl,.side.rail .nav a .pip,
+.side.rail .boxchip .txt,.side.rail .boxchip .car,.side.rail .sfoot .lbl,.side.rail .squick{display:none}
+.side.rail .nav a{justify-content:center;padding:.62rem 0}
+.side.rail .boxchip{justify-content:center;padding:.5rem 0;margin:0 .55rem .55rem}
+.side.rail .nav a.active{box-shadow:inset 3px 0 0 var(--acc)}
+.app.right .side.rail .nav a.active{box-shadow:inset -3px 0 0 var(--acc)}
+.railtoggle{margin:.25rem .55rem .35rem;text-align:center;color:var(--dim);cursor:pointer;font-size:.85rem;border:1px dashed var(--line);border-radius:8px;padding:.32rem 0}
+.svitals{padding:.55rem .8rem;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:.5rem}
+.svit .k{font-family:var(--mono);font-size:.57rem;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);display:flex;justify-content:space-between}
+.svit .b{height:5px;border-radius:3px;background:#ffffff14;overflow:hidden;margin-top:.22rem}
+.svit .b i{display:block;height:100%;background:var(--acc);transition:width .4s}
+.svit.warn .b i{background:var(--warn)} .svit.crit .b i{background:var(--crash)}
+.squick{display:flex;gap:.4rem;padding:.45rem .8rem .1rem}
+.squick button{flex:1;padding:.42rem 0;font-size:.74rem}
+.spalette{margin:.15rem .8rem .55rem;display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;border:1px solid var(--line);border-radius:10px;background:#06090c;color:var(--dim);font-family:var(--mono);font-size:.72rem;cursor:text}
+.spalette .kbd{margin-left:auto;font-size:.58rem;border:1px solid var(--line);border-radius:5px;padding:.05rem .32rem}
+.salert{margin:0 .8rem .55rem;display:flex;align-items:center;gap:.5rem;font-size:.75rem;color:var(--warn);border:1px solid #5a3b1f;border-radius:9px;padding:.45rem .6rem;background:#ffb4540d;cursor:pointer}
+.roster{flex:1;overflow:auto;padding:.1rem .6rem .5rem}
+.rhd{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.12em;color:#586675;padding:.55rem .45rem .3rem;display:flex;justify-content:space-between}
+.rrow{display:flex;align-items:center;gap:.55rem;padding:.42rem .5rem;border-radius:8px;cursor:pointer}
+.rrow:hover{background:#ffffff08}
+.rrow.sel{background:#3ddc9714}
+.rrow .rd{width:8px;height:8px;border-radius:50%;flex:none;background:var(--stop)}
+.rrow.run .rd{background:var(--run);box-shadow:0 0 7px var(--run)}
+.rrow.crash .rd{background:var(--crash);box-shadow:0 0 7px var(--crash)}
+.rrow .rn{flex:1;font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rrow .rc{font-family:var(--mono);font-size:.6rem;color:var(--dim)}
+.topbar{display:flex;align-items:center;gap:.9rem;padding:.95rem 1.6rem;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0a0e12cc;backdrop-filter:blur(8px);z-index:5}
+.topbar .pt{font-weight:800;font-size:1.08rem;letter-spacing:-.02em}
+.topbar .sub{font-family:var(--mono);font-size:.64rem;color:var(--dim)}
+.topbar .sp{flex:1}
+/* ===== new-page widgets ===== */
+.pagehd{display:flex;align-items:baseline;gap:.8rem;margin-bottom:.1rem;flex-wrap:wrap}
+.pagehd h1{font-size:1.5rem;margin:0;letter-spacing:-.02em}
+.pagehd .sub{font-family:var(--mono);font-size:.7rem;color:var(--dim)}
+.sumstrip{display:flex;gap:.7rem;flex-wrap:wrap;margin:1rem 0}
+.sumstrip .s{flex:1;min-width:128px;background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:12px;padding:.7rem .9rem}
+.sumstrip .s .k{font-family:var(--mono);font-size:.59rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+.sumstrip .s .v{font-weight:800;font-size:1.45rem;margin-top:.1rem;letter-spacing:-.02em}
+.sumstrip .s.good .v{color:var(--acc)} .sumstrip .s.bad .v{color:var(--crash)} .sumstrip .s.warnv .v{color:var(--warn)}
+table.tbl{width:100%;border-collapse:collapse;font-size:.82rem}
+table.tbl th{font-family:var(--mono);font-size:.59rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);text-align:left;padding:.55rem .7rem;border-bottom:1px solid var(--line)}
+table.tbl td{padding:.55rem .7rem;border-bottom:1px solid #ffffff08}
+table.tbl tr:hover td{background:#ffffff05}
+.panel{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:14px;padding:1.1rem 1.2rem}
+.panel h3{margin:0 0 .85rem;font-size:.95rem;letter-spacing:-.01em;display:flex;align-items:center;gap:.5rem}
+.panel h3 .sub{font-family:var(--mono);font-size:.62rem;color:var(--dim);font-weight:400;margin-left:auto}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.cols3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:.7rem;margin:1rem 0}
+.tile{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:12px;padding:.7rem .85rem}
+.tile .k{font-family:var(--mono);font-size:.57rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+.tile .v{font-weight:800;font-size:1.2rem;margin-top:.15rem}
+.tile .v small{font-size:.68rem;color:var(--dim);font-weight:600}
+.chart{width:100%;height:120px;display:block}
+.toggrow{display:flex;align-items:center;gap:.7rem;padding:.5rem 0;border-bottom:1px solid #ffffff08}
+.toggrow:last-child{border-bottom:none}
+.toggrow .tl{flex:1;font-size:.86rem}
+.toggrow .td{font-family:var(--mono);font-size:.62rem;color:var(--dim)}
+.feed{display:flex;flex-direction:column}
+.ev{display:flex;gap:.8rem;padding:.62rem .2rem;border-bottom:1px solid #ffffff08}
+.ev .when{font-family:var(--mono);font-size:.66rem;color:var(--dim);width:64px;flex:none;padding-top:.15rem}
+.ev .edot{width:9px;height:9px;border-radius:50%;flex:none;margin-top:.4rem;background:var(--stop)}
+.ev.ok .edot{background:var(--run)} .ev.warn .edot{background:var(--warn)}
+.ev.crit .edot{background:var(--crash)} .ev.info .edot{background:#5aa9e6}
+.ev .eb{flex:1;min-width:0}
+.ev .eb .m{font-size:.85rem}
+.ev .eb .tag{font-family:var(--mono);font-size:.61rem;color:var(--dim);margin-right:.4rem;border:1px solid var(--line);border-radius:5px;padding:.02rem .35rem}
+.filters{display:flex;gap:.4rem;flex-wrap:wrap;margin:.7rem 0 .4rem}
+.previewbanner{display:flex;align-items:center;gap:.6rem;border:1px dashed #5a3b1f;background:#ffb4540d;color:var(--warn);border-radius:10px;padding:.6rem .8rem;margin:.8rem 0;font-size:.82rem}
 </style>
 </head>
 <body>
-<header>
+<div class="app" id="app"><aside class="side" id="sidebar" style="display:none"></aside><div class="content" id="content">
+<header id="classicHeader">
   <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small class="ver">v__ABM_VERSION__</small> <small id="clock"></small></div>
   <div class="bulk">
     <button onclick="openSettings()">⚙ Settings</button>
@@ -4551,11 +4680,19 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     <button class="danger" onclick="location.href='/logout'">⎋ Log out</button>
   </div>
 </header>
+<div class="topbar" id="slimTop" style="display:none"></div>
 <main>
-  <div class="meta" id="meta">loading…</div>
-  <div class="hoststrip" id="hostStrip"></div>
-  <div class="grid" id="grid"></div>
+  <div id="viewDashboard">
+    <div class="meta" id="meta">loading…</div>
+    <div class="hoststrip" id="hostStrip"></div>
+    <div class="grid" id="grid"></div>
+  </div>
+  <div id="viewFleet" style="display:none"></div>
+  <div id="viewActivity" style="display:none"></div>
+  <div id="viewTelemetry" style="display:none"></div>
+  <div id="viewAutomation" style="display:none"></div>
 </main>
+</div></div>
 
 <div class="scrim" id="connScrim" onclick="closeConnection(event)">
   <div class="modal" style="width:min(560px,94vw)" onclick="event.stopPropagation()">
@@ -4853,6 +4990,17 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
     </div>
 
     <div id="stAp">
+      <div class="hint" style="margin-bottom:.4rem">Sidebar &amp; navigation</div>
+      <div id="sidebarRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem">
+        <div class="chip" data-sb="off" onclick="pickSidebar('off')">Off · classic header</div>
+        <div class="chip" data-sb="rail" onclick="pickSidebar('rail')">Icon rail</div>
+        <div class="chip" data-sb="full" onclick="pickSidebar('full')">Full</div>
+        <div class="chip" data-sb="cmd" onclick="pickSidebar('cmd')">Command center</div>
+      </div>
+      <div id="sideOrientRow" style="display:flex;gap:1rem;margin-bottom:.95rem;font-size:.84rem">
+        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="sbside" value="left" style="width:auto" onchange="pickSide('left')"> Left</label>
+        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="sbside" value="right" style="width:auto" onchange="pickSide('right')"> Right</label>
+      </div>
       <div class="hint" style="margin-bottom:.5rem">Theme preset</div>
       <div id="presetRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.9rem"></div>
       <label>Accent colour <span class="hint">blank = preset default</span>
@@ -4992,7 +5140,10 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   </div>
   <div class="body">
     <div id="tabLogs">
-      <pre class="log" id="logBox">…</pre>
+      <div id="logWrap">
+        <pre class="log" id="logBox" onscroll="onLogScroll()">…</pre>
+        <button id="logPill" class="logpill" style="display:none" onclick="jumpLogBottom()">↓ Jump to latest</button>
+      </div>
       <div id="presetBar" style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.6rem"></div>
       <div class="cmdbar">
         <span class="prompt">&gt;</span>
@@ -5049,7 +5200,7 @@ function fmtBytes(n){ if(!n)return'0'; if(n>=1e9)return (n/1e9).toFixed(1)+' GB'
 function thr(){ return (SETTINGS&&SETTINGS.thresholds)||{cpu_pct:85,mem_pct:85,disk_pct:90}; }
 function lvl(pct,t){ return pct>=Math.min(100,t+10)?'crit':(pct>=t?'warn':''); }
 let HOST=null;
-async function loadHost(){ try{ HOST=await api('/api/system/info'); }catch(e){ return; } renderHost(); }
+async function loadHost(){ try{ HOST=await api('/api/system/info'); }catch(e){ return; } renderHost(); updateSidebarLive(); }
 function gauge(label,pct,valstr,t){
   pct=Math.max(0,Math.min(100,Math.round(pct||0)));
   return `<div class="gauge ${lvl(pct,t)}"><div class="k"><span>${label}</span><span>${pct}%</span></div><div class="v">${valstr}</div><div class="b"><i style="width:${pct}%"></i></div></div>`;
@@ -5122,6 +5273,7 @@ async function refresh(){
         <button class="danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
       </div>
     </div>`).join('');
+  updateSidebarLive();
 }
 
 async function act(name,action,btn){
@@ -5160,7 +5312,7 @@ function showTab(t){
   $('cfgSave').style.display=t==='cfg'?'':'none';
   $('cfgSaveRestart').style.display=t==='cfg'?'':'none';
   if(logTimer){clearInterval(logTimer);logTimer=null;}
-  if(t==='logs'){renderPresetBar();loadLogs();logTimer=setInterval(loadLogs,3000);}
+  if(t==='logs'){renderPresetBar();logPinned=true;lastLogText=null;loadLogs();logTimer=setInterval(loadLogs,3000);}
   else if(t==='cfg'){loadCfg();}
   else if(t==='lim'){renderLimits();}
 }
@@ -5177,13 +5329,39 @@ async function sendPreset(i){
   $('drawerMsg').textContent='✓ sent: '+presets[i].command;
   setTimeout(loadLogs,250); setTimeout(loadLogs,1200);
 }
+// follow-tail / scroll-pause state for the console
+let logPinned=true, lastLogText=null, lastSeenLines=0;
+function logLineCount(){ return lastLogText ? lastLogText.split('\n').length : 0; }
+function onLogScroll(){
+  const box=$('logBox'); if(!box) return;
+  // pinned = parked at (or near) the bottom → keep following new lines
+  logPinned = box.scrollHeight-box.scrollTop-box.clientHeight < 40;
+  if(logPinned){ const p=$('logPill'); if(p) p.style.display='none'; lastSeenLines=logLineCount(); }
+}
+function jumpLogBottom(){
+  const box=$('logBox'); if(!box) return;
+  logPinned=true; box.scrollTop=box.scrollHeight;
+  const p=$('logPill'); if(p) p.style.display='none'; lastSeenLines=logLineCount();
+}
 async function loadLogs(){
   if(!CUR)return;
   const d=await api(`/api/instances/${encodeURIComponent(CUR)}/logs?lines=400`);
-  const box=$('logBox');
-  const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;
-  box.textContent=d.logs||'(empty)';
-  if(atBottom)box.scrollTop=box.scrollHeight;
+  const box=$('logBox'); if(!box) return;
+  const txt=d.logs||'(empty)';
+  if(txt===lastLogText){ if(logPinned) box.scrollTop=box.scrollHeight; return; }
+  const prevH=box.scrollHeight, prevTop=box.scrollTop;
+  lastLogText=txt; box.textContent=txt;
+  if(logPinned){
+    box.scrollTop=box.scrollHeight; lastSeenLines=logLineCount();
+    const p=$('logPill'); if(p) p.style.display='none';
+  }else{
+    // user scrolled up: hold their view steady (constant distance from the bottom)
+    // as new lines append, and surface a pill instead of yanking them to the tail
+    box.scrollTop = box.scrollHeight - prevH + prevTop;
+    const unseen = Math.max(0, logLineCount()-lastSeenLines);
+    const p=$('logPill'); if(p){ p.style.display='flex';
+      p.textContent = unseen>0 ? ('↓ '+unseen+' new line'+(unseen===1?'':'s')) : '↓ Jump to latest'; }
+  }
 }
 let CMDHIST=[], CMDIDX=-1;
 async function sendCmd(){
@@ -5498,8 +5676,324 @@ function applyTheme(s){
 async function loadSettings(){
   SETTINGS=await api('/api/settings');
   applyTheme(SETTINGS);
+  renderSidebar();
   return SETTINGS;
 }
+
+/* ===================== sidebar + page views (v1.5) ===================== */
+const ABMVER='__ABM_VERSION__';
+let CURVIEW='dashboard', TELBOT=null, telTimer=null, telSeries={};
+let SELSIDEBAR='full', SELSIDE='left';
+
+function navModel(){
+  const list=Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{});
+  const cr=list.filter(i=>i.status==='crashed').length;
+  return [
+    {g:'Manage'},
+    {ic:'▦',lbl:'Dashboard',view:'dashboard'},
+    {ic:'❖',lbl:'Fleet',view:'fleet'},
+    {ic:'⚡',lbl:'Activity',view:'activity',pip:cr||null,pipwarn:true},
+    {ic:'⏱',lbl:'Automation',view:'automation'},
+    {g:'Infrastructure'},
+    {ic:'🖥',lbl:'Boxes',act:'openBoxes()'},
+    {ic:'🌐',lbl:'Proxies',act:'openProxies()'},
+    {ic:'🚀',lbl:'Deploy',act:'openDeploy()'},
+    {ic:'📁',lbl:'Files',act:'openFiles()'},
+    {g:'System'},
+    {ic:'🔗',lbl:'Connect',act:'openConnection()'},
+    {ic:'⟲',lbl:'Scan',act:'openScan()'},
+    {ic:'⚙',lbl:'Settings',act:'openSettings()'},
+  ];
+}
+function navHtml(){
+  return '<div class="nav">'+navModel().map(n=>{
+    if(n.g) return `<div class="navg">${n.g}</div>`;
+    const act=n.view?`showView('${n.view}')`:n.act;
+    const active=(n.view&&n.view===CURVIEW)?' active':'';
+    const pip=n.pip?`<span class="pip${n.pipwarn?' warn':''}">${n.pip}</span>`:'';
+    return `<a class="${active.trim()}" data-view="${n.view||''}" onclick="${act}"><span class="ic">${n.ic}</span><span class="lbl">${esc(n.lbl)}</span>${pip}</a>`;
+  }).join('')+'</div>';
+}
+function sbBrand(){ return '<div class="sbrand"><span class="dot"></span><span class="txt">Aquarius<small>BOT MANAGER v'+esc(ABMVER)+'</small></span></div>'; }
+function sbBox(){ return '<div class="boxchip" onclick="openBoxes()"><span class="bdot"></span><span class="txt">★ This box</span><span class="car">▾</span></div>'; }
+function sbFoot(){ return '<div class="sfoot"><div class="nav"><a onclick="location.href=\'/logout\'"><span class="ic">⏻</span><span class="lbl">Log out</span></a></div></div>'; }
+
+function renderSidebar(ui){
+  ui=ui||(SETTINGS&&SETTINGS.ui)||{sidebar:'full',sidebar_side:'left'};
+  const style=ui.sidebar||'full', side=ui.sidebar_side||'left';
+  const app=$('app'), sb=$('sidebar'), hdr=$('classicHeader'), top=$('slimTop');
+  if(!app||!sb)return;
+  app.classList.toggle('right', side==='right');
+  if(style==='off'){
+    app.classList.remove('has-side');
+    sb.style.display='none'; sb.className='side'; sb.innerHTML='';
+    if(hdr)hdr.style.display=''; if(top)top.style.display='none';
+    return;
+  }
+  app.classList.add('has-side');
+  if(hdr)hdr.style.display='none'; if(top)top.style.display='';
+  sb.className='side'+(style==='rail'?' rail':'');
+  let h=sbBrand();
+  if(style!=='cmd') h+=sbBox();
+  if(style==='cmd'){
+    h+='<div class="spalette">🔍 Search bots… <span class="kbd">⌘K</span></div>';
+    h+='<div class="salert" id="sbAlert" onclick="showView(\'activity\')">checking…</div>';
+  }
+  h+=navHtml();
+  if(style==='cmd'){ h+='<div class="roster" id="sbRoster"></div>'; }
+  else{
+    if(style==='rail') h+='<div class="railtoggle" title="Expand" onclick="renderSidebar({sidebar:\'full\',sidebar_side:(SETTINGS.ui&&SETTINGS.ui.sidebar_side)||\'left\'})">»</div>';
+    h+='<div class="sgrow"></div>';
+    if(style==='full') h+='<div class="svitals" id="sbVitals"></div>';
+  }
+  h+=sbFoot();
+  sb.style.display='flex'; sb.innerHTML=h;
+  renderSlimTop();
+  updateSidebarLive();
+}
+function renderSlimTop(){
+  const top=$('slimTop'); if(!top||top.style.display==='none')return;
+  const T={dashboard:['Dashboard','your bots on this box'],fleet:['Fleet','multi-box overview'],
+    activity:['Activity & alerts','live snapshot'],telemetry:['Telemetry','bot detail'],
+    automation:['Automation','schedules · preview']};
+  const t=T[CURVIEW]||['Dashboard',''];
+  top.innerHTML=`<div><div class="pt">${esc(t[0])}</div><div class="sub">${esc(t[1])}</div></div><div class="sp"></div>`
+    +'<button class="go" onclick="bulk(\'start\')">▶ Start all</button>'
+    +'<button class="warn" onclick="bulk(\'restart\')">⟳ Restart all</button>'
+    +'<button class="danger" onclick="bulk(\'stop\')">■ Stop all</button>'
+    +'<button onclick="openAdd()">+ New</button>';
+}
+function refreshNavActive(){
+  const sb=$('sidebar'); if(!sb)return;
+  sb.querySelectorAll('.nav a[data-view]').forEach(a=>{
+    const v=a.getAttribute('data-view'); a.classList.toggle('active', !!v&&v===CURVIEW);
+  });
+}
+function updateSidebarLive(){
+  const list=Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{});
+  const cr=list.filter(i=>i.status==='crashed').length;
+  const run=list.filter(i=>i.status==='running').length;
+  const v=$('sbVitals');
+  if(v&&typeof HOST!=='undefined'&&HOST){
+    const t=thr(), cores=HOST.cpus||1, load0=HOST.load?HOST.load[0]:0;
+    const cpu=Math.min(100,Math.round(100*load0/cores));
+    const mem=HOST.mem_total?Math.round(100*HOST.mem_used/HOST.mem_total):0;
+    const disk=HOST.disk_total?Math.round(100*HOST.disk_used/HOST.disk_total):0;
+    const row=(k,p,lim)=>`<div class="svit ${p>=lim?'warn':''}"><div class="k"><span>${k}</span><span>${p}%</span></div><div class="b"><i style="width:${p}%"></i></div></div>`;
+    v.innerHTML=row('CPU',cpu,t.cpu_pct)+row('MEM',mem,t.mem_pct)+row('DISK',disk,t.disk_pct);
+  }
+  const r=$('sbRoster');
+  if(r){
+    r.innerHTML=`<div class="rhd"><span>Fleet • ${run}/${list.length} running</span><span>cpu</span></div>`+
+      list.map(i=>{
+        const cls=i.status==='running'?'run':(i.status==='crashed'?'crash':'');
+        const rc=i.status==='running'?(((i.stats&&i.stats.cpu_pct!=null)?i.stats.cpu_pct:'·')+'%'):i.status;
+        return `<div class="rrow ${cls}${i.name===TELBOT?' sel':''}" onclick="showView('telemetry','${jsq(i.name)}')"><span class="rd"></span><span class="rn">${esc(i.name)}</span><span class="rc">${esc(String(rc))}</span></div>`;
+      }).join('');
+  }
+  const a=$('sbAlert');
+  if(a){
+    a.textContent=cr?('⚠ '+cr+' crashed — see Activity'):'✓ all systems normal';
+    a.style.color=cr?'var(--warn)':'var(--dim)';
+    a.style.borderColor=cr?'#5a3b1f':'var(--line)';
+  }
+  const av=document.querySelector('#sidebar .nav a[data-view="activity"]');
+  if(av){ let pip=av.querySelector('.pip');
+    if(cr){ if(!pip){ pip=document.createElement('span'); pip.className='pip warn'; av.appendChild(pip); } pip.textContent=cr; pip.style.display=''; }
+    else if(pip){ pip.style.display='none'; } }
+}
+
+function showView(name,arg){
+  CURVIEW=name;
+  ['Dashboard','Fleet','Activity','Telemetry','Automation'].forEach(v=>{
+    const el=$('view'+v); if(el) el.style.display=(v.toLowerCase()===name)?'':'none';
+  });
+  if(telTimer&&name!=='telemetry'){clearInterval(telTimer);telTimer=null;}
+  if(name==='dashboard'){ refresh(); }
+  else if(name==='fleet'){ loadFleetView(); }
+  else if(name==='activity'){ loadActivityView(); }
+  else if(name==='telemetry'){ openTelemetry(arg); }
+  else if(name==='automation'){ renderAutomationView(); }
+  renderSlimTop(); refreshNavActive();
+  window.scrollTo(0,0);
+}
+
+async function loadFleetView(){
+  const el=$('viewFleet');
+  el.innerHTML='<div class="pagehd"><h1>Fleet</h1><span class="sub">loading…</span></div>';
+  let d; try{ d=await api('/api/fleet/status'); }catch(e){ el.innerHTML='<div class="pagehd"><h1>Fleet</h1></div><div class="panel hint">failed to load fleet status</div>'; return; }
+  const rows=(d&&d.fleet)||[];
+  const boxes=rows.length, bots=rows.reduce((a,r)=>a+(r.bots||0),0), running=rows.reduce((a,r)=>a+(r.running||0),0);
+  const offline=rows.filter(r=>!r.reachable).length;
+  const g=(k,val,p)=>`<div class="gauge ${p>=85?'warn':''}"><div class="k"><span>${k}</span><span>${p}%</span></div><div class="v">${val}</div><div class="b"><i style="width:${p}%"></i></div></div>`;
+  const cards=rows.map(r=>{
+    const host=r.host||{};
+    const cores=host.cpus||1, load0=host.load?host.load[0]:0;
+    const cpu=Math.min(100,Math.round(100*load0/cores));
+    const mem=host.mem_total?Math.round(100*host.mem_used/host.mem_total):0;
+    const name=r.controller?'★ This box (controller)':esc(r.name);
+    const sub=r.controller?'this box':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
+    const stat=r.reachable?`${r.running||0}/${r.bots||0} bots running`:('<span style="color:var(--crash)">offline'+(r.error?(' — '+esc(r.error)):'')+'</span>');
+    const gauges=(r.reachable&&host.mem_total)?(g('CPU',(host.load?host.load[0].toFixed(2):'?')+' load',cpu)+'<div style="height:.5rem"></div>'+g('MEM',mem+'% used',mem)):'';
+    const actions=r.controller?'<button class="go" onclick="showView(\'dashboard\')">Open dashboard</button>':
+      (`<button class="go" onclick="openNode('${jsq(r.name)}')">Open</button> <button onclick="openBoxes()">Manage</button>`);
+    return `<div class="panel"><h3>${name}</h3><div class="path" style="margin-top:-.5rem">${sub}</div>
+      <div style="font-weight:800;font-size:1.1rem;margin:.5rem 0 .7rem">${stat}</div>${gauges}
+      <div class="row" style="margin-top:.8rem">${actions}</div></div>`;
+  }).join('');
+  const mine=Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{});
+  const trows=mine.map(i=>{
+    const col=i.status==='running'?'var(--run)':(i.status==='crashed'?'var(--crash)':'var(--stop)');
+    const cpu=(i.stats&&i.stats.cpu_pct!=null)?i.stats.cpu_pct+'%':'—';
+    const mem=(i.stats&&i.stats.rss)?fmtBytes(i.stats.rss):'—';
+    return `<tr><td style="font-weight:700;cursor:pointer" onclick="showView('telemetry','${jsq(i.name)}')">${esc(i.name)}</td>
+      <td style="font-family:var(--mono);font-size:.74rem;color:var(--dim)">this box</td>
+      <td><span style="color:${col};font-family:var(--mono);font-size:.72rem">● ${esc(i.status.toUpperCase())}</span></td>
+      <td>${cpu}</td><td>${mem}</td></tr>`;
+  }).join('');
+  el.innerHTML=`<div class="pagehd"><h1>Fleet</h1><span class="sub">${boxes} box${boxes===1?'':'es'} · ${bots} bots · ${running} running</span></div>
+    <div class="sumstrip">
+      <div class="s"><div class="k">Boxes</div><div class="v">${boxes}</div></div>
+      <div class="s good"><div class="k">Bots running</div><div class="v">${running}</div></div>
+      <div class="s"><div class="k">Total bots</div><div class="v">${bots}</div></div>
+      <div class="s ${offline?'bad':''}"><div class="k">Offline boxes</div><div class="v">${offline}</div></div>
+    </div>
+    <div class="cols3">${cards}</div>
+    <div class="panel" style="margin-top:1rem"><h3>Bots on this box<span class="sub">click a bot for telemetry · node bots are managed on their own box</span></h3>
+      <table class="tbl"><thead><tr><th>Bot</th><th>Box</th><th>Status</th><th>CPU</th><th>MEM</th></tr></thead>
+      <tbody>${trows||'<tr><td colspan="5" class="hint">no instances</td></tr>'}</tbody></table></div>`;
+}
+
+async function loadActivityView(){
+  const el=$('viewActivity');
+  const list=Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{});
+  const t=thr(); let evs=[];
+  list.filter(i=>i.status==='crashed').forEach(i=>evs.push({sev:'crit',bot:i.name,m:'crashed — needs a restart'}));
+  list.filter(i=>i.status==='running'&&i.stats).forEach(i=>{
+    const cores=(typeof HOST!=='undefined'&&HOST&&HOST.cpus)||1, memTotal=(typeof HOST!=='undefined'&&HOST&&HOST.mem_total)||0;
+    if(i.stats.cpu_pct!=null && i.stats.cpu_pct>=t.cpu_pct*cores) evs.push({sev:'warn',bot:i.name,m:'high CPU — '+i.stats.cpu_pct+'%'});
+    if(memTotal && i.stats.rss && (100*i.stats.rss/memTotal)>=t.mem_pct) evs.push({sev:'warn',bot:i.name,m:'high memory — '+fmtBytes(i.stats.rss)});
+  });
+  let ph=null; try{ ph=await api('/api/proxies/health','POST',{}); }catch(e){}
+  const phrows=(ph&&(ph.errored||ph.results||ph.instances))||[];
+  (Array.isArray(phrows)?phrows:[]).forEach(r=>{
+    const nm=r.name||r.instance||r; if(nm) evs.push({sev:'warn',bot:nm,m:'proxy issue detected — '+(r.sample||r.reason||'check the console')});
+  });
+  const run=list.filter(i=>i.status==='running');
+  run.forEach(i=>evs.push({sev:'ok',bot:i.name,m:'running'+((i.stats&&i.stats.cpu_pct!=null)?(' · '+i.stats.cpu_pct+'% cpu'):'')}));
+  const crashed=list.filter(i=>i.status==='crashed').length;
+  const warns=evs.filter(e=>e.sev==='warn').length;
+  const ord={crit:0,warn:1,info:2,ok:3};
+  evs.sort((a,b)=>ord[a.sev]-ord[b.sev]);
+  const feed=evs.map(e=>`<div class="ev ${e.sev}"><div class="when">now</div><div class="edot"></div><div class="eb"><div class="m"><span class="tag">${esc(e.bot)}</span>${esc(e.m)}</div></div></div>`).join('')||'<div class="hint" style="padding:1rem">No activity.</div>';
+  el.innerHTML=`<div class="pagehd"><h1>Activity &amp; alerts</h1><span class="sub">live snapshot of this box</span></div>
+    <div class="sumstrip">
+      <div class="s ${crashed?'bad':''}"><div class="k">Crashed</div><div class="v">${crashed}</div></div>
+      <div class="s ${warns?'warnv':''}"><div class="k">Warnings</div><div class="v">${warns}</div></div>
+      <div class="s good"><div class="k">Running</div><div class="v">${run.length}</div></div>
+      <div class="s"><div class="k">Total bots</div><div class="v">${list.length}</div></div>
+    </div>
+    <div class="filters"><span class="hint">Derived live from current status, resource thresholds and proxy-console scan. A persistent event log is coming in v1.6.</span></div>
+    <div class="panel"><div class="feed">${feed}</div></div>`;
+}
+
+function telTilesHtml(i){
+  const st=i.stats||{};
+  const memTotal=(typeof HOST!=='undefined'&&HOST&&HOST.mem_total)||0;
+  const memPct=(memTotal&&st.rss)?Math.round(100*st.rss/memTotal):0;
+  const T=[
+    ['STATUS', i.status==='running'?'<span style="color:var(--run)">RUNNING</span>':(i.status==='crashed'?'<span style="color:var(--crash)">CRASHED</span>':'STOPPED')],
+    ['CPU', (st.cpu_pct!=null?st.cpu_pct:'—')+' <small>%</small>'],
+    ['MEMORY', (st.rss?fmtBytes(st.rss):'—')],
+    ['MEM SHARE', memPct+' <small>% host</small>'],
+    ['PROCS', (st.procs!=null?st.procs:'—')],
+    ['PID', (st.pid!=null?st.pid:'—')],
+  ];
+  return T.map(t=>`<div class="tile"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join('');
+}
+function telSpark(vals,color){
+  const w=560,h=120,n=vals.length;
+  if(!n) return '';
+  const mn=Math.min.apply(null,vals), mx=Math.max.apply(null,vals), rng=(mx-mn)||1;
+  const pts=vals.map((v,idx)=>[n>1?idx/(n-1)*w:w/2, h-10-(v-mn)/rng*(h-22)]);
+  const d='M'+pts.map(p=>p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' L');
+  const last=pts[pts.length-1];
+  return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path d="${d} L${w} ${h} L0 ${h} Z" fill="${color}" opacity="0.12"/><path d="${d}" fill="none" stroke="${color}" stroke-width="2"/><circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="3.2" fill="${color}"/></svg>`;
+}
+function telDrawChart(){
+  const c=$('telChart'); if(!c)return;
+  const s=telSeries[TELBOT]||[];
+  const acc=getComputedStyle(document.documentElement).getPropertyValue('--acc').trim()||'#3ddc97';
+  c.innerHTML=s.length?telSpark(s,acc):'<div class="hint" style="padding:1.6rem 0">collecting samples…</div>';
+}
+async function telTailNow(){
+  if(!TELBOT)return;
+  let d; try{ d=await api(`/api/instances/${encodeURIComponent(TELBOT)}/logs?lines=200`);}catch(e){return;}
+  const box=$('telLog'); if(!box)return;
+  const txt=d.logs||'(not running)';
+  if(txt===box.__last)return;
+  const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<60;
+  box.__last=txt; box.textContent=txt;
+  if(atBottom)box.scrollTop=box.scrollHeight;
+}
+function openTelemetry(name){
+  const list=Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{});
+  if(!name) name=TELBOT||((list.find(i=>i.status==='running')||list[0]||{}).name);
+  TELBOT=name;
+  const el=$('viewTelemetry'), i=(typeof INSTMAP!=='undefined'&&INSTMAP)?INSTMAP[TELBOT]:null;
+  if(!i){ el.innerHTML='<div class="pagehd"><h1>Telemetry</h1></div><div class="panel hint">No instance to show yet.</div>'; return; }
+  const opts=list.map(x=>`<option value="${esc(x.name)}"${x.name===TELBOT?' selected':''}>${esc(x.name)}</option>`).join('');
+  el.innerHTML=`<div class="pagehd"><h1>${esc(TELBOT)}</h1><span class="sub">${esc(i.dir||'')}</span><span class="sp" style="flex:1"></span>
+      <select onchange="showView('telemetry',this.value)" style="font-family:var(--sans);font-size:.8rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.35rem .5rem">${opts}</select></div>
+    <div class="tiles" id="telTiles">${telTilesHtml(i)}</div>
+    <div class="cols">
+      <div class="panel"><h3>CPU<span class="sub">live · since opened</span></h3><div id="telChart"></div></div>
+      <div class="panel"><h3>Actions</h3>
+        <div class="row"><button class="go" onclick="act('${jsq(TELBOT)}','start',this)">▶ Start</button>
+          <button class="warn" onclick="act('${jsq(TELBOT)}','restart',this)">⟳ Restart</button>
+          <button class="danger" onclick="act('${jsq(TELBOT)}','stop',this)">■ Stop</button></div>
+        <div style="margin-top:.8rem"><button onclick="openDrawer('${jsq(TELBOT)}')">⋯ Full console &amp; config</button></div>
+        <div class="hint" style="margin-top:.8rem">Game telemetry (totems / food / flight speed) streams in the bot's console — open the full console for the live tail + scroll-pause.</div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:1rem"><h3>Console<span class="sub">live tail</span></h3>
+      <pre class="log" id="telLog" style="height:240px;overflow:auto">…</pre></div>`;
+  telSeries[TELBOT]=telSeries[TELBOT]||[];
+  if(i.stats&&i.stats.cpu_pct!=null) telSeries[TELBOT].push(i.stats.cpu_pct);
+  telDrawChart(); telTailNow();
+  if(telTimer)clearInterval(telTimer);
+  telTimer=setInterval(telTick,4000);
+}
+function telTick(){
+  if(CURVIEW!=='telemetry'){ if(telTimer){clearInterval(telTimer);telTimer=null;} return; }
+  const i=(typeof INSTMAP!=='undefined'&&INSTMAP)?INSTMAP[TELBOT]:null; if(!i)return;
+  if(i.stats&&i.stats.cpu_pct!=null){ (telSeries[TELBOT]=telSeries[TELBOT]||[]).push(i.stats.cpu_pct); if(telSeries[TELBOT].length>40)telSeries[TELBOT].shift(); }
+  const tt=$('telTiles'); if(tt)tt.innerHTML=telTilesHtml(i);
+  telDrawChart(); telTailNow();
+}
+function renderAutomationView(){
+  const el=$('viewAutomation'); if(el.__built)return; el.__built=true;
+  const jobs=[['Every day 04:00','all bots','Restart all'],['Every 2h','a bot','fly resupplyspares'],
+    ['Mon/Thu 12:00','a bot','send a console command'],['On crash','any bot','notify + auto-restart (Nx)']];
+  const rows=jobs.map(j=>`<tr><td style="font-family:var(--mono);font-size:.76rem">${j[0]}</td><td style="font-weight:600">${j[1]}</td><td style="font-family:var(--mono);font-size:.76rem;color:var(--dim)">${j[2]}</td><td><div class="tgl on"></div></td></tr>`).join('');
+  el.innerHTML=`<div class="pagehd"><h1>Automation</h1><span class="sub">scheduled actions &amp; auto-recovery</span></div>
+    <div class="previewbanner">⏱ Preview — the scheduler backend isn't wired up yet. This is the planned layout (target v1.6); the controls below are inert.</div>
+    <div class="cols" style="grid-template-columns:1.6fr 1fr">
+      <div class="panel"><h3>Scheduled jobs<span class="sub">example</span></h3>
+        <table class="tbl"><thead><tr><th>When</th><th>Target</th><th>Action</th><th>On</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="panel"><h3>New scheduled job</h3>
+        <div class="frow"><div class="flabel">Target</div><div class="fctrl"><select disabled><option>all bots</option></select></div></div>
+        <div class="frow"><div class="flabel">Action</div><div class="fctrl"><select disabled><option>Restart</option></select></div></div>
+        <div class="frow"><div class="flabel">Schedule <span class="unit">cron</span></div><div class="fctrl"><input type="text" value="0 4 * * *" disabled></div></div>
+        <div class="frow"><div class="flabel">Notify on Discord</div><div class="fctrl"><div class="tgl on"></div></div></div>
+        <div class="mbar" style="margin-top:.8rem"><span class="sp" style="flex:1"></span><button class="go" disabled>+ Add job</button></div></div>
+    </div>`;
+}
+
+/* settings → appearance: sidebar picker */
+function pickSidebar(v){ SELSIDEBAR=v; document.querySelectorAll('#sidebarRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.sb===v)); previewLayout(); }
+function pickSide(v){ SELSIDE=v; previewLayout(); }
+function previewLayout(){ renderSidebar({sidebar:SELSIDEBAR,sidebar_side:SELSIDE}); }
 
 let PROXROWS=[], BULKSEL=new Set();
 let CONN={port:8765,user:'ubuntu',public_ip:''};
@@ -6017,7 +6511,7 @@ function closeSettings(e){
   if(e&&e.target!==$('settingsScrim'))return;
   $('settingsScrim').classList.remove('open');
   if(sysTimer){clearInterval(sysTimer);sysTimer=null;}
-  applyTheme(SETTINGS); // revert any unsaved live preview
+  applyTheme(SETTINGS); renderSidebar(); // revert any unsaved live preview
 }
 function setTab(t){
   $('stApBtn').classList.toggle('active',t==='ap');
@@ -6076,6 +6570,10 @@ function renderPresets(){
   $('bgImage').value=SELBG;
   $('bgDim').value=Math.round(SELBGDIM*100); $('bgDimVal').textContent=Math.round(SELBGDIM*100)+'%';
   document.querySelectorAll('#densityRow input[name=density]').forEach(r=>{r.checked=(r.value===SELDENSITY);});
+  const ui=SETTINGS.ui||{sidebar:'full',sidebar_side:'left'};
+  SELSIDEBAR=ui.sidebar||'full'; SELSIDE=ui.sidebar_side||'left';
+  document.querySelectorAll('#sidebarRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.sb===SELSIDEBAR));
+  document.querySelectorAll('#sideOrientRow input[name=sbside]').forEach(r=>{r.checked=(r.value===SELSIDE);});
 }
 function pickAccent(c){ SELACCENT=c; $('accentHex').value=c; $('accentPick').value=c; previewTheme(); }
 function pickPreset(k){
@@ -6086,9 +6584,9 @@ function pickPreset(k){
 function previewTheme(){ applyTheme({presets:SETTINGS.presets,theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY}}); }
 async function saveAppearance(){
   $('apMsg').textContent='saving…';
-  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY}});
+  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY},ui:{sidebar:SELSIDEBAR,sidebar_side:SELSIDE}});
   if(d.error){$('apMsg').style.color='var(--crash)';$('apMsg').textContent='✗ '+d.error;return;}
-  SETTINGS=d.settings; applyTheme(SETTINGS);
+  SETTINGS=d.settings; applyTheme(SETTINGS); renderSidebar();
   $('apMsg').style.color='var(--dim)';$('apMsg').textContent='✓ saved';
 }
 
