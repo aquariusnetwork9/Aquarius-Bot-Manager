@@ -6,6 +6,10 @@ AquariusProxy is a ZenithProxy fork, so they share the same launch model and con
 
 **Highlights:** lifecycle + live console with quick-command presets · structured config editor · proxy host/port editor with bulk/round-robin assignment · live whole-VPS + per-instance CPU/RAM/disk gauges with alert thresholds · enforced per-instance memory/CPU caps (cgroups) · a jailed file manager · one-click proxy deployment (Aquarius / Zenith / custom fork) · a fresh-VPS installer · **multi-VPS controller** (connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, fleet-wide bulk actions, DigitalOcean connect/provision/destroy) · in-place self-update · config backup/restore · themes + custom background.
 
+![Aquarius Bot Manager dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard.png)
+
+*One card per bot (status, live CPU/RAM, start/stop/restart) under a host gauge strip; the header carries Deploy, Proxies, Files, **Boxes**, Settings and bulk lifecycle. Full screenshot tour in the [wiki](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki).*
+
 ## Files
 - `manager.py` — the program (CLI + web server, single source of truth)
 - `schema.py` — curated AquariusProxy/ZenithProxy config schema for the structured editor
@@ -144,11 +148,19 @@ Browse to http://127.0.0.1:8765.
 ## Multi-VPS controller (Boxes, Fleet, DigitalOcean)
 One manager can act as a **controller** for your other boxes. Each other box runs the same manager (in lightweight **node mode**), and the controller reaches it over a **controller-managed SSH tunnel** — nodes stay bound to `127.0.0.1` and are never exposed to the internet. Open it with the header's **🖥 Boxes** button.
 
+![Boxes panel — Fleet view + connect a box](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/boxes.png)
+
+*The **🖥 Boxes** panel: this box + every connected node at a glance (bots running, host load/mem), fleet-wide Start / Restart / Stop all and Update all nodes, and the connect-a-box form. The sticky bar at the top is the in-page box switcher.*
+
 - **Connect a box (SSH):** paste `user@host` (add `:port` if SSH isn't on 22). The controller opens a self-healing `ssh -N -L` tunnel to that box and registers it. Optional advanced fields: SSH key path, the node's manager port, and the node's web login (only if it enforces one — the controller presents it automatically when proxying).
 - **In-page box switcher:** a sticky bar at the top lets you switch which box you're viewing. Selecting a box **reverse-proxies its full native dashboard into the same tab** — console, config, files, proxies, everything — no extra tunnel or browser tab.
 - **Fleet view:** the Boxes panel shows every box at a glance (reachable, bots running, host load/mem) with one-click **Start / Restart / Stop all** across the fleet and **Update all nodes** (pushes `selfupdate` to each).
 - **DigitalOcean:** save a DO API token, then **connect existing droplets** or **spin up a new 1GB node-mode droplet** (region/size picker, default `s-1vcpu-1gb`) — the controller auto-uploads its own SSH key, installs the manager via cloud-init, and registers the new box. DO-backed boxes also get a **Destroy** button (deletes the droplet, with a typed confirmation).
 - **All-boxes launcher:** under **🔗 Connect**, download a one-double-click script that opens an SSH tunnel to every box (controller + nodes) on distinct local ports — a direct-access fallback for when the controller itself is down.
+
+![Boxes → DigitalOcean — connect existing droplets or provision a new node](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/digitalocean.png)
+
+*Switch the connect form to **DigitalOcean** to provision a fresh 1GB node-mode droplet (region + size picker) or connect a droplet you already run — the controller handles the SSH key, cloud-init install, and registration.*
 
 Node registry lives in `nodes.json` (gitignored; SSH targets + the DO token + any node web creds, stored base64-obfuscated). Manage nodes headless with `abm node list|add|remove|test`, e.g. `abm node add box2 ubuntu@1.2.3.4`. Install a box as a node with `curl -fsSL …/install.sh | ABM_ACCESS=node bash`.
 
@@ -195,11 +207,21 @@ Give an instance a memory and/or CPU cap (New-instance form, the drawer's **Limi
 ## Settings — appearance
 Theme presets: `midnight` (default), `ember`, `ice`, `amethyst`, `paper`, `obsidian`, `forest`, `rose`, `ocean`, `gold`, `sand`. Accent colour via a picker, hex field, or one-click swatches. A **custom background image** (any http/https URL) with a readability **dim** slider, and a **density** control (comfortable / compact / spacious). Everything previews live and persists in `instances.json`.
 
+![Settings → Appearance](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/appearance.png)
+
+Set a background image URL and the whole dashboard takes it on (here the `ice` theme over a wallpaper, dim at 50%):
+
+![Dashboard with a custom background image](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/custom-background.png)
+
 ## Settings — backup & restore
 **Settings → System → Backup & restore.** Download a portable bundle of this box's configs (`instances.json` + the node registry) — the file contains secrets, so keep it safe. Restoring overwrites the current configs (a timestamped `.pre-restore-*.bak` copy is saved first) and may require logging in again. When you're viewing a node via the box switcher, backup/restore targets that node.
 
 ## Settings — manager self-update
 **Settings → System → Manager updates.** Update the manager in place (`git pull --ff-only` + restart the web UI — bots are untouched thanks to `KillMode=process`) with the **🔄 Update manager now** button, which shows an **"update available"** badge when the box is behind. Toggle **Auto-update daily** to install a systemd timer. Headless: `abm selfupdate`, `abm autoupdate on|off`.
+
+![Settings → System](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/system.png)
+
+*The System tab: a read-only host dashboard, the self-update button with its "update available" badge, config backup/restore, and the (off-by-default) system-action toggle for reboot / OS update.*
 
 ## Settings — system actions (reboot / OS update)
 **Off by default.** Enable in the Settings → System tab, or `abm settings --enable-system`.

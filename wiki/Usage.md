@@ -6,8 +6,9 @@
 
 Open the web UI (see **[[Installation]]**). Top bar buttons:
 
-- **⚙ Settings** — appearance (themes/accent), monitoring thresholds, console presets, and the System tab (reboot / OS update toggle).
+- **⚙ Settings** — appearance (themes, accent, custom background, density), monitoring thresholds, console presets, and the System tab (manager self-update, config backup/restore, reboot / OS update toggle).
 - **🔗 Connect** — your bookmark URL, the SSH tunnel command, and a downloadable one-click **reconnect shortcut**. See *Reconnecting* below.
+- **🖥 Boxes** — connect and drive other VPSes from this one: the Fleet view, the in-page box switcher, and DigitalOcean connect/provision. See **[[Multi-VPS Controller]]**.
 - **📁 Files** — the jailed file manager (browse/edit/rename/delete within allowed roots).
 - **🌐 Proxies** — per-bot proxy editor, bulk assignment, and Webshare import. See **[[Proxies]]**.
 - **⟲ Scan existing** — detect `tmux` sessions you started by hand and adopt them.
@@ -34,11 +35,22 @@ A sticky host gauge strip shows CPU load, memory, and disk vs capacity. Per-bot 
 ![Settings → Monitoring thresholds](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/settings-monitoring.png)
 
 ### Appearance
-**Settings → Appearance** picks a theme preset — midnight, ember, ice, amethyst, and the light **paper** — plus an optional accent-color override.
+**Settings → Appearance** is a full theming panel:
+
+- **11 theme presets** — `midnight` (default), `ember`, `ice`, `amethyst`, `paper`, `obsidian`, `forest`, `rose`, `ocean`, `gold`, `sand`.
+- **Accent colour** — override the preset's accent with the picker, a hex field, or one-click swatches.
+- **Custom background image** — point at any `http(s)` image URL, with a readability **dim** slider over it.
+- **Density** — Comfortable / Compact / Spacious scales the whole UI.
+
+Everything previews live and persists in `instances.json`.
 
 ![Settings → Appearance](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/appearance.png)
 
-The whole dashboard re-themes live; here it is in the light **paper** theme:
+With a custom background image set (here the `ice` theme over a wallpaper, dim at 50%), the whole dashboard takes it on:
+
+![Dashboard with a custom background image](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/custom-background.png)
+
+The theme re-applies live; here it is in the light **paper** theme:
 
 ![Light (paper) theme dashboard](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/dashboard-light.png)
 

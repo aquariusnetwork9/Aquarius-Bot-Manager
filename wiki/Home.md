@@ -11,9 +11,9 @@ Pure Python standard library + `tmux`. No pip installs, no Docker, no database.
 
 ## ⚠️ Read this first: the one-host model
 
-**Aquarius Bot Manager controls only the bots that run on the same machine it runs on.** It manages local `tmux` sessions, reads the local `/proc` for monitoring, enforces local cgroup limits, and deploys into local directories. It does **not** reach out over SSH to control bots on other servers.
+**At its core each manager controls only the bots on the machine it runs on** — local `tmux` sessions, local `/proc` monitoring, local cgroup limits, local deploy dirs. Its core design is **many bots consolidated on one VPS**, using **proxies** for per-bot IP diversity.
 
-This means its core design is **many bots consolidated on one VPS**, using **proxies** for per-bot IP diversity. If your setup is **one bot per server** (e.g. a DigitalOcean droplet per bot for separate IPs), the base manager alone won't span them — but the experimental **[[Fleet (DigitalOcean)]]** controller adds a multi-droplet layer on top. Read **[[Architecture and Limitations]]** before you install.
+As of **v1.4.0** a manager can additionally act as a **controller** that connects to your *other* boxes over SSH tunnels and drives them all from one dashboard — see the **[[Multi-VPS Controller]]**. The per-box engine is unchanged; the controller is a layer on top. Read **[[Architecture and Limitations]]** before you install.
 
 ---
 
@@ -27,6 +27,9 @@ This means its core design is **many bots consolidated on one VPS**, using **pro
 - **Resource limits** — enforce per-bot memory/CPU caps via systemd user scopes (cgroups).
 - **One-click deploy** — stand up a new AquariusProxy / ZenithProxy / custom-fork bot from scratch; the launcher self-bootstraps Java and the jar.
 - **Jailed file manager** — browse/edit configs within an allowlist of roots.
+- **Multi-VPS controller** — connect your other boxes over SSH tunnels and run them from one dashboard: a Fleet view, an in-page box switcher, and DigitalOcean connect/provision/destroy. See **[[Multi-VPS Controller]]**.
+- **Themes & visual customization** — 11 theme presets, accent swatches, a custom background image, and a density control.
+- **Self-update & backup** — update the manager in place (with an "update available" badge) and download/restore a portable config backup.
 - **Reconnect-friendly** — bots and the dashboard survive your browser closing or your PC rebooting; a **Connect** panel hands you a one-click reconnect shortcut.
 
 ## Documentation
@@ -37,7 +40,8 @@ This means its core design is **many bots consolidated on one VPS**, using **pro
 | **[[Usage]]** | Dashboard tour, full CLI reference, lifecycle, console, monitoring, reconnecting |
 | **[[Configuration]]** | `instances.json`, per-bot fields, autostart/boot, resource limits, settings |
 | **[[Proxies]]** | Manual + bulk proxy assignment, **Webshare import** (both auth models) |
-| **[[Fleet (DigitalOcean)]]** | *(experimental)* Multi-droplet: provision via the DigitalOcean API and manage agents from one controller |
+| **[[Multi-VPS Controller]]** | Connect other boxes over SSH tunnels: Fleet view, in-page box switcher, DigitalOcean connect/provision/destroy |
+| **[[Fleet (DigitalOcean)]]** | *(experimental)* CLI-only multi-droplet provisioner that predates the controller |
 | **[[Security]]** | **The full security model, what dashboard access grants, and what's stored on disk — read this** |
 | **[[Architecture and Limitations]]** | The single-host model, **the multi-droplet fleet path**, and where the tool does not fit |
 

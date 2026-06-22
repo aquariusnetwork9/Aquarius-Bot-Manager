@@ -2,6 +2,9 @@
 
 One manager can act as a **controller** for your other boxes, so you operate a whole fleet from a single dashboard. It complements the experimental [[Fleet (DigitalOcean)]] tool: the controller is built into the web UI and works with **any** provider over SSH (not just DigitalOcean, not just one VPC).
 
+![Boxes panel — Fleet view + connect a box](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/boxes.png)
+*The **🖥 Boxes** panel: every box at a glance (this box + each connected node, with bots-running and host load/mem), fleet-wide Start / Restart / Stop all and Update all nodes, and the connect-a-box form. The sticky bar at the very top is the in-page box switcher.*
+
 ## Model
 
 ```
@@ -21,6 +24,9 @@ Header → **🖥 Boxes** → **Connect a box**:
 
 - **SSH:** paste `user@host` (add `:port` if SSH isn't on 22). Advanced (optional): SSH key path on the controller, the node's manager port, and the node's web login — only needed if the node enforces one, and the controller then presents it automatically when proxying.
 - **DigitalOcean:** save a DO API token, then either **connect an existing droplet** from the list, or **provision a new one** (region + size picker, default `s-1vcpu-1gb` = 1GB). Provisioning auto-uploads the controller's own SSH public key to your DO account, creates a node-mode droplet via cloud-init, waits for its IP, and registers it. DO-backed boxes get a **Destroy** button (deletes the droplet, with a typed confirmation).
+
+![Boxes → DigitalOcean — connect existing droplets or provision a new node](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/digitalocean.png)
+*Switch the connect form to **DigitalOcean** to spin up a fresh 1GB node-mode droplet (region + size picker) or connect a droplet you already run — the controller handles the SSH key, cloud-init install, and registration.*
 
 Headless equivalent:
 
