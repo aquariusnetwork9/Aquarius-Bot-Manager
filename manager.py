@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.14.1"
+__version__ = "1.14.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -324,6 +324,22 @@ def proxy_info(directory):
 
 
 _QUEUE_RE = re.compile(r"(?:queue\s*position|position\s+in\s+queue|in\s+queue)\D*?(\d+)", re.I)
+# leading "[YYYY/MM/DD HH:MM:SS]" stamp ZenithProxy/AquariusProxy prefix every log line with
+_TS_RE = re.compile(r"^\[(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})\]")
+
+
+def _log_line_age(line):
+    """Seconds since a log line's leading timestamp (box-local clock, same as ours),
+    or None if it has no parseable stamp."""
+    m = _TS_RE.match(line.lstrip())
+    if not m:
+        return None
+    try:
+        ts = time.mktime((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)), int(m.group(6)), 0, 0, -1))
+        return time.time() - ts
+    except (ValueError, OverflowError):
+        return None
 
 
 def _log_connection(inst):
@@ -336,10 +352,10 @@ def _log_connection(inst):
     Never returns 'restarting' — a lingering boot banner means 'booted, not connected'
     = offline (that bug stuck bots on 'restarting' forever)."""
     try:
-        tail = logs(inst, lines=120)
+        tail = logs(inst, lines=200)
     except Exception:
         return {"state": "online", "queue": None}
-    for line in reversed([l for l in tail.splitlines() if l.strip()][-120:]):
+    for line in reversed([l for l in tail.splitlines() if l.strip()][-200:]):
         ll = line.lower()
         if "[discord]" in ll:
             continue                                       # Discord link ≠ MC connection
@@ -362,7 +378,12 @@ def _log_connection(inst):
         if ("proxy started" in ll or "command to log in" in ll or "booting" in ll
                 or "loading modules" in ll or "starting aquariusproxy" in ll
                 or "starting zenithproxy" in ll):
-            return {"state": "offline", "queue": None}     # booted, nothing connection-y since
+            # a FRESH boot banner means it's coming up (restarting); an old one with
+            # nothing connection-y since means it booted and never connected (offline)
+            age = _log_line_age(line)
+            if age is not None and age < 30:
+                return {"state": "restarting", "queue": None}
+            return {"state": "offline", "queue": None}
     return {"state": "online", "queue": None}
 
 
