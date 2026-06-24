@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -315,6 +315,44 @@ def proxy_info(directory):
     info = {"fork": fork, "version": core, "platform": platform, "version_full": ver}
     _PROXY_CACHE[path] = (mtime, info)
     return info
+
+
+_QUEUE_RE = re.compile(r"(?:queue\s*position|position\s+in\s+queue|in\s+queue)\D*?(\d+)", re.I)
+
+
+def connection_state(inst, status=None):
+    """Best-effort in-game connection state of a bot, read from its console tail:
+    'offline' | 'in-queue' (+queue position) | 'online' | 'restarting' | 'updating'.
+    This is the SERVER/connection state — distinct from the OS-process status
+    (running/stopped/crashed) the card badge shows. Heuristic by design; falls back
+    to 'online' for a running bot whose recent log has no telltale marker."""
+    if status is None:
+        status = instance_status(inst)
+    if status != "running":
+        return {"state": "offline", "queue": None}
+    try:
+        tail = logs(inst, lines=40)
+    except Exception:
+        return {"state": "online", "queue": None}
+    for line in reversed([l for l in tail.splitlines() if l.strip()][-40:]):
+        ll = line.lower()
+        if ("downloading version" in ll or "removing existing file" in ll
+                or "autoupdater" in ll or "fetching latest" in ll):
+            return {"state": "updating", "queue": None}
+        if ("starting aquariusproxy" in ll or "starting zenithproxy" in ll
+                or "proxy started" in ll or "booting" in ll or "loading modules" in ll):
+            return {"state": "restarting", "queue": None}
+        m = _QUEUE_RE.search(line)
+        if m:
+            pos = int(m.group(1))
+            return {"state": "in-queue", "queue": pos} if pos > 0 else {"state": "online", "queue": None}
+        if ("disconnected" in ll or "connection closed" in ll or "lost connection" in ll
+                or "could not connect" in ll or "cannot connect" in ll or "can't connect" in ll):
+            return {"state": "offline", "queue": None}
+        if ("connected" in ll or "spawn" in ll or "joined" in ll
+                or "logged in" in ll or "in-game" in ll):
+            return {"state": "online", "queue": None}
+    return {"state": "online", "queue": None}
 
 
 def send_command(inst, command):
@@ -1337,6 +1375,53 @@ def delete_instance(cfg, name, force=False):
     cfg["by_name"].pop(name, None)
     save_config(cfg)
     return f"deleted (was {st})"
+
+
+def rename_instance(cfg, old, new, move_dir=True):
+    """Rename a bot: its instance key, its tmux session (if one exists), and — when it
+    isn't running and its folder is the conventional <base>/<name> — its folder on disk.
+    A running bot is renamed in place (live tmux session renamed; folder left until it's
+    stopped, since the running process holds it). Returns a summary dict."""
+    inst = cfg["by_name"].get(old)
+    if not inst:
+        raise ValueError(f"no such bot: {old}")
+    new = sanitize_name(new)
+    if not new:
+        raise ValueError("a new name is required (letters & digits, e.g. bot1)")
+    if new == old:
+        return {"ok": True, "name": old, "dir": inst["dir"], "moved_dir": False, "note": "unchanged"}
+    if new in cfg["by_name"]:
+        raise ValueError(f"a bot named '{new}' already exists")
+    status = instance_status(inst)
+    old_session = session_name(inst)
+    adopted = bool(inst.get("session"))
+
+    moved, note = False, ""
+    if move_dir and os.path.basename(os.path.normpath(inst["dir"])) == old:
+        if status == "running":
+            note = "folder kept (bot is running) — stop it to rename the folder too"
+        else:
+            new_dir = os.path.join(os.path.dirname(os.path.normpath(inst["dir"])), new)
+            if os.path.exists(new_dir):
+                raise ValueError(f"target folder already exists: {new_dir}")
+            try:
+                os.rename(inst["dir"], new_dir)
+            except OSError as e:
+                raise ValueError(f"couldn't move folder: {e}")
+            inst["dir"] = new_dir
+            moved = True
+
+    # rename the live/crashed tmux session so the bot stays managed under the new name
+    # (adopted instances pin an external session by name — leave that alone)
+    if not adopted and session_exists(old_session):
+        new_session = SESSION_PREFIX + re.sub(r"[^A-Za-z0-9_-]", "_", new)
+        tmux("rename-session", "-t", old_session, new_session)
+
+    inst["name"] = new
+    cfg["by_name"].pop(old, None)
+    cfg["by_name"][new] = inst
+    save_config(cfg)
+    return {"ok": True, "name": new, "dir": inst["dir"], "moved_dir": moved, "note": note}
 
 
 def set_autostart(cfg, name, enabled):
@@ -3549,6 +3634,7 @@ class Handler(BaseHTTPRequestHandler):
                     "autostart": bool(i.get("autostart")),
                     "limits": limits_view(i),
                     "proxy": proxy_info(i["dir"]),
+                    "conn": connection_state(i, st),
                 }
                 if st == "running":
                     try:
@@ -3958,6 +4044,21 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 # 409 = conflict (running, needs force); 404 = missing
                 code = 404 if str(e).startswith("no such") else 409
+                return self._json({"error": str(e)}, code)
+
+        # rename a bot (instance key + tmux session + folder when stopped)
+        m = re.match(r"^/api/instances/([^/]+)/rename$", path)
+        if m:
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            try:
+                res = rename_instance(cfg, m.group(1), p.get("new"),
+                                      move_dir=p.get("move_dir", True))
+                return self._json(res)
+            except ValueError as e:
+                code = 404 if str(e).startswith("no such") else 400
                 return self._json({"error": str(e)}, code)
 
         # per-instance action
@@ -4982,6 +5083,16 @@ main{padding:1.6rem;max-width:1200px;margin:0 auto}
 .star.on{color:var(--warn)}
 .path{font-family:var(--mono);font-size:.7rem;color:var(--dim);margin:.45rem 0 .15rem;word-break:break-all}
 .cmd{font-family:var(--mono);font-size:.7rem;color:#586675;margin-bottom:.85rem;word-break:break-all}
+/* connection state line (replaces the launch-cmd line) — server/queue state, colour-coded */
+.cstate{font-family:var(--mono);font-size:.74rem;font-weight:700;margin:.1rem 0 .85rem;display:flex;align-items:center;gap:.45rem;letter-spacing:.01em}
+.cstate::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 9px currentColor;flex:none}
+.cstate.s-offline{color:#ff3b30}      /* apple red */
+.cstate.s-in-queue{color:#ffd60a}     /* yellow */
+.cstate.s-online{color:#30d158}       /* light green */
+.cstate.s-updating{color:#64d2ff}     /* light blue */
+.cstate.s-restarting{color:#d18aff}   /* light purple */
+.cstate.s-updating::before,.cstate.s-restarting::before{animation:cpulse 1.1s ease-in-out infinite}
+@keyframes cpulse{0%,100%{opacity:1}50%{opacity:.3}}
 /* proxy fork + version chip on each bot card */
 .ptag{display:inline-flex;align-items:center;gap:.35rem;font-family:var(--mono);font-size:.66rem;font-weight:600;
   color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:.12rem .45rem;margin:.1rem 0 .15rem}
@@ -5764,6 +5875,11 @@ async function api(path,method='GET',body){
   return r.json();
 }
 function badge(s){return `<span class="badge ${s}">${s}</span>`;}
+function connLabel(c){
+  if(!c) return 'Offline';
+  if(c.state==='in-queue') return 'In queue'+(c.queue!=null?(' · #'+c.queue):'');
+  return ({offline:'Offline',online:'Online',updating:'Updating…',restarting:'Restarting…'})[c.state]||c.state;
+}
 async function toggleAuto(name,enabled){
   await api(`/api/instances/${encodeURIComponent(name)}/autostart`,'POST',{enabled});
   refresh();
@@ -5839,13 +5955,14 @@ async function refresh(){
       </div>
       <div class="path">${esc(i.dir)}</div>
       ${i.proxy?`<div class="ptag ${i.proxy.fork==='AquariusProxy'?'aqua':(i.proxy.fork==='ZenithProxy'?'zenith':'')}" title="${esc(i.proxy.version_full||i.proxy.fork)}"><span class="pdot"></span>${esc(i.proxy.fork)}${i.proxy.version?(' v'+esc(i.proxy.version)):''}${i.proxy.platform?(' '+esc(i.proxy.platform)):''}</div>`:''}
-      <div class="cmd">$ ${esc(i.launch_cmd)}</div>
+      <div class="cstate s-${i.conn?i.conn.state:'offline'}">${connLabel(i.conn)}</div>
       ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
       <div class="row">
         <button class="go" onclick="act('${jsq(i.name)}','start',this)">▶ Start</button>
         <button class="warn" onclick="act('${jsq(i.name)}','restart',this)">⟳ Restart</button>
         <button class="danger" onclick="act('${jsq(i.name)}','stop',this)">■ Stop</button>
         <button onclick="openDrawer('${jsq(i.name)}')">⋯</button>
+        <button title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
         <button class="danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
       </div>
     </div>`).join('');
@@ -5868,6 +5985,16 @@ function syncAgo(){
   else { el.textContent='⚠ connection interrupted'; el.style.color='var(--crash)'; }
 }
 
+async function renameBot(name){
+  const v=prompt('Rename "'+name+'" to:\n(letters & digits; spaces & symbols become "-". The folder is renamed too when the bot is stopped.)', name);
+  if(v===null) return;
+  const nn=v.trim(); if(!nn||nn===name) return;
+  const d=await api('/api/instances/'+encodeURIComponent(name)+'/rename','POST',{new:nn});
+  if(d&&d.error){ alert('✗ '+d.error); return; }
+  if(CUR===name) CUR=d.name;          // keep an open drawer pointed at the renamed bot
+  if(d&&d.note) alert('Renamed to "'+d.name+'".\n'+d.note);
+  refresh();
+}
 async function act(name,action,btn){
   const card=btn.closest('.card');
   card.querySelectorAll('button').forEach(b=>b.disabled=true);
