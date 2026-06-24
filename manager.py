@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.14.0"
+__version__ = "1.14.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -133,6 +133,11 @@ def instance_status(inst):
     return "crashed" if pane_dead(s) else "running"
 
 
+# instance name -> epoch of the last manager-initiated (re)start. Powers the brief
+# "restarting" connection state so it never sticks (cleared once the bot connects).
+_RESTART_FLAG = {}
+
+
 def start(inst):
     s = session_name(inst)
     if session_exists(s):
@@ -147,6 +152,7 @@ def start(inst):
     tmux("new-session", "-d", "-s", s, "-c", d, "bash", "-lc", outer, check=True)
     # keep crash output visible after the process exits
     tmux("set-option", "-t", s, "remain-on-exit", "on")
+    _RESTART_FLAG[inst.get("name")] = time.time()
     return "started" + note
 
 
@@ -320,39 +326,66 @@ def proxy_info(directory):
 _QUEUE_RE = re.compile(r"(?:queue\s*position|position\s+in\s+queue|in\s+queue)\D*?(\d+)", re.I)
 
 
-def connection_state(inst, status=None):
-    """Best-effort in-game connection state of a bot, read from its console tail:
-    'offline' | 'in-queue' (+queue position) | 'online' | 'restarting' | 'updating'.
-    This is the SERVER/connection state — distinct from the OS-process status
-    (running/stopped/crashed) the card badge shows. Heuristic by design; falls back
-    to 'online' for a running bot whose recent log has no telltale marker."""
-    if status is None:
-        status = instance_status(inst)
-    if status != "running":
-        return {"state": "offline", "queue": None}
+def _log_connection(inst):
+    """Scan a bot's console tail for the most recent connection event and classify it:
+    online | in-queue (+position) | offline | updating. Calibrated to ZenithProxy /
+    AquariusProxy log tags: MC connection lives in [Client]; the Minecraft world chat
+    in [Chat]; queue in 2b2t's "Position in queue: N" + the [QueueWarning] module.
+    [Discord] lines are IGNORED — their "Session disconnected/resumed" is the Discord
+    bot link, NOT the server connection (matching it made every bot read offline).
+    Never returns 'restarting' — a lingering boot banner means 'booted, not connected'
+    = offline (that bug stuck bots on 'restarting' forever)."""
     try:
-        tail = logs(inst, lines=40)
+        tail = logs(inst, lines=120)
     except Exception:
         return {"state": "online", "queue": None}
-    for line in reversed([l for l in tail.splitlines() if l.strip()][-40:]):
+    for line in reversed([l for l in tail.splitlines() if l.strip()][-120:]):
         ll = line.lower()
+        if "[discord]" in ll:
+            continue                                       # Discord link ≠ MC connection
         if ("downloading version" in ll or "removing existing file" in ll
-                or "autoupdater" in ll or "fetching latest" in ll):
+                or "fetching latest" in ll):
             return {"state": "updating", "queue": None}
-        if ("starting aquariusproxy" in ll or "starting zenithproxy" in ll
-                or "proxy started" in ll or "booting" in ll or "loading modules" in ll):
-            return {"state": "restarting", "queue": None}
         m = _QUEUE_RE.search(line)
         if m:
             pos = int(m.group(1))
             return {"state": "in-queue", "queue": pos} if pos > 0 else {"state": "online", "queue": None}
-        if ("disconnected" in ll or "connection closed" in ll or "lost connection" in ll
-                or "could not connect" in ll or "cannot connect" in ll or "can't connect" in ll):
+        if "already queued" in ll:
+            return {"state": "in-queue", "queue": None}
+        if "[client]" in ll and ("disconnect" in ll or "timed out" in ll
+                                 or "connection closed" in ll or "lost connection" in ll):
             return {"state": "offline", "queue": None}
-        if ("connected" in ll or "spawn" in ll or "joined" in ll
-                or "logged in" in ll or "in-game" in ll):
+        if "[client]" in ll and "connected to" in ll:
             return {"state": "online", "queue": None}
+        if "[chat]" in ll:                                 # seeing world chat = in-game
+            return {"state": "online", "queue": None}
+        if ("proxy started" in ll or "command to log in" in ll or "booting" in ll
+                or "loading modules" in ll or "starting aquariusproxy" in ll
+                or "starting zenithproxy" in ll):
+            return {"state": "offline", "queue": None}     # booted, nothing connection-y since
     return {"state": "online", "queue": None}
+
+
+def connection_state(inst, status=None):
+    """In-game connection state of a bot: offline | in-queue (+position) | online |
+    restarting | updating. Distinct from the OS-process status the badge shows.
+    'restarting' is a brief, manager-tracked transient (set when we (re)start a bot,
+    cleared the moment it connects or the window lapses) so it never sticks."""
+    if status is None:
+        status = instance_status(inst)
+    name = inst.get("name")
+    if status != "running":
+        _RESTART_FLAG.pop(name, None)
+        return {"state": "offline", "queue": None}
+    st = _log_connection(inst)
+    if st["state"] in ("online", "in-queue"):
+        _RESTART_FLAG.pop(name, None)          # it's up — end any restart window
+        return st
+    ts = _RESTART_FLAG.get(name)
+    if ts is not None and time.time() - ts < 30:
+        return {"state": "restarting", "queue": None}
+    _RESTART_FLAG.pop(name, None)
+    return st                                  # offline or updating
 
 
 def send_command(inst, command):
@@ -5100,7 +5133,11 @@ main{padding:1.6rem;max-width:1200px;margin:0 auto}
 .ptag.aqua{color:var(--acc);border-color:var(--acc-dim)}
 .ptag.zenith{color:#5cc8ff;border-color:#27506b}
 .row{display:flex;gap:.4rem;flex-wrap:wrap}
-.row button{flex:1;min-width:64px}
+/* The label is centered on its own; the icon is pulled out of flow to the left edge so
+   it can't shove the word off-centre (the ⟳/▶/■ glyphs have different metrics). */
+.row button{flex:1;min-width:64px;position:relative;display:inline-flex;align-items:center;justify-content:center}
+.row button .ic{position:absolute;left:.5rem;top:50%;transform:translateY(-50%);
+  font-style:normal;display:inline-flex;align-items:center}
 .spin{display:inline-block;width:11px;height:11px;border:2px solid #ffffff33;border-top-color:var(--acc);
   border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:.3rem}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -5958,9 +5995,9 @@ async function refresh(){
       <div class="cstate s-${i.conn?i.conn.state:'offline'}">${connLabel(i.conn)}</div>
       ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
       <div class="row">
-        <button class="go" onclick="act('${jsq(i.name)}','start',this)">▶ Start</button>
-        <button class="warn" onclick="act('${jsq(i.name)}','restart',this)">⟳ Restart</button>
-        <button class="danger" onclick="act('${jsq(i.name)}','stop',this)">■ Stop</button>
+        <button class="go" onclick="act('${jsq(i.name)}','start',this)"><i class="ic">▶</i>Start</button>
+        <button class="warn" onclick="act('${jsq(i.name)}','restart',this)"><i class="ic">⟳</i>Restart</button>
+        <button class="danger" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i>Stop</button>
         <button onclick="openDrawer('${jsq(i.name)}')">⋯</button>
         <button title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
         <button class="danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
@@ -5998,7 +6035,8 @@ async function renameBot(name){
 async function act(name,action,btn){
   const card=btn.closest('.card');
   card.querySelectorAll('button').forEach(b=>b.disabled=true);
-  btn.innerHTML='<span class="spin"></span>'+btn.textContent.replace(/^\S+\s/,'');
+  const ic=btn.querySelector('.ic');               // swap just the icon for a spinner
+  if(ic){ ic.innerHTML='<span class="spin"></span>'; } else { btn.innerHTML='<span class="spin"></span>'; }
   await api(`/api/instances/${encodeURIComponent(name)}/${action}`,'POST');
   await refresh();
 }
