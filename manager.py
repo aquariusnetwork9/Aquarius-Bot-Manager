@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -744,14 +744,22 @@ def self_update(do_restart=True, service=SERVICE_NAME):
     out = {"old": old, "new": new, "updated": old != new,
            "message": pull.stdout.strip() or pull.stderr.strip()}
     if do_restart:
-        # restart the system service so the new manager.py is loaded; needs sudo (same as
-        # other system actions). The CLI/timer is a separate process, so this is safe.
-        r = subprocess.run(["sudo", "-n", "systemctl", "restart", service],
-                           capture_output=True, text=True)
-        out["restarted"] = (r.returncode == 0)
-        if r.returncode != 0:
-            out["restart_error"] = (r.stderr.strip() or r.stdout.strip()
-                                    or "sudo systemctl restart failed")
+        # Restart the service so the new manager.py loads — but only AFTER this
+        # response has had a chance to flush. A synchronous `systemctl restart`
+        # SIGTERMs us mid-request, so the caller (or a controller proxying to us)
+        # gets a dropped connection / HTML error page instead of this JSON — that
+        # was the "Unexpected token '<'" the update button showed. Detach a tiny
+        # helper (its own session, so it survives our SIGTERM under KillMode=process)
+        # that waits a beat, then runs the restart.
+        try:
+            subprocess.Popen(
+                ["sh", "-c", "sleep 1.5; sudo -n systemctl restart \"$1\"", "sh", service],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+            out["restarted"] = True
+        except Exception as e:  # noqa: BLE001 — report, don't crash the update
+            out["restarted"] = False
+            out["restart_error"] = str(e)
     return out
 
 
@@ -7211,11 +7219,19 @@ async function selfUpdate(btn){
   if(!confirm('Update the manager now (git pull + restart the web UI)? The dashboard will blink for a moment.'))return;
   const orig=btn.textContent; btn.disabled=true; btn.innerHTML='<span class="spin"></span> updating…';
   $('updMsg').style.color='var(--dim)'; $('updMsg').textContent='git pull + restart…';
-  let d; try{ d=await api('/api/selfupdate','POST',{}); }catch(e){ d={error:String(e)}; }
+  // Don't use api() here: once the update fires, the box restarts and the request
+  // either drops ("Failed to fetch") or returns the proxy's HTML "box unreachable"
+  // page (can't .json()). Both are the EXPECTED success path, not an error.
+  let d=null;
+  try{
+    const r=await fetch('/api/selfupdate',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const t=await r.text(); try{ d=JSON.parse(t); }catch(_){ d=null; }
+  }catch(e){ d=null; }
   btn.disabled=false; btn.textContent=orig;
-  if(!d||d.error){ $('updMsg').style.color='var(--crash)'; $('updMsg').textContent='✗ '+((d&&d.error)||'failed'); return; }
+  if(d&&d.error){ $('updMsg').style.color='var(--crash)'; $('updMsg').textContent='✗ '+d.error; return; }
   $('updMsg').style.color='var(--dim)';
-  if(d.updated){ $('updMsg').textContent='✓ '+d.old+' → '+d.new+(d.restarted?' · restarting…':' · restart manually'); }
+  if(!d){ $('updMsg').textContent='✓ update triggered · the box is restarting — reload in a few seconds'; }
+  else if(d.updated){ $('updMsg').textContent='✓ '+d.old+' → '+d.new+(d.restarted?' · restarting…':' · restart manually'); }
   else { $('updMsg').textContent='✓ already up to date ('+d.new+')'; }
 }
 async function toggleAutoupdate(cb){
