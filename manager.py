@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.11.1"
+__version__ = "1.12.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2329,15 +2329,25 @@ def fleet_aggregate(cfg, timeout=8):
     rows = []
     box_name = (cfg["raw"].get("settings", {}).get("box_name") or "Controller")
     try:
-        insts = cfg["instances"]
+        ci = []
+        for i in cfg["instances"]:
+            st = instance_status(i)
+            entry = {"name": i.get("name"), "status": st, "stats": None}
+            if st == "running":
+                try:
+                    entry["stats"] = instance_stats(i)
+                except Exception:
+                    pass
+            ci.append(entry)
         rows.append({"name": CONTROLLER_ROW, "label": box_name, "controller": True,
-                     "reachable": True, "bots": len(insts),
-                     "running": sum(1 for i in insts if instance_status(i) == "running"),
-                     "bot_names": [i.get("name") for i in insts],
-                     "host": _sysinfo()})
+                     "reachable": True, "bots": len(ci),
+                     "running": sum(1 for c in ci if c["status"] == "running"),
+                     "bot_names": [c["name"] for c in ci],
+                     "instances": ci, "host": _sysinfo()})
     except Exception as e:
         rows.append({"name": CONTROLLER_ROW, "label": box_name, "controller": True,
-                     "reachable": False, "error": str(e), "bots": 0, "running": 0})
+                     "reachable": False, "error": str(e), "bots": 0, "running": 0,
+                     "instances": []})
     for n in load_nodes()["nodes"]:
         row = node_public_view(n, TUNNELS)
         row["controller"] = False
@@ -2347,12 +2357,14 @@ def fleet_aggregate(cfg, timeout=8):
             row["bots"] = len(inst)
             row["running"] = sum(1 for i in inst if i.get("status") == "running")
             row["bot_names"] = [i.get("name") for i in inst]
+            row["instances"] = [{"name": i.get("name"), "status": i.get("status"),
+                                 "stats": i.get("stats")} for i in inst]
             try:
                 row["host"] = node_request(n, "GET", "/api/system/info", timeout=timeout)
             except Exception:
                 row["host"] = None
         except Exception as e:
-            row.update(reachable=False, error=str(e), bots=0, running=0)
+            row.update(reachable=False, error=str(e), bots=0, running=0, instances=[])
         rows.append(row)
     return rows
 
@@ -3696,6 +3708,26 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
             return self._json({"ok": True, "label": label})
+
+        # controller: re-establish a node's SSH tunnel on demand (manual reconnect)
+        if path == "/api/nodes/reconnect":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            node = find_node(load_nodes(), p.get("name"))
+            if not node:
+                return self._json({"error": f"no such box: {p.get('name')}"}, 404)
+            if TUNNELS is not None:
+                TUNNELS.drop(node["name"])      # tear down the stale tunnel so it re-binds clean
+            try:
+                if ensure_node_tunnel(node, wait=10):
+                    n = node_request(node, "GET", "/api/instances", timeout=8).get("instances", [])
+                    return self._json({"ok": True, "reachable": True, "instances": len(n)})
+                return self._json({"ok": True, "reachable": False,
+                                   "error": "tunnel did not come up — is the box online? check ssh user/host/key"})
+            except Exception as e:
+                return self._json({"ok": True, "reachable": False, "error": str(e)})
 
         # controller: bulk start/stop/restart across this box + nodes
         if path == "/api/fleet/action":
@@ -5120,6 +5152,10 @@ table.tbl th{font-family:var(--mono);font-size:.59rem;text-transform:uppercase;l
 table.tbl td{padding:.55rem .7rem;border-bottom:1px solid #ffffff08}
 table.tbl tr:hover td{background:#ffffff05}
 .panel{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:14px;padding:1.1rem 1.2rem}
+/* an offline box card: darkened + muted (theme-safe via opacity); brightens on
+   hover so its Reconnect button stays easy to read and click */
+.panel.boxoff{opacity:.5;filter:grayscale(.5);border-style:dashed;transition:opacity .15s,filter .15s}
+.panel.boxoff:hover{opacity:.92;filter:none}
 .panel h3{margin:0 0 .85rem;font-size:.95rem;letter-spacing:-.01em;display:flex;align-items:center;gap:.5rem}
 .panel h3 .sub{font-family:var(--mono);font-size:.62rem;color:var(--dim);font-weight:400;margin-left:auto}
 .cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
@@ -6359,26 +6395,36 @@ async function loadFleetView(){
     const cores=host.cpus||1, load0=host.load?host.load[0]:0;
     const cpu=Math.min(100,Math.round(100*load0/cores));
     const mem=host.mem_total?Math.round(100*host.mem_used/host.mem_total):0;
+    const off=!r.reachable;
     const name=(r.controller?'★ ':'')+esc(r.label||r.name);
     const sub=r.controller?'controller':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
-    const stat=r.reachable?`${r.running||0}/${r.bots||0} bots running`:('<span style="color:var(--crash)">offline'+(r.error?(' — '+esc(r.error)):'')+'</span>');
-    const gauges=(r.reachable&&host.mem_total)?(g('CPU',(host.load?host.load[0].toFixed(2):'?')+' load',cpu)+'<div style="height:.5rem"></div>'+g('MEM',mem+'% used',mem)):'';
+    const stat=off?('<span style="color:var(--crash)">⚠ offline'+(r.error?(' — '+esc(r.error)):'')+'</span>')
+      :`${r.running||0}/${r.bots||0} bots running`;
+    const gauges=(!off&&host.mem_total)?(g('CPU',(host.load?host.load[0].toFixed(2):'?')+' load',cpu)+'<div style="height:.5rem"></div>'+g('MEM',mem+'% used',mem)):'';
     const actions=r.controller?'<button class="go" onclick="showView(\'dashboard\')">Open dashboard</button>':
-      (`<button class="go" onclick="openNode('${jsq(r.name)}')">Open</button> <button onclick="openBoxes()">Manage</button>`);
-    return `<div class="panel"><h3>${name}</h3><div class="path" style="margin-top:-.5rem">${sub}</div>
+      (off?`<button class="go" onclick="reconnectBox('${jsq(r.name)}',this)">↻ Reconnect</button> <button onclick="openBoxes()">Manage</button>`
+          :`<button class="go" onclick="openNode('${jsq(r.name)}')">Open</button> <button onclick="openBoxes()">Manage</button>`);
+    return `<div class="panel${off?' boxoff':''}"><h3>${name}</h3><div class="path" style="margin-top:-.5rem">${sub}</div>
       <div style="font-weight:800;font-size:1.1rem;margin:.5rem 0 .7rem">${stat}</div>${gauges}
       <div class="row" style="margin-top:.8rem">${actions}</div></div>`;
   }).join('');
-  const mine=Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{});
-  const trows=mine.map(i=>{
-    const col=i.status==='running'?'var(--run)':(i.status==='crashed'?'var(--crash)':'var(--stop)');
-    const cpu=(i.stats&&i.stats.cpu_pct!=null)?i.stats.cpu_pct+'%':'—';
-    const mem=(i.stats&&i.stats.rss)?fmtBytes(i.stats.rss):'—';
-    return `<tr><td style="font-weight:700;cursor:pointer" onclick="showView('telemetry','${jsq(i.name)}')">${esc(i.name)}</td>
-      <td style="font-family:var(--mono);font-size:.74rem;color:var(--dim)">controller</td>
-      <td><span style="color:${col};font-family:var(--mono);font-size:.72rem">● ${esc(i.status.toUpperCase())}</span></td>
+  // every bot on every reachable box, tagged with its host box
+  const allbots=[];
+  rows.forEach(r=>{
+    const blabel=r.controller?(r.label||'Controller'):(r.label||r.name);
+    (r.instances||[]).forEach(i=>allbots.push(Object.assign({_box:blabel,_boxname:r.name,_controller:r.controller},i)));
+  });
+  const trows=allbots.map(b=>{
+    const col=b.status==='running'?'var(--run)':(b.status==='crashed'?'var(--crash)':'var(--stop)');
+    const cpu=(b.stats&&b.stats.cpu_pct!=null)?b.stats.cpu_pct+'%':'—';
+    const mem=(b.stats&&b.stats.rss)?fmtBytes(b.stats.rss):'—';
+    const onclk=b._controller?`showView('telemetry','${jsq(b.name)}')`:`openNode('${jsq(b._boxname)}')`;
+    return `<tr><td style="font-weight:700;cursor:pointer" onclick="${onclk}">${esc(b.name)}</td>
+      <td style="font-family:var(--mono);font-size:.74rem;color:var(--dim)">${b._controller?'★ ':''}${esc(b._box)}</td>
+      <td><span style="color:${col};font-family:var(--mono);font-size:.72rem">● ${esc((b.status||'').toUpperCase())}</span></td>
       <td>${cpu}</td><td>${mem}</td></tr>`;
   }).join('');
+  const offNote=offline?`<div class="hint" style="margin-top:.6rem">${offline} box${offline===1?'':'es'} offline — their bots can't be listed until you reconnect (see the darkened card${offline===1?'':'s'} above).</div>`:'';
   el.innerHTML=`<div class="pagehd"><h1>Fleet</h1><span class="sub">${boxes} box${boxes===1?'':'es'} · ${bots} bots · ${running} running</span></div>
     <div class="sumstrip">
       <div class="s"><div class="k">Boxes</div><div class="v">${boxes}</div></div>
@@ -6387,9 +6433,17 @@ async function loadFleetView(){
       <div class="s ${offline?'bad':''}"><div class="k">Offline boxes</div><div class="v">${offline}</div></div>
     </div>
     <div class="cols3">${cards}</div>
-    <div class="panel" style="margin-top:1rem"><h3>Bots on the controller<span class="sub">click a bot for telemetry · node bots are managed on their own box</span></h3>
+    <div class="panel" style="margin-top:1rem"><h3>All bots<span class="sub">every bot on every box · click a controller bot for telemetry, a node bot to open its box</span></h3>
       <table class="tbl"><thead><tr><th>Bot</th><th>Box</th><th>Status</th><th>CPU</th><th>MEM</th></tr></thead>
-      <tbody>${trows||'<tr><td colspan="5" class="hint">no instances</td></tr>'}</tbody></table></div>`;
+      <tbody>${trows||'<tr><td colspan="5" class="hint">no instances</td></tr>'}</tbody></table>${offNote}</div>`;
+}
+async function reconnectBox(name,btn){
+  const o=btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> reconnecting…';
+  let d; try{ d=await api('/api/nodes/reconnect','POST',{name}); }catch(e){ d={error:String(e)}; }
+  btn.disabled=false; btn.innerHTML=o;
+  if(d&&d.error&&!('reachable' in d)){ alert('✗ '+d.error); return; }
+  if(d&&!d.reachable){ alert('Still offline'+(d.error?(': '+d.error):'.')); }
+  loadFleetView();
 }
 
 async function loadActivityView(){
