@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1218,6 +1218,19 @@ def discover(basedir, out_path):
 # ---------------------------------------------------------------------------
 
 VALID_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+# Friendly display name for a box (controller or node). Kept to a safe charset so it
+# can be dropped into HTML/JS without escaping surprises.
+BOX_LABEL_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
+
+
+def clean_box_label(label, default=""):
+    """Normalize a user-supplied box display name. '' -> default; raises on bad chars."""
+    label = (label or "").strip()
+    if not label:
+        return default
+    if not BOX_LABEL_RE.match(label):
+        raise ValueError("name may use letters, digits, spaces, '.', '_' and '-' (max 40)")
+    return label
 
 
 def sanitize_name(name):
@@ -1664,6 +1677,7 @@ def get_settings(cfg):
             "sidebar": s.get("ui", {}).get("sidebar", "full"),
             "sidebar_side": s.get("ui", {}).get("sidebar_side", "left"),
         },
+        "box_name": s.get("box_name") or "Controller",
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
@@ -1679,8 +1693,10 @@ def get_settings(cfg):
 
 
 def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None,
-                  thresholds=None, ui=None, schedules=None):
+                  thresholds=None, ui=None, schedules=None, box_name=None):
     s = cfg["raw"].setdefault("settings", {})
+    if box_name is not None:
+        s["box_name"] = clean_box_label(box_name, default="Controller")
     if theme is not None:
         t = s.setdefault("theme", {})
         if "preset" in theme:
@@ -2244,6 +2260,21 @@ def add_node(reg, name, ssh_host, ssh_user="ubuntu", ssh_port=22, remote_port=87
     return node
 
 
+def set_node_label(reg, name, label):
+    """Set (or clear) a node's friendly display name. The registry `name` key — used by
+    tunnels, targeting and selection — is left untouched. Returns the cleaned label."""
+    node = find_node(reg, name)
+    if not node:
+        raise ValueError(f"no such box: {name}")
+    label = clean_box_label(label, default="")
+    if label and label != node.get("name"):
+        node["label"] = label
+    else:
+        node.pop("label", None)          # blank or same-as-name => no override
+    save_nodes(reg)
+    return node.get("label") or node.get("name")
+
+
 def remove_node(reg, name):
     n = find_node(reg, name)
     if not n:
@@ -2258,6 +2289,7 @@ def node_public_view(node, tunnels=None):
     u, _ = node_creds(node)
     row = {
         "name": node.get("name"),
+        "label": node.get("label") or node.get("name"),
         "ssh_host": node.get("ssh_host"),
         "ssh_user": node.get("ssh_user"),
         "ssh_port": node.get("ssh_port", 22),
@@ -2295,16 +2327,17 @@ def fleet_aggregate(cfg, timeout=8):
     """The controller + every node, summarized for the Fleet view. Never raises
     per-row — unreachable boxes are reported as such."""
     rows = []
+    box_name = (cfg["raw"].get("settings", {}).get("box_name") or "Controller")
     try:
         insts = cfg["instances"]
-        rows.append({"name": CONTROLLER_ROW, "controller": True, "reachable": True,
-                     "bots": len(insts),
+        rows.append({"name": CONTROLLER_ROW, "label": box_name, "controller": True,
+                     "reachable": True, "bots": len(insts),
                      "running": sum(1 for i in insts if instance_status(i) == "running"),
                      "bot_names": [i.get("name") for i in insts],
                      "host": _sysinfo()})
     except Exception as e:
-        rows.append({"name": CONTROLLER_ROW, "controller": True, "reachable": False,
-                     "error": str(e), "bots": 0, "running": 0})
+        rows.append({"name": CONTROLLER_ROW, "label": box_name, "controller": True,
+                     "reachable": False, "error": str(e), "bots": 0, "running": 0})
     for n in load_nodes()["nodes"]:
         row = node_public_view(n, TUNNELS)
         row["controller"] = False
@@ -3033,6 +3066,7 @@ SWITCHER_BAR = """
 </div>
 <script>
 window.ABM_CURRENT_NODE="__ABM_NODE__";
+window.ABM_CURRENT_LABEL="__ABM_LABEL__";
 function abmEsc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 async function abmSelectNode(name){
   try{ await fetch('/api/node/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}); }catch(e){}
@@ -3046,7 +3080,7 @@ async function abmSelectNode(name){
     var html='<option value="">★ Controller</option>';
     (d.nodes||[]).forEach(function(n){
       var off=(n.tunnel&&n.tunnel.alive)?'':' (offline)';
-      html+='<option value="'+abmEsc(n.name)+'"'+(n.name===cur?' selected':'')+'>'+abmEsc(n.name)+off+'</option>';
+      html+='<option value="'+abmEsc(n.name)+'"'+(n.name===cur?' selected':'')+'>'+abmEsc(n.label||n.name)+off+'</option>';
     });
     sel.innerHTML=html; if(cur)sel.value=cur;
     var w=document.getElementById('abmNodeWhich'); if(w)w.textContent=cur?'remote node':'';
@@ -3181,10 +3215,12 @@ class Handler(BaseHTTPRequestHandler):
                 or path.startswith("/api/nodes")     # /api/nodes, .../remove, .../do*
                 or path.startswith("/api/fleet/"))
 
-    def _inject_switcher_str(self, text, current):
+    def _inject_switcher_str(self, text, current, label=""):
         if "<body>" not in text or "abmNodeBar" in text:
             return text
-        bar = SWITCHER_BAR.replace("__ABM_NODE__", html.escape(current or "", quote=True))
+        bar = (SWITCHER_BAR
+               .replace("__ABM_NODE__", html.escape(current or "", quote=True))
+               .replace("__ABM_LABEL__", html.escape(label or current or "", quote=True)))
         return text.replace("<body>", "<body>" + bar, 1)
 
     def _proxy_to_node(self, node):
@@ -3217,7 +3253,8 @@ class Handler(BaseHTTPRequestHandler):
         if "text/html" in ctype.lower():
             try:
                 rbody = self._inject_switcher_str(
-                    rbody.decode("utf-8", "replace"), node["name"]).encode("utf-8")
+                    rbody.decode("utf-8", "replace"), node["name"],
+                    node.get("label") or node["name"]).encode("utf-8")
             except Exception:
                 pass
         self.send_response(status)
@@ -3247,7 +3284,8 @@ class Handler(BaseHTTPRequestHandler):
             "<button onclick=\"abmSelectNode('')\" style='background:#1c5;border:0;color:#06240f;"
             "font-weight:700;border-radius:8px;padding:.5rem .9rem;cursor:pointer'>"
             "Back to controller</button></div></body></html>")
-        body = self._inject_switcher_str(page, node["name"]).encode("utf-8")
+        body = self._inject_switcher_str(page, node["name"],
+                                         node.get("label") or node["name"]).encode("utf-8")
         self.send_response(502)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -3579,7 +3617,8 @@ class Handler(BaseHTTPRequestHandler):
                                     console_presets=p.get("console_presets"),
                                     thresholds=p.get("thresholds"),
                                     ui=p.get("ui"),
-                                    schedules=p.get("schedules"))
+                                    schedules=p.get("schedules"),
+                                    box_name=p.get("box_name"))
                 return self._json({"ok": True, "settings": out})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
@@ -3644,6 +3683,19 @@ class Handler(BaseHTTPRequestHandler):
             if TUNNELS is not None:
                 TUNNELS.drop(p.get("name"))
             return self._json({"ok": True})
+
+        # controller: set a node's friendly display name (registry key is unchanged)
+        if path == "/api/nodes/label":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            reg = load_nodes()
+            try:
+                label = set_node_label(reg, p.get("name"), p.get("label"))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True, "label": label})
 
         # controller: bulk start/stop/restart across this box + nodes
         if path == "/api/fleet/action":
@@ -6176,9 +6228,14 @@ function navHtml(){
   }).join('')+'</div>';
 }
 function sbBrand(){ return '<div class="sbrand"><span class="dot"></span><span class="txt">Aquarius<small>BOT MANAGER v'+esc(ABMVER)+'</small></span></div>'; }
-// Name of the box whose UI you're currently viewing: the controller's own page
-// (no node selected) is "Controller"; a proxied node page shows that node's name.
-function curBoxLabel(){ return (typeof window.ABM_CURRENT_NODE!=='undefined'&&window.ABM_CURRENT_NODE)||'Controller'; }
+// Name of the box whose UI you're currently viewing: a proxied node page shows that
+// node's label, the controller's own page shows its configured box name ("Controller"
+// by default). Both are user-settable in the Boxes modal.
+function curBoxLabel(){
+  if(typeof window.ABM_CURRENT_NODE!=='undefined'&&window.ABM_CURRENT_NODE)
+    return window.ABM_CURRENT_LABEL||window.ABM_CURRENT_NODE;
+  return (SETTINGS&&SETTINGS.box_name)||'Controller';
+}
 function sbBox(){ return '<div class="boxchip" onclick="openBoxes()"><span class="bdot"></span><span class="txt">★ '+esc(curBoxLabel())+'</span><span class="car">▾</span></div>'; }
 function sbFoot(){ return '<div class="sfoot"><div class="nav"><a onclick="location.href=\'/logout\'"><span class="ic">⏻</span><span class="lbl">Log out</span></a></div></div>'; }
 
@@ -6295,7 +6352,7 @@ async function loadFleetView(){
     const cores=host.cpus||1, load0=host.load?host.load[0]:0;
     const cpu=Math.min(100,Math.round(100*load0/cores));
     const mem=host.mem_total?Math.round(100*host.mem_used/host.mem_total):0;
-    const name=r.controller?'★ Controller':esc(r.name);
+    const name=(r.controller?'★ ':'')+esc(r.label||r.name);
     const sub=r.controller?'controller':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
     const stat=r.reachable?`${r.running||0}/${r.bots||0} bots running`:('<span style="color:var(--crash)">offline'+(r.error?(' — '+esc(r.error)):'')+'</span>');
     const gauges=(r.reachable&&host.mem_total)?(g('CPU',(host.load?host.load[0].toFixed(2):'?')+' load',cpu)+'<div style="height:.5rem"></div>'+g('MEM',mem+'% used',mem)):'';
@@ -6626,6 +6683,19 @@ async function openConnection(){
 function closeConnection(e){ if(e&&e.target!==$('connScrim'))return; $('connScrim').classList.remove('open'); }
 
 // ---- Boxes (multi-VPS controller) ----
+// Rename a box: the controller's name lives in settings.box_name; a node's is a
+// display label over its (unchanged) registry key. Refreshes every place the name shows.
+async function renameBox(isController, name, current){
+  const v=prompt(isController?'Name for the controller box:':'Display name for this box:', current||'');
+  if(v===null) return;
+  let d;
+  if(isController){ d=await api('/api/settings','POST',{box_name:v.trim()}); if(d&&d.settings) SETTINGS=d.settings; }
+  else { d=await api('/api/nodes/label','POST',{name:name,label:v.trim()}); }
+  if(d&&d.error){ alert('✗ '+d.error); return; }
+  loadBoxes();
+  try{ renderSidebar(SETTINGS&&SETTINGS.ui); }catch(e){}
+  try{ showView(CURVIEW); }catch(e){}
+}
 async function openBoxes(){ $('boxScrim').classList.add('open'); $('boxMsg').textContent=''; await loadBoxes(); }
 function closeBoxes(e){ if(e&&e.target!==$('boxScrim'))return; $('boxScrim').classList.remove('open'); }
 function boxMode(){
@@ -6653,14 +6723,15 @@ async function loadBoxes(){
     const up=r.reachable, col=up?'var(--ok,#3a6f5a)':'var(--crash,#c25)';
     const meta=up?((r.running||0)+'/'+(r.bots||0)+' bots running'+hostBit(r.host)):('offline'+(r.error?(' — '+esc(r.error)):''));
     const sub=r.controller?'controller':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
-    const right=r.controller?'<span class="hint">controller</span>':
-      (`<button onclick="openNode('${esc(r.name)}')">Open</button> `+
-       (r.do?`<button class="danger" onclick="destroyBox('${esc(r.name)}',this)">Destroy</button> `:'')+
-       `<button class="danger" onclick="removeBox('${esc(r.name)}',this)">Remove</button>`);
+    const ren=`<button title="Rename this box" onclick="renameBox(${r.controller?'true':'false'},'${jsq(r.name)}','${jsq(r.label||r.name)}')">✎</button>`;
+    const right=ren+(r.controller?' <span class="hint">controller</span>':
+      (` <button onclick="openNode('${jsq(r.name)}')">Open</button> `+
+       (r.do?`<button class="danger" onclick="destroyBox('${jsq(r.name)}',this)">Destroy</button> `:'')+
+       `<button class="danger" onclick="removeBox('${jsq(r.name)}',this)">Remove</button>`));
     return `<div style="display:flex;align-items:center;gap:.6rem;padding:.45rem .6rem;border:1px solid var(--line);border-radius:9px">
       <span style="width:9px;height:9px;border-radius:50%;background:${col};flex:none"></span>
       <div style="flex:1;min-width:0">
-        <div style="font-weight:600">${esc(r.name)} <span class="hint" style="font-weight:400;font-family:var(--mono)">${sub}</span></div>
+        <div style="font-weight:600">${esc(r.label||r.name)} <span class="hint" style="font-weight:400;font-family:var(--mono)">${sub}</span></div>
         <div class="hint">${meta}</div>
       </div>${right}</div>`;
   }).join('');
