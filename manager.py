@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.14.2"
+__version__ = "1.14.3"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5154,11 +5154,14 @@ main{padding:1.6rem;max-width:1200px;margin:0 auto}
 .ptag.aqua{color:var(--acc);border-color:var(--acc-dim)}
 .ptag.zenith{color:#5cc8ff;border-color:#27506b}
 .row{display:flex;gap:.4rem;flex-wrap:wrap}
-/* The label is centered on its own; the icon is pulled out of flow to the left edge so
-   it can't shove the word off-centre (the ⟳/▶/■ glyphs have different metrics). */
-.row button{flex:1;min-width:64px;position:relative;display:inline-flex;align-items:center;justify-content:center}
-.row button .ic{position:absolute;left:.5rem;top:50%;transform:translateY(-50%);
-  font-style:normal;display:inline-flex;align-items:center}
+/* Three centre tracks: the icon sits in the left track hugging the label, while the
+   label lives in its own centre track so differing ⟳/▶/■ glyph widths can't shove it. */
+.row button{flex:1 1 0;min-width:84px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center}
+.row button .ic{grid-column:1;justify-self:end;margin-right:.35rem;font-style:normal;display:inline-flex;align-items:center}
+.row button .lbl{grid-column:2;justify-self:center}
+/* Icon-only utility buttons (menu / rename / delete) stay compact instead of grabbing an
+   equal flex share — that crowding was shrinking the action buttons below usable size. */
+.row button.mini{flex:0 0 auto;min-width:40px;display:inline-flex;justify-content:center;padding:.5rem .55rem}
 .spin{display:inline-block;width:11px;height:11px;border:2px solid #ffffff33;border-top-color:var(--acc);
   border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:.3rem}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -6016,12 +6019,12 @@ async function refresh(){
       <div class="cstate s-${i.conn?i.conn.state:'offline'}">${connLabel(i.conn)}</div>
       ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
       <div class="row">
-        <button class="go" onclick="act('${jsq(i.name)}','start',this)"><i class="ic">▶</i>Start</button>
-        <button class="warn" onclick="act('${jsq(i.name)}','restart',this)"><i class="ic">⟳</i>Restart</button>
-        <button class="danger" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i>Stop</button>
-        <button onclick="openDrawer('${jsq(i.name)}')">⋯</button>
-        <button title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
-        <button class="danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
+        <button class="go" onclick="act('${jsq(i.name)}','start',this)"><i class="ic">▶</i><span class="lbl">Start</span></button>
+        <button class="warn" onclick="act('${jsq(i.name)}','restart',this)"><i class="ic">⟳</i><span class="lbl">Restart</span></button>
+        <button class="danger" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i><span class="lbl">Stop</span></button>
+        <button class="mini" title="More" onclick="openDrawer('${jsq(i.name)}')">⋯</button>
+        <button class="mini" title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
+        <button class="mini danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
       </div>
     </div>`).join('');
   updateSidebarLive();
