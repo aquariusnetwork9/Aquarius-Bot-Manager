@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -4938,7 +4938,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .close{font-size:1.2rem;line-height:1;padding:.2rem .55rem}
 /* modal */
 .modal{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-  width:min(520px,92vw);background:var(--panel);border:1px solid var(--line);
+  width:min(520px,92vw);max-height:92vh;overflow-y:auto;background:var(--panel);border:1px solid var(--line);
   border-radius:16px;padding:1.3rem 1.4rem;display:flex;flex-direction:column;gap:.7rem;
   box-shadow:0 30px 80px #000a}
 .mhead{font-weight:800;font-size:1.15rem;letter-spacing:-.02em;margin-bottom:.2rem}
@@ -5113,6 +5113,7 @@ table.tbl tr:hover td{background:#ffffff05}
 <header id="classicHeader">
   <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small class="ver">v__ABM_VERSION__</small> <small id="clock"></small></div>
   <div class="bulk">
+    <button onclick="manualRefresh(this)" title="Refresh now">🔄 Refresh</button>
     <button onclick="openSettings()">⚙ Settings</button>
     <button onclick="openConnection()">🔗 Connect</button>
     <button onclick="openBoxes()">🖥 Boxes</button>
@@ -5129,7 +5130,7 @@ table.tbl tr:hover td{background:#ffffff05}
 <div class="topbar" id="slimTop" style="display:none"></div>
 <main>
   <div id="viewDashboard">
-    <div class="meta" id="meta">loading…</div>
+    <div class="meta" id="meta"><span id="metaText">loading…</span> <span id="syncState" class="hint" style="opacity:.6"></span></div>
     <div class="hoststrip" id="hostStrip"></div>
     <div class="grid" id="grid"></div>
   </div>
@@ -5359,7 +5360,7 @@ table.tbl tr:hover td{background:#ffffff05}
       </div>
     </div>
 
-    <div id="proxList" style="max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:.5rem">loading…</div>
+    <div id="proxList" style="display:flex;flex-direction:column;gap:.5rem">loading…</div>
     <div class="mbar"><span class="msg" id="proxMsg" style="color:var(--dim)"></span>
       <button onclick="loadProxies()">Refresh</button>
       <button onclick="closeProxies()">Close</button></div>
@@ -5608,7 +5609,7 @@ table.tbl tr:hover td{background:#ffffff05}
 </div>
 
 <script>
-let CUR=null, TAB='logs', logTimer=null, INSTMAP={};
+let CUR=null, TAB='logs', logTimer=null, INSTMAP={}, LAST_REFRESH=0, SYNCING=false;
 const $=id=>document.getElementById(id);
 
 async function api(path,method='GET',body){
@@ -5669,14 +5670,18 @@ async function saveThresholds(){
 }
 
 async function refresh(){
+  SYNCING=true; syncAgo();
   loadHost();
   let d;
-  try{ d=await api('/api/instances'); }catch(e){ $('meta').textContent='connection lost'; return; }
+  try{ d=await api('/api/instances'); }
+  catch(e){ $('metaText').textContent='connection lost'; SYNCING=false; syncAgo(); return; }
+  LAST_REFRESH=Date.now(); SYNCING=false;
   const list=d.instances||[];
   INSTMAP=Object.fromEntries(list.map(i=>[i.name,i]));
   const run=list.filter(i=>i.status==='running').length;
   const cr=list.filter(i=>i.status==='crashed').length;
-  $('meta').textContent=`${list.length} instances · ${run} running`+(cr?` · ${cr} crashed`:'');
+  $('metaText').textContent=`${list.length} instances · ${run} running`+(cr?` · ${cr} crashed`:'');
+  syncAgo();
   const g=$('grid');
   if(!list.length){g.innerHTML='<div class="empty">No bots yet. Click “➕ Add Bot” to create one.</div>';return;}
   g.innerHTML=list.map(i=>`
@@ -5700,6 +5705,20 @@ async function refresh(){
       </div>
     </div>`).join('');
   updateSidebarLive();
+}
+async function manualRefresh(btn){
+  if(!btn) return refresh();
+  const o=btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Refreshing…';
+  try{ await refresh(); } finally { btn.disabled=false; btn.innerHTML=o; }
+}
+// "synced Xs ago" freshness hint — ticked once a second from tick()
+function syncAgo(){
+  const el=$('syncState'); if(!el) return;
+  if(SYNCING){ el.textContent='· syncing…'; return; }
+  if(!LAST_REFRESH){ el.textContent=''; return; }
+  const s=Math.round((Date.now()-LAST_REFRESH)/1000);
+  el.textContent = s<2 ? '· synced just now' : ('· synced '+s+'s ago');
+  el.style.color = s>12 ? 'var(--crash)' : '';   // go red if updates have stalled
 }
 
 async function act(name,action,btn){
@@ -7316,11 +7335,15 @@ async function adopt(session,btn){
 
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function jsq(s){return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
-function tick(){$('clock').textContent=new Date().toLocaleTimeString();}
+function tick(){$('clock').textContent=new Date().toLocaleTimeString();syncAgo();}
 setInterval(tick,1000);tick();
 loadSettings();
 refresh();
-setInterval(refresh,4000);
+setInterval(refresh,3000);
+// refresh the instant the tab becomes visible / regains focus, so you never
+// stare at stale cards after switching back to the dashboard
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refresh(); });
+window.addEventListener('focus',()=>refresh());
 </script>
 </body>
 </html>
