@@ -31,6 +31,7 @@ import html
 import json
 import os
 import platform
+import posixpath
 import random
 import re
 import secrets
@@ -40,15 +41,17 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.14.4"
+__version__ = "1.15.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1135,7 +1138,9 @@ def _launch_command(inst):
 # file manager  (jailed to an allowlist of roots; realpath + symlink-escape guards)
 # ---------------------------------------------------------------------------
 
-_FS_MAX_READ = 1024 * 1024   # 1 MB editable-file ceiling
+_FS_MAX_READ = 1024 * 1024            # 1 MB editable-file ceiling
+_FS_MAX_UPLOAD = 2 * 1024 * 1024 * 1024   # 2 GB per-file upload ceiling (note: a cross-box
+                                          # upload buffers in the controller's RAM en route)
 
 
 def _base_dir(cfg):
@@ -1296,6 +1301,73 @@ def fs_delete(cfg, path, recursive=False):
     else:
         os.remove(p)
     return {"deleted": p}
+
+
+def fs_upload_target(cfg, dirpath, name):
+    """Resolve (and create intermediate dirs for) an upload target under `dirpath`.
+    `name` may be a nested a/b/c path (folder uploads carry webkitRelativePath); '..'
+    segments and absolute names are rejected, and the realpath'd parent is re-checked
+    against the roots so a planted symlink can't escape the jail. Returns the abs path."""
+    roots = file_roots(cfg)
+    base = _resolve_in_roots(dirpath, roots)
+    if not os.path.isdir(base):
+        raise ValueError("target is not a directory")
+    rel = (name or "").replace("\\", "/").strip("/")
+    parts = [seg for seg in rel.split("/") if seg and seg != "."]
+    if not parts or any(seg == ".." for seg in parts):
+        raise ValueError("invalid name")
+    target = os.path.join(base, *parts)
+    parent = os.path.dirname(target)
+    if not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    _resolve_in_roots(parent, roots)            # symlink-escape guard on the real parent
+    if os.path.isdir(target):
+        raise ValueError("a directory with that name already exists")
+    return target
+
+
+def fs_download(cfg, path):
+    """Resolve a file for download. Returns (abs_path, name, cleanup=False)."""
+    p = _resolve_in_roots(path, file_roots(cfg))
+    if not os.path.isfile(p):
+        raise ValueError("not a file")
+    return p, os.path.basename(p), False
+
+
+def fs_zip_dir(cfg, path):
+    """Zip a directory (jailed) to a temp file. Returns (tmp_path, download_name,
+    cleanup=True) — the caller must delete tmp_path after streaming."""
+    p = _resolve_in_roots(path, file_roots(cfg))
+    if not os.path.isdir(p):
+        raise ValueError("not a directory")
+    base = os.path.basename(p.rstrip("/\\")) or "folder"
+    fd, tmp = tempfile.mkstemp(suffix=".zip", prefix="abm_dl_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            wrote = False
+            for root, dirs, files in os.walk(p):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    if os.path.islink(full):
+                        continue
+                    try:
+                        z.write(full, os.path.join(base, os.path.relpath(full, p)))
+                        wrote = True
+                    except OSError:
+                        continue
+                # preserve empty directories so the folder structure round-trips
+                if not files and not dirs and root != p:
+                    z.writestr(os.path.join(base, os.path.relpath(root, p)) + "/", "")
+            if not wrote:
+                z.writestr(base + "/", "")      # empty folder -> a single dir entry
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp, base + ".zip", True
 
 
 # ---------------------------------------------------------------------------
@@ -2504,6 +2576,145 @@ def node_request(node, method, path, body=None, timeout=10):
 
 CONTROLLER_ROW = "(this box)"          # the controller's own row name in the Fleet view
 
+# ---------------------------------------------------------------------------
+# cross-box file transfer (scp over the controller's stored SSH creds)
+# ---------------------------------------------------------------------------
+
+# A box id of "" / one of these aliases means the controller's own filesystem;
+# anything else is a registered node name.
+_LOCAL_BOX_IDS = ("", "local", "controller", "this", CONTROLLER_ROW)
+
+
+def _is_local_box(box):
+    return (box or "") in _LOCAL_BOX_IDS
+
+
+def _scp_opts(node):
+    """scp option list for a node, mirroring the tunnel's SSH conventions
+    (note: scp wants -P for the port and -i for the key)."""
+    opts = ["-o", "ConnectTimeout=15",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=yes",
+            "-P", str(node.get("ssh_port", 22))]
+    if node.get("ssh_key"):
+        opts += ["-i", node["ssh_key"]]
+    return opts
+
+
+def _scp_remote(node, path):
+    return f"{node.get('ssh_user', 'ubuntu')}@{node['ssh_host']}:{path}"
+
+
+def _run_scp(args, timeout):
+    cmd = ["scp", "-r", "-q", "-p"] + args
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ValueError("transfer timed out")
+    except FileNotFoundError:
+        raise ValueError("scp not found on the controller (install openssh-client)")
+    if r.returncode != 0:
+        msg = (r.stdout.decode(errors="replace").strip() or f"scp exited {r.returncode}")
+        raise ValueError("transfer failed: " + msg[:600])
+
+
+def _node_roots(node):
+    """A node's file-manager roots (asked over its tunnel), for jailing the remote side."""
+    try:
+        return node_request(node, "GET", "/api/files", timeout=8).get("roots") or []
+    except Exception as e:
+        raise ValueError(f"couldn't reach box '{node['name']}' to check its allowed roots: {e}")
+
+
+def _jail_remote(node, path):
+    """Best-effort jail of a remote path to the node's roots. scp bypasses the node's
+    manager (it writes over raw SSH), so this is a guard against accidents rather than a
+    hard boundary — the controller already holds full SSH to the box. Symlinks on the
+    node aren't resolved here (no realpath without another round-trip)."""
+    if not path:
+        raise ValueError("path required")
+    # remote boxes are Linux: normalize as POSIX so this is correct regardless of the
+    # controller's own OS (and so the path scp sees keeps forward slashes).
+    norm = posixpath.normpath(path.replace("\\", "/"))
+    for r in _node_roots(node):
+        rr = posixpath.normpath(r)
+        if norm == rr or norm.startswith(rr + "/"):
+            return norm
+    raise ValueError(f"path is outside box '{node['name']}'s allowed roots")
+
+
+def box_roots(cfg, reg, box):
+    """The file-manager roots for a box (controller-local or a node), for the UI's
+    destination-folder default."""
+    if _is_local_box(box):
+        return file_roots(cfg)
+    node = find_node(reg, box)
+    if not node:
+        raise ValueError(f"no such box: {box}")
+    return _node_roots(node)
+
+
+def transfer_between(cfg, reg, src_box, src_path, dst_box, dst_dir, timeout=900):
+    """Copy a file/folder between two boxes via scp, using the controller's stored SSH
+    creds. Either side may be the controller ("" box). Node↔node is relayed through a
+    controller temp dir (per-box keys make a single `scp -3` impractical). Each side's
+    path is jailed to that box's file_roots."""
+    if not src_path or not dst_dir:
+        raise ValueError("source path and destination folder are required")
+    src_local, dst_local = _is_local_box(src_box), _is_local_box(dst_box)
+    src_node = None if src_local else find_node(reg, src_box)
+    dst_node = None if dst_local else find_node(reg, dst_box)
+    if not src_local and src_node is None:
+        raise ValueError(f"no such source box: {src_box}")
+    if not dst_local and dst_node is None:
+        raise ValueError(f"no such destination box: {dst_box}")
+
+    # both on the controller: a plain jailed copy, no SSH
+    if src_local and dst_local:
+        roots = file_roots(cfg)
+        sp = _resolve_in_roots(src_path, roots)
+        dd = _resolve_in_roots(dst_dir, roots)
+        if not os.path.exists(sp):
+            raise ValueError("source not found")
+        if not os.path.isdir(dd):
+            raise ValueError("destination is not a directory")
+        target = os.path.join(dd, os.path.basename(sp.rstrip("/\\")))
+        if os.path.isdir(sp):
+            shutil.copytree(sp, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(sp, target)
+        return {"ok": True, "via": "local copy", "dest": target}
+
+    # jail/normalize each side
+    src_path = _resolve_in_roots(src_path, file_roots(cfg)) if src_local else _jail_remote(src_node, src_path)
+    if src_local and not os.path.exists(src_path):
+        raise ValueError("source not found")
+    if dst_local:
+        dst_dir = _resolve_in_roots(dst_dir, file_roots(cfg))
+        if not os.path.isdir(dst_dir):
+            raise ValueError("destination is not a directory")
+    else:
+        dst_dir = _jail_remote(dst_node, dst_dir)
+
+    if src_local:                                   # controller -> node
+        _run_scp(_scp_opts(dst_node) + [src_path, _scp_remote(dst_node, dst_dir)], timeout)
+        return {"ok": True, "via": "scp", "direction": f"→ {dst_node['name']}"}
+    if dst_local:                                   # node -> controller
+        _run_scp(_scp_opts(src_node) + [_scp_remote(src_node, src_path), dst_dir], timeout)
+        return {"ok": True, "via": "scp", "direction": f"{src_node['name']} →"}
+
+    # node -> node: stage through a controller temp dir
+    tmp = tempfile.mkdtemp(prefix="abm_xfer_")
+    try:
+        _run_scp(_scp_opts(src_node) + [_scp_remote(src_node, src_path), tmp], timeout)
+        staged = [os.path.join(tmp, n) for n in os.listdir(tmp)]
+        if not staged:
+            raise ValueError("nothing was copied from the source box")
+        _run_scp(_scp_opts(dst_node) + [staged[0], _scp_remote(dst_node, dst_dir)], timeout)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return {"ok": True, "via": "scp relay", "direction": f"{src_node['name']} → {dst_node['name']}"}
+
 
 def fleet_aggregate(cfg, timeout=8):
     """The controller + every node, summarized for the Fleet view. Never raises
@@ -3378,6 +3589,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _send_file(self, abspath, download_name, cleanup=False):
+        """Stream a file to the client as an attachment (chunked, never fully buffered).
+        If cleanup, delete abspath afterwards (used for on-the-fly folder zips)."""
+        try:
+            size = os.path.getsize(abspath)
+            f = open(abspath, "rb")
+        except OSError as e:
+            return self._json({"error": str(e)}, 404)
+        try:
+            ascii_name = download_name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{urllib.parse.quote(download_name)}")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if self.command != "HEAD":
+                shutil.copyfileobj(f, self.wfile, 64 * 1024)
+        finally:
+            f.close()
+            if cleanup:
+                try:
+                    os.remove(abspath)
+                except OSError:
+                    pass
+
     def _read_body(self):
         n = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(n) if n else b""
@@ -3404,7 +3643,7 @@ class Handler(BaseHTTPRequestHandler):
     def _is_switcher_path(self, path):
         # controller-level paths always served locally so box-switching keeps working
         # even while a remote node is selected
-        return (path in ("/logout", "/api/authstatus")
+        return (path in ("/logout", "/api/authstatus", "/api/transfer", "/api/box/roots")
                 or path.startswith("/api/node/")     # /api/node/select
                 or path.startswith("/api/nodes")     # /api/nodes, .../remove, .../do*
                 or path.startswith("/api/fleet/"))
@@ -3553,6 +3792,19 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
 
+        # download a file (streamed) or a folder (zipped on the fly)
+        if path == "/api/files/download":
+            try:
+                target = q.get("path", [""])[0]
+                rp = _resolve_in_roots(target, file_roots(cfg))
+                if os.path.isdir(rp):
+                    abspath, name, cleanup = fs_zip_dir(cfg, target)
+                else:
+                    abspath, name, cleanup = fs_download(cfg, target)
+                return self._send_file(abspath, name, cleanup=cleanup)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
         if path == "/api/schema":
             return self._json({"schema": ZENITH_SCHEMA})
 
@@ -3569,6 +3821,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/nodes":
             reg = load_nodes()
             return self._json({"nodes": [node_public_view(n, TUNNELS) for n in reg["nodes"]]})
+
+        # controller: a box's file-manager roots (for the cross-box transfer dest default).
+        # Served locally so it works even while a node is selected.
+        if path == "/api/box/roots":
+            try:
+                return self._json({"roots": box_roots(self._cfg(), load_nodes(),
+                                                       q.get("box", [""])[0])})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
 
         # automation: job definitions + live runtime (next/last run, watchdog tries)
         if path == "/api/schedules":
@@ -3832,6 +4093,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(e)}, 400)
             except json.JSONDecodeError as e:
                 return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # controller: copy a file/folder between two boxes (scp over stored SSH creds).
+        # Served locally (switcher path) so it can orchestrate even while a node is selected.
+        if path == "/api/transfer":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            try:
+                return self._json(transfer_between(
+                    self._cfg(), load_nodes(),
+                    p.get("src_box", ""), p.get("src_path", ""),
+                    p.get("dst_box", ""), p.get("dst_dir", "")))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
 
         # controller: register a new node (other VPS box). Accepts user@host[:port] in
         # "target" or explicit fields. Brings the tunnel up and probes it so the UI
@@ -4278,6 +4554,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"invalid JSON: {e}"}, 400)
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
+
+        # upload a file (raw request body; folder uploads send each file with its
+        # webkitRelativePath as ?name). Streamed straight to disk — never JSON-parsed,
+        # so this must be matched BEFORE the JSON file-manager block below.
+        if path == "/api/files/upload":
+            q = parse_qs(urlparse(self.path).query)
+            n = int(self.headers.get("Content-Length", 0))
+            if n > _FS_MAX_UPLOAD:
+                # drain so the connection stays usable, then refuse
+                try:
+                    self.rfile.read(n)
+                except Exception:
+                    pass
+                return self._json(
+                    {"error": f"file too large (limit {_FS_MAX_UPLOAD // (1024 * 1024)} MB)"}, 413)
+            try:
+                target = fs_upload_target(cfg, q.get("dir", [""])[0], q.get("name", [""])[0])
+            except ValueError as e:
+                try:
+                    self.rfile.read(n)        # consume the body so the socket isn't left mid-message
+                except Exception:
+                    pass
+                return self._json({"error": str(e)}, 400)
+            written = 0
+            try:
+                with open(target, "wb") as out:
+                    remaining = n
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        remaining -= len(chunk)
+                        written += len(chunk)
+                _resolve_in_roots(target, file_roots(cfg))   # final symlink-escape guard
+            except (OSError, ValueError) as e:
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True, "path": target, "size": written})
 
         # file manager (jailed) — create / edit / rename / delete
         if path.startswith("/api/files/"):
@@ -5718,14 +6036,18 @@ table.tbl tr:hover td{background:#ffffff05}
 <div class="scrim" id="filesScrim" onclick="closeFiles(event)">
   <div class="modal" style="width:min(840px,96vw)" onclick="event.stopPropagation()">
     <div class="mhead">Files</div>
-    <div class="hint" style="margin:-.3rem 0 .5rem">Jailed to the manager's allowed roots. Create, edit, rename and delete files &amp; folders.</div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Jailed to the manager's allowed roots. Upload &amp; download from your computer, create, edit, rename, delete, and (with boxes registered) ↗ send files between boxes.</div>
     <div id="fbBrowse">
       <div class="fbbar">
         <select id="fbRoot" onchange="fbGotoRoot()" title="jump to a root"></select>
         <button onclick="fbUp()">⬆ Up</button>
         <button onclick="fbMkdir()">+ Folder</button>
         <button onclick="fbNewFile()">+ File</button>
+        <button onclick="fbPickUpload(false)" title="upload file(s) from your computer">📤 Upload</button>
+        <button onclick="fbPickUpload(true)" title="upload a whole folder from your computer">📤 Folder</button>
         <button onclick="fbReload()">⟳</button>
+        <input id="fbUpFiles" type="file" multiple style="display:none" onchange="fbUpload(this.files);this.value='';">
+        <input id="fbUpDir" type="file" webkitdirectory style="display:none" onchange="fbUpload(this.files);this.value='';">
       </div>
       <div class="fbpath" id="fbPath"></div>
       <div id="fbList" style="max-height:54vh;overflow:auto">loading…</div>
@@ -7438,12 +7760,16 @@ function fbRender(d){
   if(cont) sel.value=cont;
   $('fbPath').textContent=d.path;
   if(!d.entries.length){ $('fbList').innerHTML='<div class="hint">empty folder</div>'; return; }
+  // cross-box "send to another box" is only meaningful in controller mode (boxes registered)
+  const xbox=typeof window.ABM_CURRENT_NODE!=='undefined';
   $('fbList').innerHTML=d.entries.map(e=>{
     const open=e.type==='dir'?`fbNav('${jsq(e.path)}')`:`fbOpen('${jsq(e.path)}')`;
     return `<div class="frow2">
       <span class="ficon">${e.type==='dir'?'📁':'📄'}</span>
       <span class="fn" onclick="${open}">${esc(e.name)}</span>
       <span class="fmeta">${e.type==='dir'?'':fmtBytes(e.size)}</span>
+      <button title="${e.type==='dir'?'download as .zip':'download'}" onclick="fbDownload('${jsq(e.path)}')">⬇</button>
+      ${xbox?`<button title="send to another box" onclick="fbSendToBox('${jsq(e.path)}','${jsq(e.name)}')">↗</button>`:''}
       <button title="rename" onclick="fbRename('${jsq(e.path)}','${jsq(e.name)}')">✎</button>
       <button class="danger" title="delete" onclick="fbDelete('${jsq(e.path)}',${e.type==='dir'})">🗑</button>
     </div>`;
@@ -7486,6 +7812,53 @@ async function fbDelete(path,isdir){
   const d=await api('/api/files/delete','POST',{path,recursive:isdir});
   if(d.error){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ '+d.error; return; }
   fbReload();
+}
+function fbPickUpload(isDir){ $(isDir?'fbUpDir':'fbUpFiles').click(); }
+async function fbUpload(fileList){
+  const files=[...(fileList||[])]; if(!files.length)return;
+  if(!FBCWD){ $('fbMsg').style.color='var(--crash)'; $('fbMsg').textContent='✗ pick a folder first'; return; }
+  let ok=0, fail=0, lastErr='';
+  for(let i=0;i<files.length;i++){
+    const f=files[i], rel=f.webkitRelativePath||f.name;
+    $('fbMsg').style.color='var(--dim)';
+    $('fbMsg').textContent=`uploading ${i+1}/${files.length}: ${rel} …`;
+    try{
+      const r=await fetch('/api/files/upload?dir='+encodeURIComponent(FBCWD)+'&name='+encodeURIComponent(rel),{method:'POST',body:f});
+      const d=await r.json().catch(()=>({error:'bad response ('+r.status+')'}));
+      if(d&&d.error){ fail++; lastErr=d.error; } else { ok++; }
+    }catch(e){ fail++; lastErr=String(e); }
+  }
+  $('fbMsg').style.color=fail?'var(--crash)':'var(--dim)';
+  $('fbMsg').textContent='✓ uploaded '+ok+' file(s)'+(fail?(' · ✗ '+fail+' failed ('+lastErr+')'):'');
+  fbReload();
+}
+function fbDownload(path){
+  // GET with the session cookie; Content-Disposition makes the browser save it
+  // (a folder comes back as a .zip). Works for remote boxes via the reverse proxy.
+  const a=document.createElement('a');
+  a.href='/api/files/download?path='+encodeURIComponent(path);
+  a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove();
+}
+async function fbSendToBox(path,name){
+  // copy this file/folder to another box via the controller (scp over SSH).
+  const cur=(typeof window.ABM_CURRENT_NODE!=='undefined')?(window.ABM_CURRENT_NODE||''):'';
+  let boxes=[{id:'',label:'this box (controller)'}];
+  try{ const d=await api('/api/nodes'); (d.nodes||[]).forEach(n=>boxes.push({id:n.name,label:n.label||n.name})); }catch(e){}
+  const dests=boxes.filter(b=>b.id!==cur);
+  if(!dests.length){ alert('No other boxes are registered to send to.'); return; }
+  const pick=prompt('Send "'+name+'" to which box?\n\n'+dests.map((b,i)=>(i+1)+') '+b.label).join('\n')+'\n\nEnter a number:');
+  if(!pick)return;
+  const idx=parseInt(pick,10)-1;
+  if(isNaN(idx)||idx<0||idx>=dests.length){ alert('Invalid choice.'); return; }
+  const dst=dests[idx];
+  let def='';
+  try{ const r=await api('/api/box/roots?box='+encodeURIComponent(dst.id)); def=(r.roots&&r.roots[0])||''; }catch(e){}
+  const dstdir=prompt('Destination folder on '+dst.label+':',def);
+  if(!dstdir)return;
+  $('fbMsg').style.color='var(--dim)'; $('fbMsg').textContent='transferring "'+name+'" → '+dst.label+' … (this can take a moment)';
+  const res=await api('/api/transfer','POST',{src_box:cur,src_path:path,dst_box:dst.id,dst_dir:dstdir});
+  $('fbMsg').style.color=res.error?'var(--crash)':'var(--dim)';
+  $('fbMsg').textContent=res.error?('✗ '+res.error):('✓ sent to '+dst.label+(res.via?(' ('+res.via+')'):''));
 }
 function openSettings(){
   $('settingsScrim').classList.add('open');
