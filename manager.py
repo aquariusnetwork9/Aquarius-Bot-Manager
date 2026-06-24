@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1212,6 +1212,16 @@ def discover(basedir, out_path):
 VALID_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+def sanitize_name(name):
+    """Turn arbitrary user input into a Linux-safe instance/folder name:
+    keep letters/digits/._-, collapse any run of other characters into a single
+    '-', and trim leading/trailing separators (so we never make a hidden dir or a
+    '..' path component). Returns '' if nothing usable remains."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip())
+    s = re.sub(r"-{2,}", "-", s).strip("-._")
+    return s
+
+
 def add_instance(cfg, name, directory, launch_cmd=None, config_file=None,
                  stop_keys=None, stop_timeout=None, autostart=False, limits=None):
     """Add a new instance to the config. Returns the new instance dict.
@@ -1522,13 +1532,15 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
                  autostart=True):
     """Start a background deploy: download the fork's launcher, unzip into `directory`,
     register the instance. Returns immediately; poll DEPLOY_JOB for progress.
-    autostart defaults True so a VPS reboot relaunches the bot via the boot unit."""
-    name = (name or "").strip()
-    if not VALID_NAME.match(name):
-        raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
+    autostart defaults True so a VPS reboot relaunches the bot via the boot unit.
+    `name` is sanitized to a Linux-safe form; when `directory` is omitted the bot's
+    folder is created automatically as <base>/<name>."""
+    name = sanitize_name(name)
+    if not name:
+        raise ValueError("a name is required (letters & digits, e.g. bot1)")
     cfg = load_config(cfg_path)
     if name in cfg["by_name"]:
-        raise ValueError(f"instance '{name}' already exists")
+        raise ValueError(f"a bot named '{name}' already exists")
     repo = _resolve_repo(source, owner_repo)
     directory = os.path.abspath(os.path.expanduser(
         directory.strip() if directory and directory.strip() else os.path.join(_base_dir(cfg), name)))
@@ -5099,8 +5111,7 @@ table.tbl tr:hover td{background:#ffffff05}
     <button onclick="openFiles()">📁 Files</button>
     <button onclick="openProxies()">🌐 Proxies</button>
     <button onclick="openScan()">⟲ Scan existing</button>
-    <button class="go" onclick="openDeploy()">🚀 Deploy</button>
-    <button onclick="openAdd()">+ New instance</button>
+    <button class="go" onclick="openDeploy()">➕ Add Bot</button>
     <button class="go" onclick="bulk('start')">▶ Start all</button>
     <button class="warn" onclick="bulk('restart')">⟳ Restart all</button>
     <button class="danger" onclick="bulk('stop')">■ Stop all</button>
@@ -5349,8 +5360,8 @@ table.tbl tr:hover td{background:#ffffff05}
 
 <div class="scrim" id="deployScrim" onclick="closeDeploy(event)">
   <div class="modal" onclick="event.stopPropagation()">
-    <div class="mhead">Deploy a proxy</div>
-    <div class="hint" style="margin:-.3rem 0 .4rem">Downloads the chosen fork's launcher and registers a new instance. The launcher fetches Java + the jar on first start.</div>
+    <div class="mhead">Add a bot</div>
+    <div class="hint" style="margin:-.3rem 0 .4rem">Creates a new folder for the bot, downloads the chosen fork's launcher into it, and registers it. The launcher fetches Java + the jar on first start.</div>
     <label>Source
       <div id="depSrc" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">
         <div class="chip sel" data-s="aquarius" onclick="pickSrc('aquarius',this)">AquariusProxy</div>
@@ -5360,10 +5371,9 @@ table.tbl tr:hover td{background:#ffffff05}
     </label>
     <label id="depRepoWrap" style="display:none">Custom repo <span class="hint">owner/repo on GitHub — must publish a launcher-v3 release</span>
       <input id="dep_repo" placeholder="youruser/YourProxyFork" autocomplete="off"></label>
-    <label>Name <span class="hint">letters, digits, . _ -</span>
-      <input id="dep_name" placeholder="bot1" autocomplete="off" oninput="depAutoDir()"></label>
-    <label>Directory <span class="hint">where to install (auto-filled from base dir)</span>
-      <input id="dep_dir" placeholder="/home/ubuntu/zenith/bot1" autocomplete="off" oninput="depDirEdited=true"></label>
+    <label>Name <span class="hint">spaces &amp; symbols become "-" (Linux-safe)</span>
+      <input id="dep_name" placeholder="bot1" autocomplete="off" oninput="depPreview()"></label>
+    <div class="hint" id="dep_path" style="margin:-.2rem 0 .4rem"></div>
     <div class="mrow">
       <label style="flex:1">Memory cap <span class="hint">e.g. 2G — optional</span>
         <input id="dep_mem" placeholder="2G" autocomplete="off"></label>
@@ -5375,7 +5385,7 @@ table.tbl tr:hover td{background:#ffffff05}
     <pre class="log" id="depLog" style="display:none;min-height:120px;max-height:32vh">…</pre>
     <div class="mbar"><span class="msg" id="depMsg" style="flex:1;color:var(--dim)"></span>
       <button onclick="closeDeploy()">Close</button>
-      <button class="go" id="depBtn" onclick="startDeploy()">Deploy</button></div>
+      <button class="go" id="depBtn" onclick="startDeploy()">Add Bot</button></div>
   </div>
 </div>
 
@@ -5527,37 +5537,6 @@ table.tbl tr:hover td{background:#ffffff05}
   </div>
 </div>
 
-<div class="scrim" id="addScrim" onclick="closeAdd(event)">
-  <div class="modal" onclick="event.stopPropagation()">
-    <div class="mhead">New instance</div>
-    <label>Name <span class="hint">letters, digits, . _ -</span>
-      <input id="f_name" placeholder="bot3" autocomplete="off"></label>
-    <label>Directory
-      <input id="f_dir" placeholder="/home/youruser/zenith/bot3" autocomplete="off"></label>
-    <label>Launch command <span class="hint">default ./launch.sh</span>
-      <input id="f_launch" placeholder="./launch.sh" autocomplete="off"></label>
-    <label>Config file <span class="hint">default config.json</span>
-      <input id="f_cfg" placeholder="config.json" autocomplete="off"></label>
-    <div class="mrow">
-      <label style="flex:2">Stop keys <span class="hint">comma sep, default C-c</span>
-        <input id="f_keys" placeholder="C-c" autocomplete="off"></label>
-      <label style="flex:1">Stop timeout
-        <input id="f_to" type="number" placeholder="15" autocomplete="off"></label>
-    </div>
-    <div class="mrow">
-      <label style="flex:1">Memory cap <span class="hint">e.g. 2G — blank = none</span>
-        <input id="f_mem" placeholder="2G" autocomplete="off"></label>
-      <label style="flex:1">CPU cap % <span class="hint">100 = one core</span>
-        <input id="f_cpu" type="number" placeholder="200" autocomplete="off"></label>
-    </div>
-    <div class="mbar">
-      <span class="msg" id="addMsg"></span>
-      <button onclick="closeAdd()">Cancel</button>
-      <button class="go" id="addBtn" onclick="submitAdd()">Add</button>
-    </div>
-  </div>
-</div>
-
 <div class="scrim" id="scrim" onclick="closeDrawer()"></div>
 <aside class="drawer" id="drawer">
   <header>
@@ -5691,7 +5670,7 @@ async function refresh(){
   const cr=list.filter(i=>i.status==='crashed').length;
   $('meta').textContent=`${list.length} instances · ${run} running`+(cr?` · ${cr} crashed`:'');
   const g=$('grid');
-  if(!list.length){g.innerHTML='<div class="empty">No instances configured. Add them to instances.json.</div>';return;}
+  if(!list.length){g.innerHTML='<div class="empty">No bots yet. Click “➕ Add Bot” to create one.</div>';return;}
   g.innerHTML=list.map(i=>`
     <div class="card ${i.status}">
       <div class="top">
@@ -6151,7 +6130,7 @@ function navModel(){
     {g:'Infrastructure'},
     {ic:'🖥',lbl:'Boxes',act:'openBoxes()'},
     {ic:'🌐',lbl:'Proxies',act:'openProxies()'},
-    {ic:'🚀',lbl:'Deploy',act:'openDeploy()'},
+    {ic:'➕',lbl:'Add Bot',act:'openDeploy()'},
     {ic:'📁',lbl:'Files',act:'openFiles()'},
     {g:'System'},
     {ic:'🔗',lbl:'Connect',act:'openConnection()'},
@@ -6215,7 +6194,7 @@ function renderSlimTop(){
     +'<button class="go" onclick="bulk(\'start\')">▶ Start all</button>'
     +'<button class="warn" onclick="bulk(\'restart\')">⟳ Restart all</button>'
     +'<button class="danger" onclick="bulk(\'stop\')">■ Stop all</button>'
-    +'<button onclick="openAdd()">+ New</button>';
+    +'<button class="go" onclick="openDeploy()">➕ Add Bot</button>';
 }
 function refreshNavActive(){
   const sb=$('sidebar'); if(!sb)return;
@@ -6557,7 +6536,7 @@ function palItems(){
   });
   const modal=[
     {ic:'🖥',lbl:'Boxes',go:()=>openBoxes()},{ic:'🌐',lbl:'Proxies',go:()=>openProxies()},
-    {ic:'🚀',lbl:'Deploy',go:()=>openDeploy()},{ic:'📁',lbl:'Files',go:()=>openFiles()},
+    {ic:'➕',lbl:'Add Bot',go:()=>openDeploy()},{ic:'📁',lbl:'Files',go:()=>openFiles()},
     {ic:'🔗',lbl:'Connect',go:()=>openConnection()},{ic:'⟲',lbl:'Scan existing',go:()=>openScan()},
     {ic:'⚙',lbl:'Settings',go:()=>openSettings()},
   ];
@@ -6992,33 +6971,35 @@ async function bulkSelectErrored(btn){
   $('bulkMsg').textContent=er.length?('selected '+er.length+' errored bot'+(er.length>1?'s':'')):'no errored bots';
 }
 
-let depSrc='aquarius', depTimer=null, depDirEdited=false;
+let depSrc='aquarius', depTimer=null;
+// Mirror of the server's sanitize_name(): make a Linux-safe folder/instance name.
+function lxSafe(s){ return (s||'').trim().replace(/[^A-Za-z0-9._-]+/g,'-').replace(/-{2,}/g,'-').replace(/^[-._]+|[-._]+$/g,''); }
 function openDeploy(){
-  depDirEdited=false; depSrc='aquarius';
+  depSrc='aquarius';
   document.querySelectorAll('#depSrc .chip').forEach(c=>c.classList.toggle('sel',c.dataset.s==='aquarius'));
   $('depRepoWrap').style.display='none';
-  ['dep_name','dep_dir','dep_repo','dep_mem','dep_cpu'].forEach(id=>$(id).value='');
+  ['dep_name','dep_repo','dep_mem','dep_cpu'].forEach(id=>$(id).value='');
+  $('dep_path').textContent='';
   $('depLog').style.display='none'; $('depLog').textContent='';
   $('depMsg').textContent=''; $('depBtn').disabled=false;
   $('deployScrim').classList.add('open'); setTimeout(()=>$('dep_name').focus(),50);
 }
 function closeDeploy(e){ if(e&&e.target!==$('deployScrim'))return; if(depTimer){clearInterval(depTimer);depTimer=null;} $('deployScrim').classList.remove('open'); }
 function pickSrc(s,el){ depSrc=s; document.querySelectorAll('#depSrc .chip').forEach(c=>c.classList.toggle('sel',c.dataset.s===s)); $('depRepoWrap').style.display=s==='custom'?'':'none'; }
-function depAutoDir(){
-  if(depDirEdited)return;
-  const base=(SETTINGS&&SETTINGS.base_dir)||'', n=$('dep_name').value.trim();
-  $('dep_dir').value=(n&&base)?(base.replace(/[\/\\]+$/,'')+'/'+n):'';
+function depPreview(){
+  const base=((SETTINGS&&SETTINGS.base_dir)||'').replace(/[\/\\]+$/,''), n=lxSafe($('dep_name').value);
+  $('dep_path').textContent = n ? ('Installs to: '+(base?base+'/':'')+n) : '';
 }
 async function startDeploy(){
-  const name=$('dep_name').value.trim();
-  if(!name){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='name required'; return; }
-  const body={name,dir:$('dep_dir').value.trim(),source:depSrc,owner_repo:$('dep_repo').value.trim(),
+  const name=lxSafe($('dep_name').value);
+  if(!name){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='enter a name (letters & digits)'; return; }
+  const body={name,source:depSrc,owner_repo:$('dep_repo').value.trim(),
               limits:{memory:$('dep_mem').value.trim(),cpu:$('dep_cpu').value.trim()},
               autostart:$('dep_autostart').checked};
   $('depMsg').style.color='var(--dim)'; $('depMsg').textContent='starting…'; $('depBtn').disabled=true;
   const d=await api('/api/deploy','POST',body);
   if(d.error){ $('depMsg').style.color='var(--crash)'; $('depMsg').textContent='✗ '+d.error; $('depBtn').disabled=false; return; }
-  $('depLog').style.display=''; $('depMsg').textContent='deploying…';
+  $('depLog').style.display=''; $('depMsg').textContent='adding…';
   if(depTimer)clearInterval(depTimer);
   depTimer=setInterval(pollDeploy,700); pollDeploy();
 }
@@ -7029,7 +7010,7 @@ async function pollDeploy(){
   if(j.status==='done'||j.status==='error'){
     clearInterval(depTimer); depTimer=null; $('depBtn').disabled=false;
     $('depMsg').style.color=j.status==='done'?'var(--dim)':'var(--crash)';
-    $('depMsg').textContent=j.status==='done'?'✓ deployed — start it from the dashboard':'✗ deploy failed';
+    $('depMsg').textContent=j.status==='done'?'✓ bot added — start it from the dashboard':'✗ could not add bot';
     refresh();
   }
 }
@@ -7314,35 +7295,6 @@ async function adopt(session,btn){
   const d=await api('/api/adopt','POST',{session});
   if(d.error){ btn.disabled=false; btn.textContent='Adopt'; $('scanMsg').textContent='✗ '+d.error; return; }
   await loadScan();
-  refresh();
-}
-
-function openAdd(){
-  ['f_name','f_dir','f_launch','f_cfg','f_keys','f_to','f_mem','f_cpu'].forEach(id=>$(id).value='');
-  $('addMsg').textContent='';
-  $('addScrim').classList.add('open');
-  setTimeout(()=>$('f_name').focus(),50);
-}
-function closeAdd(e){
-  if(e&&e.target!==$('addScrim'))return;
-  $('addScrim').classList.remove('open');
-}
-async function submitAdd(){
-  const body={
-    name:$('f_name').value.trim(),
-    dir:$('f_dir').value.trim(),
-    launch_cmd:$('f_launch').value.trim()||null,
-    config_file:$('f_cfg').value.trim()||null,
-    stop_keys:$('f_keys').value.trim()||null,
-    stop_timeout:$('f_to').value.trim()||null,
-    limits:{memory:$('f_mem').value.trim(),cpu:$('f_cpu').value.trim()},
-  };
-  $('addMsg').textContent='';
-  $('addBtn').disabled=true;
-  const d=await api('/api/instances/add','POST',body);
-  $('addBtn').disabled=false;
-  if(d.error){$('addMsg').textContent='✗ '+d.error;return;}
-  $('addScrim').classList.remove('open');
   refresh();
 }
 
