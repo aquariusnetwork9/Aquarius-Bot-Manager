@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.11.0"
+__version__ = "1.11.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5412,7 +5412,14 @@ table.tbl tr:hover td{background:#ffffff05}
       </div>
     </div>
 
-    <div id="proxList" style="display:flex;flex-direction:column;gap:.5rem">loading…</div>
+    <div class="modcard open" id="proxListCard" style="margin-bottom:.4rem">
+      <div class="mhd" onclick="document.getElementById('proxListCard').classList.toggle('open')">
+        <span class="caret">▶</span><span class="mtitle">Per-bot proxies<span id="proxCount" class="hint" style="font-weight:400;margin-left:.4rem"></span></span>
+      </div>
+      <div class="mbody" style="gap:.5rem">
+        <div id="proxList" style="display:flex;flex-direction:column;gap:.5rem">loading…</div>
+      </div>
+    </div>
     <div class="mbar"><span class="msg" id="proxMsg" style="color:var(--dim)"></span>
       <button onclick="loadProxies()">Refresh</button>
       <button onclick="closeProxies()">Close</button></div>
@@ -6901,7 +6908,9 @@ async function loadProxies(){
 function renderProxyList(){
   const rows=PROXROWS, box=$('proxList');
   const inp='font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.35rem .45rem';
-  if(!rows.filter(r=>r.found).length){ box.innerHTML='<div class="hint">No instances have a proxy field.</div>'; return; }
+  const found=rows.filter(r=>r.found).length;
+  const cnt=$('proxCount'); if(cnt) cnt.textContent=found?('· '+found+' bot'+(found===1?'':'s')):'';
+  if(!found){ box.innerHTML='<div class="hint">No instances have a proxy field.</div>'; return; }
   box.innerHTML=rows.map((r,idx)=> r.found ? `
     <div class="scand likely" style="gap:.4rem;flex-wrap:wrap;align-items:center">
       <div class="si" style="flex-basis:100%"><div class="sn">${esc(r.name)}${r.has_auth?` <span title="proxy credentials set${r.user?' ('+esc(r.user)+')':''}">🔒</span>`:''}</div></div>
