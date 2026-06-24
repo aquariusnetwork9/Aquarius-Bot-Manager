@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -272,6 +272,49 @@ def instance_stats(inst):
         if dt > 0 and dj >= 0:
             cpu_pct = round(100.0 * dj / (dt * _CLK_TCK), 1)
     return {"pid": pid, "cpu_pct": cpu_pct, "rss": rss_bytes, "procs": nproc}
+
+
+# tiny mtime cache so we don't re-parse launch_config.json on every poll
+_PROXY_CACHE = {}
+
+
+def proxy_info(directory):
+    """Which proxy fork + version a bot runs, read from its launcher's launch_config.json.
+    Returns {"fork", "version", "version_full"} or None when it can't be determined
+    (e.g. a hand-rolled launch with no launch_config.json). Cached by file mtime."""
+    path = os.path.join(directory or "", "launch_config.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _PROXY_CACHE.pop(path, None)
+        return None
+    cached = _PROXY_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path) as f:
+            lc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    repo = (lc.get("repo_name") or "").strip()
+    owner = (lc.get("repo_owner") or "").strip()
+    if repo:
+        fork = repo
+    elif owner:
+        fork = {"aquariusnetwork9": "AquariusProxy", "rfresh2": "ZenithProxy"}.get(owner, owner)
+    else:
+        fork = "ZenithProxy"          # rfresh's stock launcher layout
+    # e.g. "3.5.2+java.1.21.4" -> version "3.5.2", platform "Java" (drop the MC version)
+    ver = (lc.get("local_version") or lc.get("version") or "").strip()
+    core, _, meta = ver.partition("+")
+    platform = ""
+    if meta:
+        first = meta.split(".", 1)[0].lower()
+        if first in ("java", "linux"):
+            platform = first.capitalize()
+    info = {"fork": fork, "version": core, "platform": platform, "version_full": ver}
+    _PROXY_CACHE[path] = (mtime, info)
+    return info
 
 
 def send_command(inst, command):
@@ -3505,6 +3548,7 @@ class Handler(BaseHTTPRequestHandler):
                     "status": st,
                     "autostart": bool(i.get("autostart")),
                     "limits": limits_view(i),
+                    "proxy": proxy_info(i["dir"]),
                 }
                 if st == "running":
                     try:
@@ -4938,6 +4982,12 @@ main{padding:1.6rem;max-width:1200px;margin:0 auto}
 .star.on{color:var(--warn)}
 .path{font-family:var(--mono);font-size:.7rem;color:var(--dim);margin:.45rem 0 .15rem;word-break:break-all}
 .cmd{font-family:var(--mono);font-size:.7rem;color:#586675;margin-bottom:.85rem;word-break:break-all}
+/* proxy fork + version chip on each bot card */
+.ptag{display:inline-flex;align-items:center;gap:.35rem;font-family:var(--mono);font-size:.66rem;font-weight:600;
+  color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:.12rem .45rem;margin:.1rem 0 .15rem}
+.ptag .pdot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.ptag.aqua{color:var(--acc);border-color:var(--acc-dim)}
+.ptag.zenith{color:#5cc8ff;border-color:#27506b}
 .row{display:flex;gap:.4rem;flex-wrap:wrap}
 .row button{flex:1;min-width:64px}
 .spin{display:inline-block;width:11px;height:11px;border:2px solid #ffffff33;border-top-color:var(--acc);
@@ -5788,6 +5838,7 @@ async function refresh(){
         </div>
       </div>
       <div class="path">${esc(i.dir)}</div>
+      ${i.proxy?`<div class="ptag ${i.proxy.fork==='AquariusProxy'?'aqua':(i.proxy.fork==='ZenithProxy'?'zenith':'')}" title="${esc(i.proxy.version_full||i.proxy.fork)}"><span class="pdot"></span>${esc(i.proxy.fork)}${i.proxy.version?(' v'+esc(i.proxy.version)):''}${i.proxy.platform?(' '+esc(i.proxy.platform)):''}</div>`:''}
       <div class="cmd">$ ${esc(i.launch_cmd)}</div>
       ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
       <div class="row">
