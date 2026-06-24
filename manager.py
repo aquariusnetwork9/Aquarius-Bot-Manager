@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.14.3"
+__version__ = "1.14.4"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6014,7 +6014,6 @@ async function refresh(){
           ${badge(i.status)}
         </div>
       </div>
-      <div class="path">${esc(i.dir)}</div>
       ${i.proxy?`<div class="ptag ${i.proxy.fork==='AquariusProxy'?'aqua':(i.proxy.fork==='ZenithProxy'?'zenith':'')}" title="${esc(i.proxy.version_full||i.proxy.fork)}"><span class="pdot"></span>${esc(i.proxy.fork)}${i.proxy.version?(' v'+esc(i.proxy.version)):''}${i.proxy.platform?(' '+esc(i.proxy.platform)):''}</div>`:''}
       <div class="cstate s-${i.conn?i.conn.state:'offline'}">${connLabel(i.conn)}</div>
       ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
