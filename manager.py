@@ -48,7 +48,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3025,7 +3025,7 @@ SWITCHER_BAR = """
 <div id="abmNodeBar" style="position:sticky;top:0;z-index:99999;display:flex;align-items:center;gap:.6rem;padding:.3rem .8rem;background:#0a1016;border-bottom:1px solid #1c2a36;font:600 .8rem/1.25 system-ui,-apple-system,sans-serif;color:#cdd9e2">
   <span style="opacity:.6;font-weight:400">Viewing</span>
   <select id="abmNodeSel" onchange="abmSelectNode(this.value)" style="font:600 .8rem system-ui,sans-serif;background:#06090c;color:#e6f0f7;border:1px solid #1c2a36;border-radius:7px;padding:.22rem .5rem;cursor:pointer">
-    <option value="">★ This box (controller)</option>
+    <option value="">★ Controller</option>
   </select>
   <span id="abmNodeWhich" style="opacity:.5;font-weight:400"></span>
   <span style="flex:1"></span>
@@ -3043,7 +3043,7 @@ async function abmSelectNode(name){
     var d=await fetch('/api/nodes').then(function(r){return r.json();});
     var sel=document.getElementById('abmNodeSel'); if(!sel)return;
     var cur=window.ABM_CURRENT_NODE||'';
-    var html='<option value="">★ This box (controller)</option>';
+    var html='<option value="">★ Controller</option>';
     (d.nodes||[]).forEach(function(n){
       var off=(n.tunnel&&n.tunnel.alive)?'':' (offline)';
       html+='<option value="'+abmEsc(n.name)+'"'+(n.name===cur?' selected':'')+'>'+abmEsc(n.name)+off+'</option>';
@@ -5609,7 +5609,7 @@ table.tbl tr:hover td{background:#ffffff05}
 </div>
 
 <script>
-let CUR=null, TAB='logs', logTimer=null, INSTMAP={}, LAST_REFRESH=0, SYNCING=false;
+let CUR=null, TAB='logs', logTimer=null, INSTMAP={}, LAST_REFRESH=0;
 const $=id=>document.getElementById(id);
 
 async function api(path,method='GET',body){
@@ -5670,12 +5670,11 @@ async function saveThresholds(){
 }
 
 async function refresh(){
-  SYNCING=true; syncAgo();
   loadHost();
   let d;
   try{ d=await api('/api/instances'); }
-  catch(e){ $('metaText').textContent='connection lost'; SYNCING=false; syncAgo(); return; }
-  LAST_REFRESH=Date.now(); SYNCING=false;
+  catch(e){ syncAgo(); return; }   // keep last-known counts; the pill below shows staleness
+  LAST_REFRESH=Date.now();
   const list=d.instances||[];
   INSTMAP=Object.fromEntries(list.map(i=>[i.name,i]));
   const run=list.filter(i=>i.status==='running').length;
@@ -5711,14 +5710,16 @@ async function manualRefresh(btn){
   const o=btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Refreshing…';
   try{ await refresh(); } finally { btn.disabled=false; btn.innerHTML=o; }
 }
-// "synced Xs ago" freshness hint — ticked once a second from tick()
+// Freshness pill next to the instance count, ticked every second from tick().
+// Healthy auto-refresh (every 3s) keeps it on "live"; it only escalates once
+// updates actually stop arriving: live → last synced Xs ago → interrupted.
 function syncAgo(){
   const el=$('syncState'); if(!el) return;
-  if(SYNCING){ el.textContent='· syncing…'; return; }
-  if(!LAST_REFRESH){ el.textContent=''; return; }
+  if(!LAST_REFRESH){ el.textContent=''; return; }            // nothing synced yet
   const s=Math.round((Date.now()-LAST_REFRESH)/1000);
-  el.textContent = s<2 ? '· synced just now' : ('· synced '+s+'s ago');
-  el.style.color = s>12 ? 'var(--crash)' : '';   // go red if updates have stalled
+  if(s<10){ el.textContent='● live'; el.style.color='var(--run)'; }
+  else if(s<30){ el.textContent='· last synced '+s+'s ago'; el.style.color='var(--warn)'; }
+  else { el.textContent='⚠ connection interrupted'; el.style.color='var(--crash)'; }
 }
 
 async function act(name,action,btn){
@@ -6175,7 +6176,10 @@ function navHtml(){
   }).join('')+'</div>';
 }
 function sbBrand(){ return '<div class="sbrand"><span class="dot"></span><span class="txt">Aquarius<small>BOT MANAGER v'+esc(ABMVER)+'</small></span></div>'; }
-function sbBox(){ return '<div class="boxchip" onclick="openBoxes()"><span class="bdot"></span><span class="txt">★ This box</span><span class="car">▾</span></div>'; }
+// Name of the box whose UI you're currently viewing: the controller's own page
+// (no node selected) is "Controller"; a proxied node page shows that node's name.
+function curBoxLabel(){ return (typeof window.ABM_CURRENT_NODE!=='undefined'&&window.ABM_CURRENT_NODE)||'Controller'; }
+function sbBox(){ return '<div class="boxchip" onclick="openBoxes()"><span class="bdot"></span><span class="txt">★ '+esc(curBoxLabel())+'</span><span class="car">▾</span></div>'; }
 function sbFoot(){ return '<div class="sfoot"><div class="nav"><a onclick="location.href=\'/logout\'"><span class="ic">⏻</span><span class="lbl">Log out</span></a></div></div>'; }
 
 function renderSidebar(ui){
@@ -6291,8 +6295,8 @@ async function loadFleetView(){
     const cores=host.cpus||1, load0=host.load?host.load[0]:0;
     const cpu=Math.min(100,Math.round(100*load0/cores));
     const mem=host.mem_total?Math.round(100*host.mem_used/host.mem_total):0;
-    const name=r.controller?'★ This box (controller)':esc(r.name);
-    const sub=r.controller?'this box':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
+    const name=r.controller?'★ Controller':esc(r.name);
+    const sub=r.controller?'controller':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
     const stat=r.reachable?`${r.running||0}/${r.bots||0} bots running`:('<span style="color:var(--crash)">offline'+(r.error?(' — '+esc(r.error)):'')+'</span>');
     const gauges=(r.reachable&&host.mem_total)?(g('CPU',(host.load?host.load[0].toFixed(2):'?')+' load',cpu)+'<div style="height:.5rem"></div>'+g('MEM',mem+'% used',mem)):'';
     const actions=r.controller?'<button class="go" onclick="showView(\'dashboard\')">Open dashboard</button>':
@@ -6307,7 +6311,7 @@ async function loadFleetView(){
     const cpu=(i.stats&&i.stats.cpu_pct!=null)?i.stats.cpu_pct+'%':'—';
     const mem=(i.stats&&i.stats.rss)?fmtBytes(i.stats.rss):'—';
     return `<tr><td style="font-weight:700;cursor:pointer" onclick="showView('telemetry','${jsq(i.name)}')">${esc(i.name)}</td>
-      <td style="font-family:var(--mono);font-size:.74rem;color:var(--dim)">this box</td>
+      <td style="font-family:var(--mono);font-size:.74rem;color:var(--dim)">controller</td>
       <td><span style="color:${col};font-family:var(--mono);font-size:.72rem">● ${esc(i.status.toUpperCase())}</span></td>
       <td>${cpu}</td><td>${mem}</td></tr>`;
   }).join('');
@@ -6319,7 +6323,7 @@ async function loadFleetView(){
       <div class="s ${offline?'bad':''}"><div class="k">Offline boxes</div><div class="v">${offline}</div></div>
     </div>
     <div class="cols3">${cards}</div>
-    <div class="panel" style="margin-top:1rem"><h3>Bots on this box<span class="sub">click a bot for telemetry · node bots are managed on their own box</span></h3>
+    <div class="panel" style="margin-top:1rem"><h3>Bots on the controller<span class="sub">click a bot for telemetry · node bots are managed on their own box</span></h3>
       <table class="tbl"><thead><tr><th>Bot</th><th>Box</th><th>Status</th><th>CPU</th><th>MEM</th></tr></thead>
       <tbody>${trows||'<tr><td colspan="5" class="hint">no instances</td></tr>'}</tbody></table></div>`;
 }
@@ -6437,7 +6441,7 @@ async function renderAutomationView(){
   el.innerHTML='<div class="pagehd"><h1>Automation</h1><span class="sub">loading…</span></div>';
   let d; try{ d=await api('/api/schedules'); }catch(e){ el.innerHTML='<div class="pagehd"><h1>Automation</h1></div><div class="panel hint">failed to load</div>'; return; }
   SCHEDJOBS=(d.schedules&&d.schedules.jobs)||[]; SCHEDHOOK=(d.schedules&&d.schedules.notify_webhook)||''; SCHEDRT=d.runtime||{};
-  SCHEDBOXES=[{v:'',l:'This box'}]; SCHEDBOTS={'':[]};
+  SCHEDBOXES=[{v:'',l:curBoxLabel()}]; SCHEDBOTS={'':[]};
   // this box's bots (running or not) — authoritative local instance list
   try{ const il=await api('/api/instances'); SCHEDBOTS['']=((il&&il.instances)||[]).map(i=>i.name).filter(Boolean).sort(); }catch(e){}
   // connected boxes + their bots (best-effort; one fleet sweep)
@@ -6473,7 +6477,7 @@ function schedDraw(){
   const rows=SCHEDJOBS.length?SCHEDJOBS.map(j=>{
     const rt=SCHEDRT[j.id]||{};
     const when=j.trigger==='on_crash'?('on crash · up to '+(j.max_tries||3)+'×'):esc(j.when||'');
-    const tgt=(j.box==='*'?'all boxes':(j.box?esc(j.box):'this box'))+' · '+esc(j.target||'all');
+    const tgt=(j.box==='*'?'all boxes':(j.box?esc(j.box):curBoxLabel()))+' · '+esc(j.target||'all');
     const act=esc(j.action)+(j.action==='command'?(': '+esc(j.command||'')):'');
     const nxt=j.trigger==='on_crash'?'watching':(rt.next_run?schedRel(rt.next_run):'—');
     return `<tr>
@@ -6555,7 +6559,7 @@ function closePalette(e){ if(e&&e.target!==$('palScrim'))return; $('palScrim').c
 function palItems(){
   const items=[], side=palHasSidebar();
   Object.values((typeof INSTMAP!=='undefined'&&INSTMAP)||{}).forEach(b=>{
-    items.push({kind:'bot',lbl:b.name,box:'this box',dot:b.status,
+    items.push({kind:'bot',lbl:b.name,box:curBoxLabel(),dot:b.status,
       go:()=>{ side?showView('telemetry',b.name):openDrawer(b.name); }});
   });
   (PALFLEET||[]).filter(r=>!r.controller&&r.reachable&&Array.isArray(r.bot_names)).forEach(r=>{
@@ -6583,11 +6587,11 @@ function palRender(){
     let ic, tag;
     if(it.kind==='page'){ ic=it.ic; tag='<span class="pk">page</span>'; }
     else if(it.kind==='bot'){ const c=it.dot==='running'?'var(--run)':(it.dot==='crashed'?'var(--crash)':'var(--dim)');
-      ic=`<span style="color:${c}">●</span>`; tag='<span class="pk">bot · this box</span>'; }
+      ic=`<span style="color:${c}">●</span>`; tag=`<span class="pk">bot · ${esc(curBoxLabel())}</span>`; }
     else { ic='<span style="color:var(--dim)">●</span>'; tag=`<span class="pk">bot · ${esc(it.box)}</span>`; }
     return `<div class="palitem ${idx===PALSEL?'sel':''}" onclick="palPick(${idx})" onmousemove="if(PALSEL!=${idx}){PALSEL=${idx};palHi();}"><span class="pic">${ic}</span><span class="pl">${esc(it.lbl)}</span>${tag}</div>`;
   }).join('');
-  const sc=$('palScope'); if(sc) sc.textContent=PALFLEET?(PALFLEET.filter(r=>r.reachable).length+' box(es)'):'this box';
+  const sc=$('palScope'); if(sc) sc.textContent=PALFLEET?(PALFLEET.filter(r=>r.reachable).length+' box(es)'):curBoxLabel();
 }
 function palHi(){ document.querySelectorAll('#palResults .palitem').forEach((el,idx)=>el.classList.toggle('sel',idx===PALSEL)); const s=document.querySelector('#palResults .palitem.sel'); if(s)s.scrollIntoView({block:'nearest'}); }
 function palPick(idx){ const it=PAL[idx]; if(!it)return; closePalette(); try{ it.go(); }catch(e){} }
@@ -6644,11 +6648,11 @@ async function loadBoxes(){
   const rows=(d&&d.fleet)||[];
   const nodes=rows.filter(r=>!r.controller);
   $('boxBulk').style.display=nodes.length?'flex':'none';
-  if(!nodes.length){ el.innerHTML='<span class="hint">No other boxes connected yet — this box (the controller) is your current dashboard. Add another below.</span>'; return; }
+  if(!nodes.length){ el.innerHTML='<span class="hint">No other boxes connected yet — the controller is your current dashboard. Add another below.</span>'; return; }
   el.innerHTML=rows.map(r=>{
     const up=r.reachable, col=up?'var(--ok,#3a6f5a)':'var(--crash,#c25)';
     const meta=up?((r.running||0)+'/'+(r.bots||0)+' bots running'+hostBit(r.host)):('offline'+(r.error?(' — '+esc(r.error)):''));
-    const sub=r.controller?'this box':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
+    const sub=r.controller?'controller':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
     const right=r.controller?'<span class="hint">controller</span>':
       (`<button onclick="openNode('${esc(r.name)}')">Open</button> `+
        (r.do?`<button class="danger" onclick="destroyBox('${esc(r.name)}',this)">Destroy</button> `:'')+
