@@ -3,6 +3,7 @@
 - [[Home]]
 - [[Installation]]
 - [[Usage]]
+- **[[Control Surface]]** 🛰️
 - [[Configuration]]
 - [[Proxies]]
 - [[Multi-VPS Controller]]

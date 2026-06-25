@@ -20,6 +20,7 @@ As of **v1.4.0** a manager can additionally act as a **controller** that connect
 ## What it does
 
 - **Lifecycle** — start / stop / restart / view logs for every bot, one or all at once.
+- **Live Control Surface** — a front-facing cockpit per bot: live module toggles, vitals, a command palette, and an interactive **Live Map** (click to fly), in three switchable themes. See **[[Control Surface]]**.
 - **Live console** — attach to each bot's stdin/stdout, with editable quick-command presets.
 - **Structured config editor** — a curated AquariusProxy/ZenithProxy settings editor with a raw-JSON fallback; **Save** or **Save & Restart**.
 - **Proxies** — per-bot host/port/username/password editor, bulk round-robin assignment, and one-click **import from a Webshare subscription**. See **[[Proxies]]**.
@@ -38,6 +39,7 @@ As of **v1.4.0** a manager can additionally act as a **controller** that connect
 |------|--------------|
 | **[[Installation]]** | Fresh-VPS install, access modes (tunnel vs HTTPS), first-run setup, cloud-init, manual install |
 | **[[Usage]]** | Dashboard tour, full CLI reference, lifecycle, console, monitoring, reconnecting |
+| **[[Control Surface]]** | The live Mission Control cockpit: themes, Live Map, command palette, and the **48-module reference with warnings & caveats** |
 | **[[Configuration]]** | `instances.json`, per-bot fields, autostart/boot, resource limits, settings |
 | **[[Proxies]]** | Manual + bulk proxy assignment, **Webshare import** (both auth models) |
 | **[[Multi-VPS Controller]]** | Connect other boxes over SSH tunnels: Fleet view, in-page box switcher, DigitalOcean connect/provision/destroy |

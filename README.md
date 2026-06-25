@@ -157,6 +157,16 @@ Browse to http://127.0.0.1:8765.
 - **🌐 Proxies** — quick host/port **and user/password** editor for instances using `client.connection.proxy`. Each row has host, port, optional username + password (blank password keeps the existing one; clearing the username drops the saved credentials), with **Save** and **⟳** (save **& restart**). A **Bulk assign / rotate** panel lets you paste a list of `host:port` proxies and apply them across selected instances — **round-robin** (cycle the list across targets) or **same to all** — with an optional restart-after.
 - Per-instance drawer (⋯): **Console** tab has a live command bar (sends to tmux stdin) plus **quick-command preset buttons**; **Config** tab is a structured AquariusProxy/ZenithProxy config/module editor (toggles, numbers, lists, filter) with a Raw JSON fallback and **Save** / **Save & Restart**; **Limits** tab sets the memory/CPU caps. The ★ on each card toggles autostart.
 
+## Live Control Surface (Mission Control)
+A live, front-facing cockpit for a bot — every module, the world map, vitals, and a command palette on one page. Open it from a bot's viewer drawer (**Control → ⛶ Open full control surface**) or at **`/control?inst=<name>`**. It's served by the manager and relayed over the same authenticated, loopback-only tunnel as the live viewer — nothing the bot serves is exposed.
+
+![Mission Control — Live Map](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/control-v1-mission-control.png)
+
+- **Live** today: module status + **enable toggles**, action buttons, **vitals** (health/food/position/speed via the ~20 Hz SSE feed), a **command runner**, and the **Live Map** — a real bot-centred map with an entity overlay where you **click to set an Elytra destination** (`fly trip <dim> <x> <z>`).
+- **Three appearances**, switchable from the top bar (your pick is remembered): **Mission Control** (`v1`, default), **Aurora Glass** (`v2`), **Console Pro** (`v3`). All share the same live data and the same Live Map.
+- Per-module **settings subcards are read-only previews for now** (honest in-UI banner); live config editing arrives in v3.1 with the `/control/config` API.
+- Requires the bot's `server.viewer.enabled` **and** `server.viewer.control` to be `true` (with `control:false` it's a read-only viewer). Full guide + the **48-module reference with warnings & caveats**: **[Control Surface](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Control-Surface)**.
+
 ## Multi-VPS controller (Boxes, Fleet, DigitalOcean)
 One manager can act as a **controller** for your other boxes. Each other box runs the same manager (in lightweight **node mode**), and the controller reaches it over a **controller-managed SSH tunnel** — nodes stay bound to `127.0.0.1` and are never exposed to the internet. Open it with the header's **🖥 Boxes** button.
 

@@ -2,7 +2,21 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v1.7.0 — *latest*
+## v3.0.0 — *latest*
+
+- **Live Control Surface (Mission Control).** Each bot gets a front-facing cockpit at **`/control?inst=<name>`** (open it from the viewer drawer's **Control → ⛶ Open full control surface**) — every module, the world map, vitals, and a command palette on one page. It's served by the manager and relayed over the same authenticated, loopback-only tunnel as the live viewer, so nothing the bot serves is exposed.
+  - **Live:** module status dots + **enable toggles**, per-module action buttons, **vitals** (health / food / position / dimension / speed from the ~20 Hz SSE feed), a **command runner**, and an interactive **Live Map** — a real bot-centred map tile with an entity overlay where you **click to set an Elytra destination** (`fly trip <dim> <x> <z>`).
+  - **Three appearances**, switchable from the top bar and remembered: **Mission Control** (`v1`, default), **Aurora Glass** (`v2`), **Console Pro** (`v3`) — all share the same live data and the same Live Map.
+  - Per-module **settings subcards are read-only previews** for now (honest in-UI banner); live config editing arrives in **v3.1** with the `/control/config` API. Pearl-pins-on-the-map and the trade-list editor follow after.
+  - New full guide with screenshots and a **48-module reference (warnings & caveats per module)**: **[[Control Surface]]**.
+  - Requires the bot's `server.viewer.enabled` **and** `server.viewer.control` to be `true` (with `control:false` it's a read-only viewer).
+
+## v2.0 – v2.2 — live viewer & first-person POV
+
+- **Per-bot live viewer** — a 2D world map that follows the bot (map / pan / overlays) plus an offline first-person **POV** rendered with raw WebGL (ambient occlusion + fog + selectable 32/48/64 render range; no textures by design). Streamed at ~20 Hz over SSE with per-bot viewer-port auto-detection.
+- **Control tab (cockpit precursor)** in the per-bot drawer — vitals, inventory/armor with real MC item icons, module toggles, and an ElytraPilot flight panel. v3.0.0 promotes this to the full standalone Control Surface.
+
+## v1.7.0
 
 - **Automation: pick the target bot from a dropdown.** The "Target bot" field on the Automation page is now a dropdown of every bot on the selected box — **running or not** — plus an **All bots** option, instead of a free-text name. It tracks the **Box** selector: choosing a connected box lists that box's bots, and **All boxes** collapses to just *All bots*. No more typos in bot names.
 - **10 selectable fonts.** A new **Font** picker in **Settings → Appearance** swaps the whole UI's display + monospace pairing: **Aquarius** (default · Sora / Space Mono), **System** (no web fetch), **Inter**, **Roboto**, **Rounded** (Nunito / Fira Code), **Grotesk** (Space Grotesk / IBM Plex Mono), **Terminal** (all-mono), **Geometric** (Poppins / Source Code Pro), **Classic** (Work Sans / Ubuntu Mono), and **Editorial** (Libre Franklin / Spline Sans Mono). The choice previews live, persists in `settings.theme.font`, lazy-loads its Google Font, and is also settable via `abm settings --font <name>`.
