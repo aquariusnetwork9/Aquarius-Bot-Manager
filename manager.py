@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.18.0"
+__version__ = "1.19.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3732,8 +3732,8 @@ class Handler(BaseHTTPRequestHandler):
         selected remote node already proxies this whole request to that box's manager, which serves its local bot.
         Path: /api/instances/<name>/viewer/{state|map}. Port defaults to 2998 (override ?port=)."""
         parts = path.split("/")
-        # ['', 'api', 'instances', '<name>', 'viewer', 'state'|'map']
-        if len(parts) < 6 or parts[4] != "viewer" or parts[5] not in ("state", "map"):
+        # ['', 'api', 'instances', '<name>', 'viewer', 'state'|'map'|'chunks']
+        if len(parts) < 6 or parts[4] != "viewer" or parts[5] not in ("state", "map", "chunks"):
             return self._json({"error": "not found"}, 404)
         sub = parts[5]
         try:
@@ -3742,11 +3742,16 @@ class Handler(BaseHTTPRequestHandler):
             port = 2998
         if not (1024 <= port <= 65535):
             port = 2998
-        url = f"http://127.0.0.1:{port}/viewer/{'state.json' if sub == 'state' else 'map.png'}"
+        upstream = {"state": "state.json", "map": "map.png", "chunks": "chunks"}[sub]
+        url = f"http://127.0.0.1:{port}/viewer/{upstream}"
         if sub == "map":
             try:
-                sz = max(64, min(512, int(q.get("size", ["256"])[0])))
-                url += f"?size={sz}"
+                url += f"?size={max(64, min(512, int(q.get('size', ['256'])[0])))}"
+            except (ValueError, TypeError, IndexError):
+                pass
+        elif sub == "chunks":
+            try:
+                url += f"?r={max(8, min(64, int(q.get('r', ['40'])[0])))}"
             except (ValueError, TypeError, IndexError):
                 pass
         try:
@@ -3762,7 +3767,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        for hk in ("X-Center-X", "X-Center-Z", "X-Size"):   # let the client pan the map precisely
+        for hk in ("X-Center-X", "X-Center-Z", "X-Size", "X-Encoding"):  # map pan precision + chunk encoding
             hv = resp.headers.get(hk)
             if hv:
                 self.send_header(hk, hv)
@@ -6121,6 +6126,19 @@ table.tbl tr:hover td{background:#ffffff05}
       <button id="vwRecenter" onclick="vwRecenter()" title="Recenter + follow the bot"
         style="margin-left:auto;font-size:.7rem;padding:.3rem .55rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:7px;cursor:pointer">⌖ follow</button>
     </div>
+    <div class="tabs" style="padding:0;margin:.1rem 0 .6rem;display:flex;gap:.4rem">
+      <div class="tab active" id="vwTabMap" onclick="vwSetTab('map')">🗺 Map</div>
+      <div class="tab" id="vwTabPov" onclick="vwSetTab('pov')">◳ POV</div>
+    </div>
+    <div id="vwPovWrap" style="display:none;position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
+      <canvas id="vwPov" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+      <div id="vwPovMsg" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.74rem;padding:1rem">loading 3D…</div>
+      <div style="position:absolute;top:.4rem;right:.4rem;display:flex;gap:.3rem">
+        <button id="vwCam1" onclick="vwSetCam('1st')" style="font-size:.62rem;padding:.2rem .45rem;border:1px solid var(--acc-dim);background:var(--panel);color:var(--acc);border-radius:6px;cursor:pointer">1st</button>
+        <button id="vwCam3" onclick="vwSetCam('3rd')" style="font-size:.62rem;padding:.2rem .45rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:6px;cursor:pointer">3rd</button>
+      </div>
+      <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">fullbright</div>
+    </div>
     <div id="vwWrap" style="position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:grab;touch-action:none">
       <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
       <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port 2998).</div>
@@ -6471,19 +6489,21 @@ let VW=null, vwStateT=null, vwRAF=null, vwHandlersInit=false, vwData=null;
 // 2b2t nether ring-road radii (blocks) for the overlay; cardinals at x=0/z=0, diagonals x=±z.
 const VW_RINGS=[200,500,1000,1500,2000,2500,5000,7500,10000,15000,20000,25000,50000,55000,62500,100000,125000,250000,500000,750000,1000000,1250000,1568852,1875000,2500000,3750000];
 const VW_HOSTILE=new Set(['WITHER','WITHER_SKELETON','WITHER_SKULL','SKELETON','ZOMBIE','ZOMBIFIED_PIGLIN','PIGLIN','PIGLIN_BRUTE','HOGLIN','ZOGLIN','BLAZE','GHAST','MAGMA_CUBE','ENDERMAN','CREEPER','SPIDER','PHANTOM','VEX','PILLAGER','VINDICATOR','RAVAGER','EVOKER']);
-let vwSamples=[], vwRender={x:0,z:0,yaw:0,has:false};
+let vwSamples=[], vwRender={x:0,y:0,z:0,yaw:0,pitch:0,has:false};
 let vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
 let vwCam={x:0,z:0}, vwZoom=3, vwFollow=true, vwDrag=null;
+let vwTab='map', vwCam3rd=false, vwThree=null, vwBox=null, vwChunkBusy=false, vwChunkAt=0;
 function vwLerpAng(a,b,k){ let d=((b-a+540)%360)-180; return a+d*k; }
 function vwUpdMode(){ const m=$('vwMode'); if(m) m.textContent = vwFollow?'FOLLOW':'FREE'; }
 function vwOnlineSet(on){ const o=$('vwOff'); if(o) o.style.display = on?'none':'flex'; }
 function openViewer(name){
   VW=name; $('vwName').textContent=name;
-  vwSamples=[]; vwRender={x:0,z:0,yaw:0,has:false};
+  vwSamples=[]; vwRender={x:0,y:0,z:0,yaw:0,pitch:0,has:false};
   vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
-  vwCam={x:0,z:0}; vwFollow=true; vwDrag=null;
+  vwCam={x:0,z:0}; vwFollow=true; vwDrag=null; vwBox=null; vwChunkAt=0;
+  if(vwThree&&vwThree.mesh){ vwThree.scene.remove(vwThree.mesh); vwThree.mesh.geometry.dispose(); vwThree.mesh=null; }
   vwZoom=$('vwCanvas').width/220;          // ~220 blocks across by default
-  vwUpdMode(); vwOnlineSet(false);
+  vwUpdMode(); vwOnlineSet(false); vwSetTab('map'); vwSetCam('1st');
   $('vwScrim').classList.add('open');
   vwInitHandlers(); vwTickState();
   clearInterval(vwStateT); vwStateT=setInterval(vwTickState,100);
@@ -6503,9 +6523,9 @@ async function vwTickState(){
   try{ d=await (await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/state')).json(); }catch(e){}
   if(!d || d.offline){ vwOnlineSet(false); vwData=null; $('vwHud').innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; return; }
   vwOnlineSet(true); vwData=d;
-  const s={x:+d.x, z:+d.z, yaw:+d.yaw||0};
+  const s={x:+d.x, y:+d.y, z:+d.z, yaw:+d.yaw||0, pitch:+d.pitch||0};
   vwSamples.push(s); if(vwSamples.length>4) vwSamples.shift();
-  if(!vwRender.has){ vwRender.x=s.x; vwRender.z=s.z; vwRender.yaw=s.yaw; vwRender.has=true; vwCam.x=s.x; vwCam.z=s.z; }
+  if(!vwRender.has){ vwRender.x=s.x; vwRender.y=s.y; vwRender.z=s.z; vwRender.yaw=s.yaw; vwRender.pitch=s.pitch; vwRender.has=true; vwCam.x=s.x; vwCam.z=s.z; }
   const band=d.band&&d.band!=='CLEAR'?' <span style="color:var(--warn)">⚠ '+esc(d.band)+'</span>':'';
   $('vwHud').innerHTML='<span>📍 '+Math.round(d.x)+', '+Math.round(d.y)+', '+Math.round(d.z)+'</span>'
     +'<span>'+esc(d.dimension||'?')+'</span>'
@@ -6537,10 +6557,11 @@ function vwMaybeFetchMap(){
 function vwFrame(){
   if(VW){
     const s=vwSamples[vwSamples.length-1];
-    if(s){ vwRender.x+=(s.x-vwRender.x)*0.30; vwRender.z+=(s.z-vwRender.z)*0.30; vwRender.yaw=vwLerpAng(vwRender.yaw,s.yaw,0.30); }
+    if(s){ vwRender.x+=(s.x-vwRender.x)*0.30; vwRender.y+=(s.y-vwRender.y)*0.30; vwRender.z+=(s.z-vwRender.z)*0.30;
+           vwRender.yaw=vwLerpAng(vwRender.yaw,s.yaw,0.30); vwRender.pitch+=(s.pitch-vwRender.pitch)*0.30; }
     if(vwFollow){ vwCam.x=vwRender.x; vwCam.z=vwRender.z; }
-    if(VW) vwMaybeFetchMap();
-    vwDraw();
+    if(vwTab==='pov'){ if(vwThree) vwPovRender(); }
+    else { vwMaybeFetchMap(); vwDraw(); }
   }
   vwRAF=requestAnimationFrame(vwFrame);
 }
@@ -6633,6 +6654,97 @@ function vwInitHandlers(){
   });
   const end=()=>{ vwDrag=null; $('vwWrap').style.cursor='grab'; };
   wrap.addEventListener('pointerup',end); wrap.addEventListener('pointercancel',end);
+}
+// ---- POV: three.js fullbright voxel renderer (1st / 3rd person) ----
+function vwSetTab(t){
+  vwTab=t;
+  $('vwTabMap').classList.toggle('active', t==='map');
+  $('vwTabPov').classList.toggle('active', t==='pov');
+  $('vwWrap').style.display = t==='map'?'block':'none';
+  $('vwPovWrap').style.display = t==='pov'?'block':'none';
+  if(t==='pov'){ vwInitPov(); }
+}
+function vwSetCam(m){
+  vwCam3rd=(m==='3rd');
+  const a=$('vwCam1'), b=$('vwCam3');
+  if(a){ a.style.color=vwCam3rd?'var(--txt)':'var(--acc)'; a.style.borderColor=vwCam3rd?'var(--line)':'var(--acc-dim)'; }
+  if(b){ b.style.color=vwCam3rd?'var(--acc)':'var(--txt)'; b.style.borderColor=vwCam3rd?'var(--acc-dim)':'var(--line)'; }
+}
+async function vwInitPov(){
+  if(vwThree){ vwResizePov(); return; }
+  try{
+    const THREE=await import('https://unpkg.com/three@0.160.0/build/three.module.js');
+    const renderer=new THREE.WebGLRenderer({canvas:$('vwPov'), antialias:false});
+    const scene=new THREE.Scene(); scene.background=new THREE.Color(0x06090c);
+    const cam=new THREE.PerspectiveCamera(75,1,0.1,3000);
+    vwThree={THREE,renderer,scene,cam,mesh:null};
+    vwResizePov(); $('vwPovMsg').style.display='none';
+    vwFetchChunks();
+  }catch(e){ const m=$('vwPovMsg'); if(m){ m.style.display='flex'; m.textContent='3D unavailable ('+e+')'; } }
+}
+function vwResizePov(){
+  if(!vwThree) return;
+  const cv=$('vwPov'), w=cv.clientWidth||600, h=cv.clientHeight||600;
+  vwThree.renderer.setSize(w,h,false); vwThree.cam.aspect=w/h; vwThree.cam.updateProjectionMatrix();
+}
+async function vwFetchChunks(){
+  if(vwChunkBusy||!VW||!vwRender.has) return;
+  vwChunkBusy=true;
+  try{
+    const r=await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/chunks?r=32');
+    if(!r.ok) throw 0;
+    let buf=await r.arrayBuffer();
+    if((r.headers.get('X-Encoding')||'')==='deflate'){
+      const ds=new DecompressionStream('deflate');
+      buf=await new Response(new Blob([buf]).stream().pipeThrough(ds)).arrayBuffer();
+    }
+    vwBuildMesh(buf); vwChunkAt=performance.now();
+  }catch(e){}
+  finally{ vwChunkBusy=false; }
+}
+const VW_FACES=[
+  {n:[0,1,0], s:1.00, c:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]},
+  {n:[0,-1,0],s:0.55, c:[[0,0,1],[0,0,0],[1,0,0],[1,0,1]]},
+  {n:[1,0,0], s:0.80, c:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]]},
+  {n:[-1,0,0],s:0.80, c:[[0,0,1],[0,1,1],[0,1,0],[0,0,0]]},
+  {n:[0,0,1], s:0.70, c:[[1,0,1],[1,1,1],[0,1,1],[0,0,1]]},
+  {n:[0,0,-1],s:0.70, c:[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]}
+];
+function vwBuildMesh(buf){
+  if(!vwThree) return;
+  const T=vwThree.THREE, dv=new DataView(buf);
+  const ox=dv.getInt32(0), oy=dv.getInt32(4), oz=dv.getInt32(8);
+  const sx=dv.getUint16(12), sy=dv.getUint16(14), sz=dv.getUint16(16);
+  const pal=new Uint8Array(buf,18,192), vox=new Uint8Array(buf,210,sx*sy*sz);
+  const at=(x,y,z)=> (x<0||y<0||z<0||x>=sx||y>=sy||z>=sz)?0:vox[(y*sz+z)*sx+x];
+  const pos=[], col=[];
+  for(let y=0;y<sy;y++) for(let z=0;z<sz;z++) for(let x=0;x<sx;x++){
+    const id=vox[(y*sz+z)*sx+x]; if(!id) continue;
+    const pr=pal[id*3], pg=pal[id*3+1], pb=pal[id*3+2], wx=ox+x, wy=oy+y, wz=oz+z;
+    for(const f of VW_FACES){
+      if(at(x+f.n[0],y+f.n[1],z+f.n[2])) continue;
+      const cr=pr*f.s/255, cg=pg*f.s/255, cb=pb*f.s/255, c=f.c;
+      for(const i of [0,1,2,0,2,3]){ pos.push(wx+c[i][0],wy+c[i][1],wz+c[i][2]); col.push(cr,cg,cb); }
+    }
+  }
+  const geo=new T.BufferGeometry();
+  geo.setAttribute('position', new T.Float32BufferAttribute(pos,3));
+  geo.setAttribute('color', new T.Float32BufferAttribute(col,3));
+  const mesh=new T.Mesh(geo, new T.MeshBasicMaterial({vertexColors:true}));
+  if(vwThree.mesh){ vwThree.scene.remove(vwThree.mesh); vwThree.mesh.geometry.dispose(); }
+  vwThree.mesh=mesh; vwThree.scene.add(mesh);
+  vwBox={cx:ox+sx/2, cz:oz+sz/2, sx:sx};
+}
+function vwPovRender(){
+  if(!vwThree) return;
+  const cam=vwThree.cam;
+  const ex=vwRender.x+0.5, ey=vwRender.y+1.62, ez=vwRender.z+0.5;
+  const yaw=vwRender.yaw*Math.PI/180, pit=vwRender.pitch*Math.PI/180;
+  const lx=-Math.sin(yaw)*Math.cos(pit), ly=-Math.sin(pit), lz=Math.cos(yaw)*Math.cos(pit);
+  if(vwCam3rd){ const D=5; cam.position.set(ex-lx*D, ey-ly*D+1.4, ez-lz*D); cam.lookAt(ex,ey,ez); }
+  else { cam.position.set(ex,ey,ez); cam.lookAt(ex+lx, ey+ly, ez+lz); }
+  if(!vwBox || Math.hypot(vwRender.x-vwBox.cx, vwRender.z-vwBox.cz)>vwBox.sx*0.30 || performance.now()-vwChunkAt>6000) vwFetchChunks();
+  vwThree.renderer.render(vwThree.scene, cam);
 }
 function openDrawer(name){
   CUR=name; $('drawerName').textContent=name;
