@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3793,7 +3793,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         elif sub == "chunks":
             try:
-                url += f"?r={max(8, min(64, int(q.get('r', ['40'])[0])))}"
+                r = max(8, min(64, int(q.get('r', ['48'])[0])))
+                yb = max(8, min(96, int(q.get('yb', ['48'])[0])))
+                ya = max(8, min(96, int(q.get('ya', ['48'])[0])))
+                url += f"?r={r}&yb={yb}&ya={ya}"
             except (ValueError, TypeError, IndexError):
                 pass
         try:
@@ -6865,7 +6868,7 @@ async function vwFetchChunks(){
   if(vwChunkBusy||!VW||!vwRender.has) return;
   vwChunkBusy=true;
   try{
-    const r=await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/chunks?r='+vwPovR);
+    const r=await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/chunks?r='+vwPovR+'&yb='+vwPovR+'&ya='+vwPovR);
     if(!r.ok) throw 0;
     let buf=await r.arrayBuffer();
     if((r.headers.get('X-Encoding')||'')==='deflate'){
