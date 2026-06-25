@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.17.0"
+__version__ = "1.18.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6467,7 +6467,10 @@ async function bulk(action){
 // The map PNG is bot-centered on the bot (server side) and carries its world-center in
 // headers, so the client pans it precisely. Free mode unlocks the camera (drag/zoom);
 // since the bot only knows its own loaded chunks, panning past them shows empty space.
-let VW=null, vwStateT=null, vwRAF=null, vwHandlersInit=false;
+let VW=null, vwStateT=null, vwRAF=null, vwHandlersInit=false, vwData=null;
+// 2b2t nether ring-road radii (blocks) for the overlay; cardinals at x=0/z=0, diagonals x=±z.
+const VW_RINGS=[200,500,1000,1500,2000,2500,5000,7500,10000,15000,20000,25000,50000,55000,62500,100000,125000,250000,500000,750000,1000000,1250000,1568852,1875000,2500000,3750000];
+const VW_HOSTILE=new Set(['WITHER','WITHER_SKELETON','WITHER_SKULL','SKELETON','ZOMBIE','ZOMBIFIED_PIGLIN','PIGLIN','PIGLIN_BRUTE','HOGLIN','ZOGLIN','BLAZE','GHAST','MAGMA_CUBE','ENDERMAN','CREEPER','SPIDER','PHANTOM','VEX','PILLAGER','VINDICATOR','RAVAGER','EVOKER']);
 let vwSamples=[], vwRender={x:0,z:0,yaw:0,has:false};
 let vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
 let vwCam={x:0,z:0}, vwZoom=3, vwFollow=true, vwDrag=null;
@@ -6498,14 +6501,16 @@ async function vwTickState(){
   if(!VW) return;
   let d=null;
   try{ d=await (await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/state')).json(); }catch(e){}
-  if(!d || d.offline){ vwOnlineSet(false); $('vwHud').innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; return; }
-  vwOnlineSet(true);
+  if(!d || d.offline){ vwOnlineSet(false); vwData=null; $('vwHud').innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; return; }
+  vwOnlineSet(true); vwData=d;
   const s={x:+d.x, z:+d.z, yaw:+d.yaw||0};
   vwSamples.push(s); if(vwSamples.length>4) vwSamples.shift();
   if(!vwRender.has){ vwRender.x=s.x; vwRender.z=s.z; vwRender.yaw=s.yaw; vwRender.has=true; vwCam.x=s.x; vwCam.z=s.z; }
+  const band=d.band&&d.band!=='CLEAR'?' <span style="color:var(--warn)">⚠ '+esc(d.band)+'</span>':'';
   $('vwHud').innerHTML='<span>📍 '+Math.round(d.x)+', '+Math.round(d.y)+', '+Math.round(d.z)+'</span>'
+    +'<span>'+esc(d.dimension||'?')+'</span>'
     +'<span>❤ '+(+d.health).toFixed(0)+'</span><span>🍗 '+d.food+'</span>'
-    +'<span>✈ '+esc(d.flightPhase||'-')+'</span><span>↻ '+Math.round(d.yaw)+'°</span>';
+    +'<span>✈ '+esc(d.flightPhase||'-')+band+'</span><span>↻ '+Math.round(d.yaw)+'°</span>';
 }
 async function vwFetchMap(size){
   vwMap.loading=true;
@@ -6547,6 +6552,50 @@ function vwDraw(){
     x.imageSmoothingEnabled=false;
     const wx0=m.cx-m.size/2, wz0=m.cz-m.size/2;
     x.drawImage(m.img,(wx0-camx)*z+W/2,(wz0-camz)*z+H/2,m.size*z,m.size*z);
+  }
+  // ---- world overlays (same world->canvas transform) ----
+  const P=(wx,wz)=>[(wx-camx)*z+W/2,(wz-camz)*z+H/2];
+  const seg=(ax,az,bx,bz)=>{ const a=P(ax,az),b=P(bx,bz); x.beginPath(); x.moveTo(a[0],a[1]); x.lineTo(b[0],b[1]); x.stroke(); };
+  const wMinX=camx-W/2/z, wMaxX=camx+W/2/z, wMinZ=camz-H/2/z, wMaxZ=camz+H/2/z;
+  // highway network: cardinals (x=0, z=0), diagonals (x=±z), ring squares — clipped to the view
+  x.lineWidth=1; x.strokeStyle='rgba(120,150,200,.30)';
+  if(wMinX<=0&&wMaxX>=0) seg(0,wMinZ,0,wMaxZ);
+  if(wMinZ<=0&&wMaxZ>=0) seg(wMinX,0,wMaxX,0);
+  x.strokeStyle='rgba(120,150,200,.20)';
+  { const x0=Math.max(wMinX,wMinZ),x1=Math.min(wMaxX,wMaxZ); if(x0<=x1) seg(x0,x0,x1,x1); }
+  { const x0=Math.max(wMinX,-wMaxZ),x1=Math.min(wMaxX,-wMinZ); if(x0<=x1) seg(x0,-x0,x1,-x1); }
+  x.strokeStyle='rgba(120,150,200,.22)';
+  for(const r of VW_RINGS){
+    for(const ex of [r,-r]){ if(ex<wMinX-1||ex>wMaxX+1) continue; const z0=Math.max(-r,wMinZ),z1=Math.min(r,wMaxZ); if(z0<=z1) seg(ex,z0,ex,z1); }
+    for(const ez of [r,-r]){ if(ez<wMinZ-1||ez>wMaxZ+1) continue; const x0=Math.max(-r,wMinX),x1=Math.min(r,wMaxX); if(x0<=x1) seg(x0,ez,x1,ez); }
+  }
+  if(vwData){
+    // reroute path (bot -> waypoints)
+    if(vwData.reroute&&vwData.reroute.length&&vwRender.has){
+      x.strokeStyle='#64d2ff'; x.lineWidth=2; x.beginPath();
+      const b=P(vwRender.x,vwRender.z); x.moveTo(b[0],b[1]);
+      for(const w of vwData.reroute){ const p=P(w[0],w[1]); x.lineTo(p[0],p[1]); }
+      x.stroke();
+      x.fillStyle='#64d2ff'; for(const w of vwData.reroute){ const p=P(w[0],w[1]); x.beginPath(); x.arc(p[0],p[1],3,0,7); x.fill(); }
+    }
+    // target
+    if(vwData.target){ const p=P(vwData.target[0],vwData.target[1]); x.strokeStyle='#ff9f0a'; x.lineWidth=2;
+      x.beginPath(); x.arc(p[0],p[1],7,0,7); x.stroke();
+      x.beginPath(); x.moveTo(p[0]-10,p[1]); x.lineTo(p[0]+10,p[1]); x.moveTo(p[0],p[1]-10); x.lineTo(p[0],p[1]+10); x.stroke(); }
+    // grief markers (red X)
+    if(vwData.grief){ x.strokeStyle='#ff5b4d'; x.lineWidth=2;
+      for(const g of vwData.grief){ const p=P(g[0],g[1]);
+        x.beginPath(); x.moveTo(p[0]-5,p[1]-5); x.lineTo(p[0]+5,p[1]+5); x.moveTo(p[0]-5,p[1]+5); x.lineTo(p[0]+5,p[1]-5); x.stroke(); } }
+    // entities (dots colored by kind)
+    if(vwData.entities){
+      for(const e of vwData.entities){ const p=P(e.x,e.z), t=(e.type||'').toUpperCase();
+        let col='#9aa7b2';
+        if(t==='PLAYER') col='#ffffff';
+        else if(t==='ITEM'||t==='EXPERIENCE_ORB') col='#ffd60a';
+        else if(VW_HOSTILE.has(t)) col='#ff5b4d';
+        x.fillStyle=col; x.beginPath(); x.arc(p[0],p[1],3.2,0,7); x.fill();
+        if(t==='PLAYER'){ x.strokeStyle='#ffffff'; x.lineWidth=1; x.beginPath(); x.arc(p[0],p[1],5.5,0,7); x.stroke(); } }
+    }
   }
   if(!vwRender.has) return;
   const bx=(vwRender.x-camx)*z+W/2, by=(vwRender.z-camz)*z+H/2;
