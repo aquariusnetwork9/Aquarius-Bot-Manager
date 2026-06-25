@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6239,6 +6239,12 @@ table.tbl tr:hover td{background:#ffffff05}
         <button id="vwCam3" onclick="vwSetCam('3rd')" style="font-size:.62rem;padding:.2rem .45rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:6px;cursor:pointer">3rd</button>
       </div>
       <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">fullbright</div>
+      <div style="position:absolute;bottom:.4rem;right:.4rem;display:flex;gap:.3rem;align-items:center">
+        <span style="font-family:var(--mono);font-size:.55rem;color:#cdd9e2aa;text-shadow:0 1px 2px #000">range</span>
+        <button id="vwD32" onclick="vwSetDist(32)" style="font-size:.6rem;padding:.15rem .4rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:6px;cursor:pointer">32</button>
+        <button id="vwD48" onclick="vwSetDist(48)" style="font-size:.6rem;padding:.15rem .4rem;border:1px solid var(--acc-dim);background:var(--panel);color:var(--acc);border-radius:6px;cursor:pointer">48</button>
+        <button id="vwD64" onclick="vwSetDist(64)" style="font-size:.6rem;padding:.15rem .4rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:6px;cursor:pointer">64</button>
+      </div>
     </div>
     <div id="vwWrap" style="position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:grab;touch-action:none">
       <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
@@ -6594,7 +6600,7 @@ const VW_HOSTILE=new Set(['WITHER','WITHER_SKELETON','WITHER_SKULL','SKELETON','
 let vwSamples=[], vwRender={x:0,y:0,z:0,yaw:0,pitch:0,has:false};
 let vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
 let vwCam={x:0,z:0}, vwZoom=3, vwFollow=true, vwDrag=null;
-let vwTab='map', vwCam3rd=false, vwGL=null, vwBox=null, vwChunkBusy=false, vwChunkAt=0;
+let vwTab='map', vwCam3rd=false, vwGL=null, vwBox=null, vwChunkBusy=false, vwChunkAt=0, vwPovR=48;
 function vwLerpAng(a,b,k){ let d=((b-a+540)%360)-180; return a+d*k; }
 function vwUpdMode(){ const m=$('vwMode'); if(m) m.textContent = vwFollow?'FOLLOW':'FREE'; }
 function vwOnlineSet(on){ const o=$('vwOff'); if(o) o.style.display = on?'none':'flex'; }
@@ -6797,6 +6803,12 @@ function vwSetCam(m){
   if(a){ a.style.color=vwCam3rd?'var(--txt)':'var(--acc)'; a.style.borderColor=vwCam3rd?'var(--line)':'var(--acc-dim)'; }
   if(b){ b.style.color=vwCam3rd?'var(--acc)':'var(--txt)'; b.style.borderColor=vwCam3rd?'var(--acc-dim)':'var(--line)'; }
 }
+function vwSetDist(r){
+  vwPovR=r;
+  for(const v of [32,48,64]){ const b=$('vwD'+v); if(b){ const on=(v===r);
+    b.style.color=on?'var(--acc)':'var(--txt)'; b.style.borderColor=on?'var(--acc-dim)':'var(--line)'; } }
+  vwChunkAt=0; vwFetchChunks();   // re-fetch the voxel box at the new radius
+}
 // Self-contained WebGL voxel renderer — no three.js, no external fetch (fully offline).
 // Column-major 4x4 matrix helpers (gl-matrix conventions, no deps).
 function vwM4Mul(a,b){ const o=new Float32Array(16);
@@ -6821,17 +6833,22 @@ function vwInitPov(){
     const gl=cv.getContext('webgl')||cv.getContext('experimental-webgl');
     if(!gl) throw new Error('WebGL not supported');
     const vs=vwCompileShader(gl, gl.VERTEX_SHADER,
-      'attribute vec3 aPos;attribute vec3 aCol;uniform mat4 uMVP;varying vec3 vCol;'
-      +'void main(){vCol=aCol;gl_Position=uMVP*vec4(aPos,1.0);}');
+      'attribute vec3 aPos;attribute vec3 aCol;uniform mat4 uMVP;uniform vec3 uCam;'
+      +'varying vec3 vCol;varying float vDist;'
+      +'void main(){vCol=aCol;vDist=length(aPos-uCam);gl_Position=uMVP*vec4(aPos,1.0);}');
     const fs=vwCompileShader(gl, gl.FRAGMENT_SHADER,
-      'precision mediump float;varying vec3 vCol;void main(){gl_FragColor=vec4(vCol,1.0);}');
+      'precision mediump float;varying vec3 vCol;varying float vDist;'
+      +'uniform vec3 uFogCol;uniform vec2 uFogRange;'
+      +'void main(){float f=clamp((vDist-uFogRange.x)/(uFogRange.y-uFogRange.x),0.0,1.0);'
+      +'gl_FragColor=vec4(mix(vCol,uFogCol,f),1.0);}');
     const prog=gl.createProgram(); gl.attachShader(prog,vs); gl.attachShader(prog,fs); gl.linkProgram(prog);
     if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
     gl.useProgram(prog);
     gl.enable(gl.DEPTH_TEST); gl.clearColor(0x06/255,0x09/255,0x0c/255,1);
     vwGL={gl,prog,
       locPos:gl.getAttribLocation(prog,'aPos'), locCol:gl.getAttribLocation(prog,'aCol'),
-      locMVP:gl.getUniformLocation(prog,'uMVP'),
+      locMVP:gl.getUniformLocation(prog,'uMVP'), locCam:gl.getUniformLocation(prog,'uCam'),
+      locFogCol:gl.getUniformLocation(prog,'uFogCol'), locFogRange:gl.getUniformLocation(prog,'uFogRange'),
       bufPos:gl.createBuffer(), bufCol:gl.createBuffer(), count:0};
     vwResizePov(); $('vwPovMsg').style.display='none';
     vwFetchChunks();
@@ -6848,7 +6865,7 @@ async function vwFetchChunks(){
   if(vwChunkBusy||!VW||!vwRender.has) return;
   vwChunkBusy=true;
   try{
-    const r=await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/chunks?r=32');
+    const r=await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/chunks?r='+vwPovR);
     if(!r.ok) throw 0;
     let buf=await r.arrayBuffer();
     if((r.headers.get('X-Encoding')||'')==='deflate'){
@@ -6859,14 +6876,16 @@ async function vwFetchChunks(){
   }catch(e){}
   finally{ vwChunkBusy=false; }
 }
+// n=face normal, s=directional shade, c=4 corner offsets, t=the two tangent axes (for AO sampling)
 const VW_FACES=[
-  {n:[0,1,0], s:1.00, c:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]},
-  {n:[0,-1,0],s:0.55, c:[[0,0,1],[0,0,0],[1,0,0],[1,0,1]]},
-  {n:[1,0,0], s:0.80, c:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]]},
-  {n:[-1,0,0],s:0.80, c:[[0,0,1],[0,1,1],[0,1,0],[0,0,0]]},
-  {n:[0,0,1], s:0.70, c:[[1,0,1],[1,1,1],[0,1,1],[0,0,1]]},
-  {n:[0,0,-1],s:0.70, c:[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]}
+  {n:[0,1,0], s:1.00, t:[0,2], c:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]},
+  {n:[0,-1,0],s:0.55, t:[0,2], c:[[0,0,1],[0,0,0],[1,0,0],[1,0,1]]},
+  {n:[1,0,0], s:0.80, t:[1,2], c:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]]},
+  {n:[-1,0,0],s:0.80, t:[1,2], c:[[0,0,1],[0,1,1],[0,1,0],[0,0,0]]},
+  {n:[0,0,1], s:0.70, t:[0,1], c:[[1,0,1],[1,1,1],[0,1,1],[0,0,1]]},
+  {n:[0,0,-1],s:0.70, t:[0,1], c:[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]}
 ];
+const VW_AO=[0.45,0.66,0.84,1.0];   // per-vertex occlusion multipliers (inner corner -> open)
 function vwBuildMesh(buf){
   if(!vwGL) return;
   const gl=vwGL.gl, dv=new DataView(buf);
@@ -6879,9 +6898,25 @@ function vwBuildMesh(buf){
     const id=vox[(y*sz+z)*sx+x]; if(!id) continue;
     const pr=pal[id*3], pg=pal[id*3+1], pb=pal[id*3+2], wx=ox+x, wy=oy+y, wz=oz+z;
     for(const f of VW_FACES){
-      if(at(x+f.n[0],y+f.n[1],z+f.n[2])) continue;
-      const cr=pr*f.s/255, cg=pg*f.s/255, cb=pb*f.s/255, c=f.c;
-      for(const i of [0,1,2,0,2,3]){ pos.push(wx+c[i][0],wy+c[i][1],wz+c[i][2]); col.push(cr,cg,cb); }
+      const fx=x+f.n[0], fy=y+f.n[1], fz=z+f.n[2];
+      if(at(fx,fy,fz)) continue;                 // face hidden by a neighbour
+      const c=f.c, ta=f.t[0], tb=f.t[1], base=f.s/255;
+      const crf=pr*base, cgf=pg*base, cbf=pb*base;
+      // ambient occlusion: darken each corner by its two edge + diagonal neighbours in the front layer
+      const ao=[0,0,0,0];
+      for(let k=0;k<4;k++){
+        const o1=[0,0,0]; o1[ta]=c[k][ta]?1:-1;
+        const o2=[0,0,0]; o2[tb]=c[k][tb]?1:-1;
+        const e1=at(fx+o1[0],fy+o1[1],fz+o1[2])?1:0;
+        const e2=at(fx+o2[0],fy+o2[1],fz+o2[2])?1:0;
+        const ec=(e1&&e2)?1:(at(fx+o1[0]+o2[0],fy+o1[1]+o2[1],fz+o1[2]+o2[2])?1:0);
+        ao[k]=VW_AO[(e1&&e2)?0:3-(e1+e2+ec)];
+      }
+      for(const i of [0,1,2,0,2,3]){
+        const a=ao[i];
+        pos.push(wx+c[i][0],wy+c[i][1],wz+c[i][2]);
+        col.push(crf*a, cgf*a, cbf*a);
+      }
     }
   }
   gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufPos); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
@@ -6904,6 +6939,10 @@ function vwPovRender(){
   if(vwGL.count){
     gl.useProgram(vwGL.prog);
     gl.uniformMatrix4fv(vwGL.locMVP, false, mvp);
+    gl.uniform3f(vwGL.locCam, eye[0], eye[1], eye[2]);
+    gl.uniform3f(vwGL.locFogCol, 0x06/255, 0x09/255, 0x0c/255);    // fade distant blocks into the backdrop
+    const fr=(vwBox?vwBox.sx*0.5:vwPovR);                          // box half-width ~ render radius
+    gl.uniform2f(vwGL.locFogRange, fr*0.6, fr*1.15);
     gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufPos); gl.enableVertexAttribArray(vwGL.locPos); gl.vertexAttribPointer(vwGL.locPos,3,gl.FLOAT,false,0,0);
     gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufCol); gl.enableVertexAttribArray(vwGL.locCol); gl.vertexAttribPointer(vwGL.locCol,3,gl.FLOAT,false,0,0);
     gl.drawArrays(gl.TRIANGLES, 0, vwGL.count);
