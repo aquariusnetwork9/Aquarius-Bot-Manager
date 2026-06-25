@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6343,6 +6343,14 @@ table.tbl tr:hover td{background:#ffffff05}
       .vw-cmdbar input{flex:1;font-family:var(--mono);font-size:.74rem;padding:.42rem .55rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:8px}
       .vw-result{font-family:var(--mono);font-size:.7rem;color:var(--txt);background:#06090c;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem;min-height:2.4rem;max-height:170px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
       .vw-rcmd{color:var(--acc);margin-bottom:.25rem;font-weight:700}
+      .vw-flstat{display:flex;flex-direction:column;gap:.45rem;margin-bottom:.6rem}
+      .vw-fl-top{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .9rem}
+      .vw-fl-stat{font-family:var(--mono);font-size:.72rem;color:var(--dim)}
+      .vw-fl-stat b{color:var(--txt);font-size:.82rem}
+      .vw-fl-row{display:flex;align-items:center;gap:.5rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)}
+      .vw-fl-row b{color:var(--txt)}
+      .vw-fl-ctl{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center}
+      .vw-fl-ctl input{width:88px;font-family:var(--mono);font-size:.72rem;padding:.36rem .5rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:8px}
     </style>
     <div id="vwPovWrap" style="display:none;position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
       <canvas id="vwPov" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
@@ -6367,12 +6375,25 @@ table.tbl tr:hover td{background:#ffffff05}
     <div id="vwControlWrap" class="vw-ctl" style="display:none">
       <div id="vwCtlBanner"></div>
       <div class="vw-card"><div id="vwVitals" class="vw-vitals"></div></div>
+      <div class="vw-card">
+        <div class="vw-sec">Flight — ElytraPilot</div>
+        <div id="vwFlightStat" class="vw-flstat"></div>
+        <div class="vw-fl-ctl">
+          <input id="vwFlX" placeholder="dest X" inputmode="numeric">
+          <input id="vwFlZ" placeholder="dest Z" inputmode="numeric">
+          <button class="vw-qbtn" onclick="vwFlyTo()">✈ Fly there</button>
+          <button class="vw-qbtn" onclick="vwRunCommand('fly stop')">Stop</button>
+          <button class="vw-qbtn" onclick="vwRunCommand('fly resupplyspares')">Resupply</button>
+          <button class="vw-qbtn" onclick="vwRunCommand('fly restart')">Restart</button>
+          <span style="font-size:.62rem;color:var(--dim)">tip: click the map to set a destination</span>
+        </div>
+      </div>
       <div class="vw-cols">
         <div>
           <div class="vw-card">
             <div class="vw-sec">Location</div>
             <div class="vw-mini">
-              <canvas id="vwMiniCanvas" width="520" height="520" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
+              <canvas id="vwMiniCanvas" width="520" height="520" onclick="vwMiniClick(event)" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;cursor:crosshair"></canvas>
               <div style="position:absolute;top:.3rem;left:.4rem;font-family:var(--mono);font-size:.55rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
             </div>
           </div>
@@ -6815,8 +6836,14 @@ function vwApplyState(d){
   if(!d || d.offline){ vwOnlineSet(false); vwData=null; $('vwHud').innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; return; }
   vwOnlineSet(true); vwData=d;
   const s={x:+d.x, y:+d.y, z:+d.z, yaw:+d.yaw||0, pitch:+d.pitch||0};
+  const prev=vwSamples[vwSamples.length-1];
   vwSamples.push(s); if(vwSamples.length>4) vwSamples.shift();
+  const now=performance.now();   // live horizontal speed (b/s) from position deltas, smoothed
+  if(prev&&vwLastSampleT){ const dt=(now-vwLastSampleT)/1000;
+    if(dt>0.01&&dt<2){ vwSpeed=vwSpeed*0.6+(Math.hypot(s.x-prev.x,s.z-prev.z)/dt)*0.4; } }
+  vwLastSampleT=now;
   if(!vwRender.has){ vwRender.x=s.x; vwRender.y=s.y; vwRender.z=s.z; vwRender.yaw=s.yaw; vwRender.pitch=s.pitch; vwRender.has=true; vwCam.x=s.x; vwCam.z=s.z; }
+  if(vwTab==='control'){ vwRenderVitals(); vwRenderFlight(); }
   const band=d.band&&d.band!=='CLEAR'?' <span style="color:var(--warn)">⚠ '+esc(d.band)+'</span>':'';
   $('vwHud').innerHTML='<span>📍 '+Math.round(d.x)+', '+Math.round(d.y)+', '+Math.round(d.z)+'</span>'
     +'<span>'+esc(d.dimension||'?')+'</span>'
@@ -7114,7 +7141,7 @@ function vwPovRender(){
   if(!vwBox || Math.hypot(vwRender.x-vwBox.cx, vwRender.z-vwBox.cz)>vwBox.sx*0.30 || performance.now()-vwChunkAt>6000) vwFetchChunks();
 }
 // ---- Control tab: live vitals + inventory (real MC item icons), module toggles, command palette, mini-map ----
-let vwInvData=null, vwModData=null, vwCmdData=null, vwInvT=null, vwModT=null, vwCmdLoaded=false;
+let vwInvData=null, vwModData=null, vwCmdData=null, vwInvT=null, vwModT=null, vwCmdLoaded=false, vwSpeed=0, vwLastSampleT=0;
 const VW_ICON='https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/1.21.4/assets/minecraft/textures/';
 function vwIconFallback(img,next){ if(img.dataset.f){ img.style.display='none'; } else { img.dataset.f='1'; img.src=next; } }
 function vwIconHtml(name){
@@ -7151,6 +7178,36 @@ function vwRenderInv(){
   const iv=vwInvData||{}, g=a=>(a||[]).map(vwSlot).join('');
   $('vwInv').innerHTML='<div class="vw-grid">'+g(iv.main)+'</div><div class="vw-grid vw-hot">'+g(iv.hotbar)+'</div>';
 }
+function vwFindElytra(){
+  const iv=vwInvData||{}; let worn=null, spares=0;
+  const chest=iv.armor&&iv.armor.chestplate;
+  if(chest&&chest.name&&chest.name.indexOf('elytra')>=0) worn=chest;
+  for(const arr of [iv.hotbar,iv.main]) for(const it of (arr||[])) if(it&&it.name&&it.name.indexOf('elytra')>=0) spares++;
+  return {worn,spares};
+}
+function vwRenderFlight(){
+  const el=$('vwFlightStat'); if(!el) return;
+  const d=vwData||{}, e=vwFindElytra();
+  const phase=d.flightPhase||'IDLE', band=d.band, tgt=d.target?(d.target[0]+', '+d.target[1]):'—';
+  let h='<div class="vw-fl-top"><span class="vw-chip">✈ '+esc(phase)+'</span>';
+  if(band&&band!=='CLEAR') h+='<span class="vw-chip" style="color:var(--warn)">⚠ '+esc(band)+'</span>';
+  h+='<span class="vw-fl-stat">speed <b>'+(vwSpeed||0).toFixed(0)+'</b> b/s</span>'
+    +'<span class="vw-fl-stat">alt <b>'+Math.round(d.y||0)+'</b></span>'
+    +'<span class="vw-fl-stat">target <b>'+esc(tgt)+'</b></span></div>';
+  if(e.worn&&e.worn.max){ const f=Math.max(0,Math.min(1,e.worn.dur/e.worn.max)), c=f>0.5?'#3fb950':(f>0.25?'#d29922':'#f85149');
+    h+='<div class="vw-fl-row"><span>elytra</span><div class="vw-bar" style="width:150px"><i style="width:'+(f*100).toFixed(0)+'%;background:'+c+'"></i></div><b>'+e.worn.dur+'/'+e.worn.max+'</b><span class="vw-chip">×'+e.spares+' spare'+(e.spares===1?'':'s')+'</span></div>'; }
+  else { h+='<div class="vw-fl-row"><span style="color:var(--dim)">no elytra worn</span><span class="vw-chip">×'+e.spares+' spare'+(e.spares===1?'':'s')+'</span></div>'; }
+  el.innerHTML=h;
+}
+function vwFlyTo(){ const x=(($('vwFlX')||{}).value||'').trim(), z=(($('vwFlZ')||{}).value||'').trim();
+  if(x!==''&&z!=='') vwRunCommand('fly trip nether '+x+' '+z); }
+function vwMiniClick(e){
+  const cv=$('vwMiniCanvas'); if(!cv||!vwRender.has) return;
+  const r=cv.getBoundingClientRect(), W=cv.width, z=W/110;
+  const px=(e.clientX-r.left)/r.width*W, py=(e.clientY-r.top)/r.height*cv.height;
+  const wx=Math.round(vwRender.x+(px-W/2)/z), wz=Math.round(vwRender.z+(py-cv.height/2)/z);
+  if($('vwFlX')) $('vwFlX').value=wx; if($('vwFlZ')) $('vwFlZ').value=wz;
+}
 function vwRenderModules(){
   const mods=(vwModData&&vwModData.modules)||[];
   const f=(($('vwModFilter')||{}).value||'').toLowerCase();
@@ -7179,7 +7236,7 @@ function vwModToggle(name,on){ vwRunCommand(name.toLowerCase()+' '+(on?'on':'off
 async function vwTickInv(){
   if(!VW||vwTab!=='control') return;
   try{ const d=await(await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/inventory')).json();
-    if(d&&!d.offline){ vwInvData=d; vwRenderVitals(); vwRenderEquip(); vwRenderInv(); } }catch(e){}
+    if(d&&!d.offline){ vwInvData=d; vwRenderVitals(); vwRenderEquip(); vwRenderInv(); vwRenderFlight(); } }catch(e){}
 }
 async function vwTickMod(){
   if(!VW||vwTab!=='control') return;
@@ -7197,7 +7254,7 @@ function vwControlStart(){
   const q=$('vwQuick'); if(q&&!q.dataset.init){ q.dataset.init='1';
     q.innerHTML=[['Connect','connect'],['Disconnect','disconnect'],['Status','info'],['Reconnect','reconnect']]
       .map(a=>'<button class="vw-qbtn" onclick="vwRunCommand(\''+a[1]+'\')">'+a[0]+'</button>').join(''); }
-  vwRenderVitals(); vwTickInv(); vwTickMod(); vwLoadCommands();
+  vwRenderVitals(); vwRenderFlight(); vwTickInv(); vwTickMod(); vwLoadCommands();
   clearInterval(vwInvT); vwInvT=setInterval(vwTickInv,1500);
   clearInterval(vwModT); vwModT=setInterval(vwTickMod,2800);
 }
