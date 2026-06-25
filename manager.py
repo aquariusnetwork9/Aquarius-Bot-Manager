@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.16.0"
+__version__ = "1.17.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3762,6 +3762,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        for hk in ("X-Center-X", "X-Center-Z", "X-Size"):   # let the client pan the map precisely
+            hv = resp.headers.get(hk)
+            if hv:
+                self.send_header(hk, hv)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -6110,15 +6114,20 @@ table.tbl tr:hover td{background:#ffffff05}
 </div>
 
 <div class="scrim" id="vwScrim" onclick="closeViewer(event)">
-  <div class="modal" style="width:min(720px,96vw)" onclick="event.stopPropagation()">
-    <div class="mhead">Live viewer — <span id="vwName"></span></div>
-    <div id="vwWrap" style="position:relative;width:100%;max-width:560px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
-      <img id="vwMap" alt="" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;display:none">
-      <canvas id="vwCanvas" width="512" height="512" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+  <div class="modal" style="width:min(760px,96vw)" onclick="event.stopPropagation()">
+    <div class="mhead" style="display:flex;align-items:center;gap:.55rem">
+      <span>Live viewer — <span id="vwName"></span></span>
+      <span id="vwMode" style="font-family:var(--mono);font-size:.6rem;color:var(--acc);border:1px solid var(--acc-dim);border-radius:5px;padding:.05rem .35rem"></span>
+      <button id="vwRecenter" onclick="vwRecenter()" title="Recenter + follow the bot"
+        style="margin-left:auto;font-size:.7rem;padding:.3rem .55rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:7px;cursor:pointer">⌖ follow</button>
+    </div>
+    <div id="vwWrap" style="position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:grab;touch-action:none">
+      <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
       <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port 2998).</div>
+      <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
     </div>
     <div id="vwHud" style="display:flex;flex-wrap:wrap;gap:.45rem 1rem;justify-content:center;margin-top:.7rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)"></div>
-    <div style="text-align:center;margin-top:.5rem;color:var(--dim);font-size:.66rem;font-family:var(--mono)">N ↑ &nbsp;·&nbsp; map follows the bot (centered)</div>
+    <div style="text-align:center;margin-top:.4rem;color:var(--dim);font-size:.64rem;font-family:var(--mono)">drag to pan · scroll to zoom · ⌖ to follow</div>
   </div>
 </div>
 
@@ -6452,57 +6461,129 @@ async function bulk(action){
   refresh();
 }
 
-// ---- live viewer (polls the bot's relayed /viewer feed) ----
-let VW=null, vwStateT=null, vwMapT=null;
+// ---- live viewer: bot-centered smooth scroll (interpolated @ rAF) + free pan/zoom ----
+// State polls ~10 Hz; the canvas renders every frame, easing the bot pose toward the
+// latest sample so motion is smooth at display fps even though the data is ~20 TPS.
+// The map PNG is bot-centered on the bot (server side) and carries its world-center in
+// headers, so the client pans it precisely. Free mode unlocks the camera (drag/zoom);
+// since the bot only knows its own loaded chunks, panning past them shows empty space.
+let VW=null, vwStateT=null, vwRAF=null, vwHandlersInit=false;
+let vwSamples=[], vwRender={x:0,z:0,yaw:0,has:false};
+let vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
+let vwCam={x:0,z:0}, vwZoom=3, vwFollow=true, vwDrag=null;
+function vwLerpAng(a,b,k){ let d=((b-a+540)%360)-180; return a+d*k; }
+function vwUpdMode(){ const m=$('vwMode'); if(m) m.textContent = vwFollow?'FOLLOW':'FREE'; }
+function vwOnlineSet(on){ const o=$('vwOff'); if(o) o.style.display = on?'none':'flex'; }
 function openViewer(name){
   VW=name; $('vwName').textContent=name;
+  vwSamples=[]; vwRender={x:0,z:0,yaw:0,has:false};
+  vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
+  vwCam={x:0,z:0}; vwFollow=true; vwDrag=null;
+  vwZoom=$('vwCanvas').width/220;          // ~220 blocks across by default
+  vwUpdMode(); vwOnlineSet(false);
   $('vwScrim').classList.add('open');
-  $('vwOff').style.display='flex'; $('vwMap').style.display='none';
-  vwRefreshMap(); vwTickState();
-  clearInterval(vwStateT); clearInterval(vwMapT);
-  vwStateT=setInterval(vwTickState,1000);
-  vwMapT=setInterval(vwRefreshMap,1500);
+  vwInitHandlers(); vwTickState();
+  clearInterval(vwStateT); vwStateT=setInterval(vwTickState,100);
+  if(!vwRAF) vwRAF=requestAnimationFrame(vwFrame);
 }
 function closeViewer(e){
   if(e && e.target!==$('vwScrim')) return;
   $('vwScrim').classList.remove('open');
-  clearInterval(vwStateT); clearInterval(vwMapT); vwStateT=vwMapT=null; VW=null;
+  clearInterval(vwStateT); vwStateT=null;
+  if(vwRAF){ cancelAnimationFrame(vwRAF); vwRAF=null; }
+  VW=null;
 }
-function vwRefreshMap(){
-  if(!VW) return;
-  const img=$('vwMap');
-  img.onload=()=>{ img.style.display='block'; $('vwOff').style.display='none'; };
-  img.onerror=()=>{ img.style.display='none'; };
-  img.src='/api/instances/'+encodeURIComponent(VW)+'/viewer/map?size=256&ts='+Date.now();
-}
+function vwRecenter(){ vwFollow=true; vwUpdMode(); }
 async function vwTickState(){
   if(!VW) return;
   let d=null;
   try{ d=await (await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/state')).json(); }catch(e){}
-  const hud=$('vwHud');
-  if(!d || d.offline){ hud.innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; vwDrawOverlay(null); return; }
-  hud.innerHTML='<span>📍 '+Math.round(d.x)+', '+Math.round(d.y)+', '+Math.round(d.z)+'</span>'
+  if(!d || d.offline){ vwOnlineSet(false); $('vwHud').innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; return; }
+  vwOnlineSet(true);
+  const s={x:+d.x, z:+d.z, yaw:+d.yaw||0};
+  vwSamples.push(s); if(vwSamples.length>4) vwSamples.shift();
+  if(!vwRender.has){ vwRender.x=s.x; vwRender.z=s.z; vwRender.yaw=s.yaw; vwRender.has=true; vwCam.x=s.x; vwCam.z=s.z; }
+  $('vwHud').innerHTML='<span>📍 '+Math.round(d.x)+', '+Math.round(d.y)+', '+Math.round(d.z)+'</span>'
     +'<span>❤ '+(+d.health).toFixed(0)+'</span><span>🍗 '+d.food+'</span>'
     +'<span>✈ '+esc(d.flightPhase||'-')+'</span><span>↻ '+Math.round(d.yaw)+'°</span>';
-  vwDrawOverlay(d);
 }
-function vwDrawOverlay(d){
+async function vwFetchMap(size){
+  vwMap.loading=true;
+  try{
+    const r=await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/map?size='+size+'&ts='+Date.now());
+    if(!r.ok) throw 0;
+    const cx=+r.headers.get('X-Center-X'), cz=+r.headers.get('X-Center-Z'), sz=+r.headers.get('X-Size')||size;
+    const bmp=await createImageBitmap(await r.blob());
+    vwMap.img=bmp;
+    vwMap.cx=isFinite(cx)?cx:vwRender.x; vwMap.cz=isFinite(cz)?cz:vwRender.z; vwMap.size=sz;
+    vwMap.fetchedAt=performance.now();
+  }catch(e){}
+  finally{ vwMap.loading=false; }
+}
+function vwMaybeFetchMap(){
+  const W=$('vwCanvas').width, viewB=W/vwZoom;
+  const need=Math.min(512, Math.max(64, Math.ceil(viewB*1.3/16)*16));
+  const m=vwMap;
+  const moved = m.img && Math.hypot(vwRender.x-m.cx, vwRender.z-m.cz) > (m.size*0.5 - viewB*0.5 - 8);
+  const tooSmall = m.img && m.size < Math.ceil(viewB/16)*16;
+  const stale = (performance.now()-m.fetchedAt) > 4000;
+  if(!m.loading && (!m.img || moved || tooSmall || stale)) vwFetchMap(need);
+}
+function vwFrame(){
+  if(VW){
+    const s=vwSamples[vwSamples.length-1];
+    if(s){ vwRender.x+=(s.x-vwRender.x)*0.30; vwRender.z+=(s.z-vwRender.z)*0.30; vwRender.yaw=vwLerpAng(vwRender.yaw,s.yaw,0.30); }
+    if(vwFollow){ vwCam.x=vwRender.x; vwCam.z=vwRender.z; }
+    if(VW) vwMaybeFetchMap();
+    vwDraw();
+  }
+  vwRAF=requestAnimationFrame(vwFrame);
+}
+function vwDraw(){
   const c=$('vwCanvas'); if(!c) return;
-  const x=c.getContext('2d'), W=c.width, H=c.height, cx=W/2, cy=H/2;
+  const x=c.getContext('2d'), W=c.width, H=c.height, z=vwZoom, camx=vwCam.x, camz=vwCam.z, m=vwMap;
   x.clearRect(0,0,W,H);
-  x.strokeStyle='rgba(255,255,255,.30)'; x.lineWidth=2;            // center crosshair = the bot
-  x.beginPath(); x.moveTo(cx-12,cy); x.lineTo(cx+12,cy); x.moveTo(cx,cy-12); x.lineTo(cx,cy+12); x.stroke();
-  if(!d) return;
-  // heading arrow. MC yaw: facing = (-sin, cos) in (x,z); map is x->right, z->down, N(-z) up.
-  const yaw=(+d.yaw||0)*Math.PI/180, dx=-Math.sin(yaw), dz=Math.cos(yaw), L=52;
-  const ex=cx+dx*L, ey=cy+dz*L, a=Math.atan2(dz,dx);
+  if(m.img){
+    x.imageSmoothingEnabled=false;
+    const wx0=m.cx-m.size/2, wz0=m.cz-m.size/2;
+    x.drawImage(m.img,(wx0-camx)*z+W/2,(wz0-camz)*z+H/2,m.size*z,m.size*z);
+  }
+  if(!vwRender.has) return;
+  const bx=(vwRender.x-camx)*z+W/2, by=(vwRender.z-camz)*z+H/2;
+  x.strokeStyle='rgba(255,255,255,.30)'; x.lineWidth=2;
+  x.beginPath(); x.moveTo(bx-11,by); x.lineTo(bx+11,by); x.moveTo(bx,by-11); x.lineTo(bx,by+11); x.stroke();
+  const yaw=vwRender.yaw*Math.PI/180, dx=-Math.sin(yaw), dz=Math.cos(yaw), L=26;
+  const ex=bx+dx*L, ey=by+dz*L, a=Math.atan2(dz,dx);
   x.strokeStyle='#30d158'; x.fillStyle='#30d158'; x.lineWidth=3;
-  x.beginPath(); x.moveTo(cx,cy); x.lineTo(ex,ey); x.stroke();
+  x.beginPath(); x.moveTo(bx,by); x.lineTo(ex,ey); x.stroke();
   x.beginPath(); x.moveTo(ex,ey);
-  x.lineTo(ex-14*Math.cos(a-0.42), ey-14*Math.sin(a-0.42));
-  x.lineTo(ex-14*Math.cos(a+0.42), ey-14*Math.sin(a+0.42));
+  x.lineTo(ex-12*Math.cos(a-0.42), ey-12*Math.sin(a-0.42));
+  x.lineTo(ex-12*Math.cos(a+0.42), ey-12*Math.sin(a+0.42));
   x.closePath(); x.fill();
-  x.fillStyle='#fff'; x.beginPath(); x.arc(cx,cy,4,0,7); x.fill();  // bot dot
+  x.fillStyle='#fff'; x.beginPath(); x.arc(bx,by,3.5,0,7); x.fill();
+}
+function vwInitHandlers(){
+  if(vwHandlersInit) return; vwHandlersInit=true;
+  const wrap=$('vwWrap');
+  wrap.addEventListener('wheel',(e)=>{
+    e.preventDefault();
+    const W=$('vwCanvas').width, f=e.deltaY<0?1.12:1/1.12;
+    vwZoom=Math.max(W/512, Math.min(W/24, vwZoom*f));
+  },{passive:false});
+  wrap.addEventListener('pointerdown',(e)=>{
+    wrap.setPointerCapture(e.pointerId);
+    if(vwFollow){ vwFollow=false; vwCam.x=vwRender.x; vwCam.z=vwRender.z; vwUpdMode(); }
+    vwDrag={sx:e.clientX, sy:e.clientY, cx:vwCam.x, cz:vwCam.z};
+    wrap.style.cursor='grabbing';
+  });
+  wrap.addEventListener('pointermove',(e)=>{
+    if(!vwDrag) return;
+    const cv=$('vwCanvas'), sc=cv.width/cv.getBoundingClientRect().width;
+    vwCam.x=vwDrag.cx-(e.clientX-vwDrag.sx)*sc/vwZoom;
+    vwCam.z=vwDrag.cz-(e.clientY-vwDrag.sy)*sc/vwZoom;
+  });
+  const end=()=>{ vwDrag=null; $('vwWrap').style.cursor='grab'; };
+  wrap.addEventListener('pointerup',end); wrap.addEventListener('pointercancel',end);
 }
 function openDrawer(name){
   CUR=name; $('drawerName').textContent=name;
