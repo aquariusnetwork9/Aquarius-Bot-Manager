@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.19.0"
+__version__ = "2.0.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -285,6 +285,43 @@ def instance_stats(inst):
 
 # tiny mtime cache so we don't re-parse launch_config.json on every poll
 _PROXY_CACHE = {}
+_VIEWER_PORT_CACHE = {}
+
+
+def viewer_port_for(inst):
+    """Which loopback port a bot's diagnostic viewer feed listens on (server.viewer.port).
+    Resolution order: an explicit `viewer_port` in instances.json (our own config) wins;
+    otherwise auto-discover it from the bot's own config.json (`server.viewer.port`), so
+    several viewer-enabled bots on one box each get their right port with zero manual setup;
+    otherwise fall back to the 2998 default. Only the integer port is read — never tokens —
+    and the parse is mtime-cached so the hot polling path doesn't re-read the file."""
+    explicit = inst.get("viewer_port")
+    if explicit:
+        try:
+            p = int(explicit)
+            if 1024 <= p <= 65535:
+                return p
+        except (ValueError, TypeError):
+            pass
+    path = os.path.join(inst.get("dir") or "", inst.get("config_file") or "config.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return 2998
+    cached = _VIEWER_PORT_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    port = 2998
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        p = int(((data.get("server") or {}).get("viewer") or {}).get("port", 2998))
+        if 1024 <= p <= 65535:
+            port = p
+    except (OSError, ValueError, TypeError, AttributeError):
+        port = 2998
+    _VIEWER_PORT_CACHE[path] = (mtime, port)
+    return port
 
 
 def proxy_info(directory):
@@ -3730,18 +3767,23 @@ class Handler(BaseHTTPRequestHandler):
         """Relay a bot's loopback viewer feed to the dashboard. The bot binds the viewer to 127.0.0.1 only, so the
         browser can't reach it directly — we fetch it server-side and pass it through. Cross-box is automatic: a
         selected remote node already proxies this whole request to that box's manager, which serves its local bot.
-        Path: /api/instances/<name>/viewer/{state|map}. Port defaults to 2998 (override ?port=)."""
+        Path: /api/instances/<name>/viewer/{state|map}. Port is resolved per-bot (instances.json
+        `viewer_port`, else the bot's own config.json `server.viewer.port`, else 2998); ?port= overrides."""
         parts = path.split("/")
         # ['', 'api', 'instances', '<name>', 'viewer', 'state'|'map'|'chunks']
         if len(parts) < 6 or parts[4] != "viewer" or parts[5] not in ("state", "map", "chunks"):
             return self._json({"error": "not found"}, 404)
         sub = parts[5]
-        try:
-            port = int(q.get("port", ["2998"])[0])
-        except (ValueError, TypeError, IndexError):
-            port = 2998
-        if not (1024 <= port <= 65535):
-            port = 2998
+        name = urllib.parse.unquote(parts[3])
+        inst = self._cfg()["by_name"].get(name) or {}
+        port = viewer_port_for(inst)
+        if q.get("port"):                          # explicit override (ad-hoc / testing)
+            try:
+                p = int(q["port"][0])
+                if 1024 <= p <= 65535:
+                    port = p
+            except (ValueError, TypeError, IndexError):
+                pass
         upstream = {"state": "state.json", "map": "map.png", "chunks": "chunks"}[sub]
         url = f"http://127.0.0.1:{port}/viewer/{upstream}"
         if sub == "map":
@@ -3777,6 +3819,61 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _viewer_stream(self, path, q, node):
+        """Stream a bot's ~20 Hz SSE state feed (text/event-stream) straight through to the browser, unbuffered.
+        Picks its upstream symmetrically: on the controller (a node is selected) it streams from that box's
+        manager — which runs this same code with no node selected and so streams from its local bot; on a leaf
+        box it streams from the bot's loopback /viewer/stream. The browser's EventSource falls back to polling
+        if this can't be opened, so a 503 here is a soft failure."""
+        parts = path.split("/")  # ['', 'api', 'instances', '<name>', 'viewer', 'stream']
+        if len(parts) < 6:
+            return self._json({"error": "not found"}, 404)
+        name = urllib.parse.unquote(parts[3])
+        hdrs = {"Accept": "text/event-stream"}
+        if node is not None:
+            url = f"http://127.0.0.1:{node['local_port']}{self.path}"
+            u, pw = node_creds(node)
+            if u:
+                hdrs["Authorization"] = "Basic " + base64.b64encode(f"{u}:{pw}".encode()).decode()
+        else:
+            inst = self._cfg()["by_name"].get(name) or {}
+            port = viewer_port_for(inst)
+            if q.get("port"):
+                try:
+                    p = int(q["port"][0])
+                    if 1024 <= p <= 65535:
+                        port = p
+                except (ValueError, TypeError, IndexError):
+                    pass
+            url = f"http://127.0.0.1:{port}/viewer/stream"
+        try:
+            up = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=10)
+        except Exception:
+            self.send_response(503)        # browser EventSource sees this and falls back to polling
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")   # discourage any intermediary buffering
+            self.end_headers()
+            while True:
+                line = up.readline()       # forwards each SSE line as it arrives (low latency)
+                if not line:
+                    break
+                self.wfile.write(line)
+                self.wfile.flush()
+        except Exception:
+            pass                            # client/upstream disconnected — end the stream quietly
+        finally:
+            try:
+                up.close()
+            except Exception:
+                pass
+
     # ---- routing ----
     def do_GET(self):
         u = urlparse(self.path)
@@ -3805,6 +3902,10 @@ class Handler(BaseHTTPRequestHandler):
 
         # controller: a selected node proxies the whole UI through its SSH tunnel
         node = self._selected_node()
+        # The viewer SSE feed must stream, so it bypasses the buffering node-proxy: handle it here and
+        # let _viewer_stream pick its upstream (the selected box's manager, else the local bot).
+        if path.startswith("/api/instances/") and path.endswith("/viewer/stream"):
+            return self._viewer_stream(path, q, node)
         if node is not None and not self._is_switcher_path(path):
             return self._proxy_to_node(node)
 
@@ -6141,7 +6242,7 @@ table.tbl tr:hover td{background:#ffffff05}
     </div>
     <div id="vwWrap" style="position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:grab;touch-action:none">
       <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
-      <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port 2998).</div>
+      <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port auto-detected).</div>
       <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
     </div>
     <div id="vwHud" style="display:flex;flex-wrap:wrap;gap:.45rem 1rem;justify-content:center;margin-top:.7rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)"></div>
@@ -6486,13 +6587,14 @@ async function bulk(action){
 // headers, so the client pans it precisely. Free mode unlocks the camera (drag/zoom);
 // since the bot only knows its own loaded chunks, panning past them shows empty space.
 let VW=null, vwStateT=null, vwRAF=null, vwHandlersInit=false, vwData=null;
+let vwES=null, vwStreamRetry=null;   // SSE push (~20 Hz) with polling fallback
 // 2b2t nether ring-road radii (blocks) for the overlay; cardinals at x=0/z=0, diagonals x=±z.
 const VW_RINGS=[200,500,1000,1500,2000,2500,5000,7500,10000,15000,20000,25000,50000,55000,62500,100000,125000,250000,500000,750000,1000000,1250000,1568852,1875000,2500000,3750000];
 const VW_HOSTILE=new Set(['WITHER','WITHER_SKELETON','WITHER_SKULL','SKELETON','ZOMBIE','ZOMBIFIED_PIGLIN','PIGLIN','PIGLIN_BRUTE','HOGLIN','ZOGLIN','BLAZE','GHAST','MAGMA_CUBE','ENDERMAN','CREEPER','SPIDER','PHANTOM','VEX','PILLAGER','VINDICATOR','RAVAGER','EVOKER']);
 let vwSamples=[], vwRender={x:0,y:0,z:0,yaw:0,pitch:0,has:false};
 let vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
 let vwCam={x:0,z:0}, vwZoom=3, vwFollow=true, vwDrag=null;
-let vwTab='map', vwCam3rd=false, vwThree=null, vwBox=null, vwChunkBusy=false, vwChunkAt=0;
+let vwTab='map', vwCam3rd=false, vwGL=null, vwBox=null, vwChunkBusy=false, vwChunkAt=0;
 function vwLerpAng(a,b,k){ let d=((b-a+540)%360)-180; return a+d*k; }
 function vwUpdMode(){ const m=$('vwMode'); if(m) m.textContent = vwFollow?'FOLLOW':'FREE'; }
 function vwOnlineSet(on){ const o=$('vwOff'); if(o) o.style.display = on?'none':'flex'; }
@@ -6501,26 +6603,51 @@ function openViewer(name){
   vwSamples=[]; vwRender={x:0,y:0,z:0,yaw:0,pitch:0,has:false};
   vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
   vwCam={x:0,z:0}; vwFollow=true; vwDrag=null; vwBox=null; vwChunkAt=0;
-  if(vwThree&&vwThree.mesh){ vwThree.scene.remove(vwThree.mesh); vwThree.mesh.geometry.dispose(); vwThree.mesh=null; }
+  if(vwGL){ vwGL.count=0; }   // drop the old mesh; context is reused on reopen
   vwZoom=$('vwCanvas').width/220;          // ~220 blocks across by default
   vwUpdMode(); vwOnlineSet(false); vwSetTab('map'); vwSetCam('1st');
   $('vwScrim').classList.add('open');
   vwInitHandlers(); vwTickState();
   clearInterval(vwStateT); vwStateT=setInterval(vwTickState,100);
+  vwOpenStream();          // upgrade to ~20 Hz push; onopen stops the poll, onerror falls back to it
   if(!vwRAF) vwRAF=requestAnimationFrame(vwFrame);
 }
 function closeViewer(e){
   if(e && e.target!==$('vwScrim')) return;
   $('vwScrim').classList.remove('open');
   clearInterval(vwStateT); vwStateT=null;
+  clearTimeout(vwStreamRetry); vwStreamRetry=null;
+  vwCloseStream();
   if(vwRAF){ cancelAnimationFrame(vwRAF); vwRAF=null; }
   VW=null;
+}
+function vwCloseStream(){ if(vwES){ try{ vwES.close(); }catch(_){ } vwES=null; } }
+function vwOpenStream(){
+  if(typeof EventSource==='undefined' || !VW) return;        // ancient browser → polling only
+  vwCloseStream();
+  let es;
+  try{ es=new EventSource('/api/instances/'+encodeURIComponent(VW)+'/viewer/stream'); }
+  catch(e){ return; }
+  vwES=es;
+  es.onopen=()=>{ clearInterval(vwStateT); vwStateT=null; };  // push is live → stop the HTTP poll
+  es.onmessage=(ev)=>{ if(!VW) return; let d=null; try{ d=JSON.parse(ev.data); }catch(_){ return; } vwApplyState(d); };
+  es.onerror=()=>{
+    if(!VW){ vwCloseStream(); return; }
+    if(!vwStateT){ vwTickState(); vwStateT=setInterval(vwTickState,100); }   // keep data flowing via polling
+    if(es.readyState===EventSource.CLOSED){     // fatal (e.g. 503 from relay); browser won't retry — we do
+      vwCloseStream();
+      clearTimeout(vwStreamRetry); vwStreamRetry=setTimeout(()=>{ if(VW) vwOpenStream(); }, 8000);
+    }
+  };
 }
 function vwRecenter(){ vwFollow=true; vwUpdMode(); }
 async function vwTickState(){
   if(!VW) return;
   let d=null;
   try{ d=await (await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/state')).json(); }catch(e){}
+  vwApplyState(d);
+}
+function vwApplyState(d){
   if(!d || d.offline){ vwOnlineSet(false); vwData=null; $('vwHud').innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; return; }
   vwOnlineSet(true); vwData=d;
   const s={x:+d.x, y:+d.y, z:+d.z, yaw:+d.yaw||0, pitch:+d.pitch||0};
@@ -6560,7 +6687,7 @@ function vwFrame(){
     if(s){ vwRender.x+=(s.x-vwRender.x)*0.30; vwRender.y+=(s.y-vwRender.y)*0.30; vwRender.z+=(s.z-vwRender.z)*0.30;
            vwRender.yaw=vwLerpAng(vwRender.yaw,s.yaw,0.30); vwRender.pitch+=(s.pitch-vwRender.pitch)*0.30; }
     if(vwFollow){ vwCam.x=vwRender.x; vwCam.z=vwRender.z; }
-    if(vwTab==='pov'){ if(vwThree) vwPovRender(); }
+    if(vwTab==='pov'){ if(vwGL) vwPovRender(); }
     else { vwMaybeFetchMap(); vwDraw(); }
   }
   vwRAF=requestAnimationFrame(vwFrame);
@@ -6670,22 +6797,52 @@ function vwSetCam(m){
   if(a){ a.style.color=vwCam3rd?'var(--txt)':'var(--acc)'; a.style.borderColor=vwCam3rd?'var(--line)':'var(--acc-dim)'; }
   if(b){ b.style.color=vwCam3rd?'var(--acc)':'var(--txt)'; b.style.borderColor=vwCam3rd?'var(--acc-dim)':'var(--line)'; }
 }
-async function vwInitPov(){
-  if(vwThree){ vwResizePov(); return; }
+// Self-contained WebGL voxel renderer — no three.js, no external fetch (fully offline).
+// Column-major 4x4 matrix helpers (gl-matrix conventions, no deps).
+function vwM4Mul(a,b){ const o=new Float32Array(16);
+  for(let c=0;c<4;c++) for(let r=0;r<4;r++){ let s=0; for(let k=0;k<4;k++) s+=a[k*4+r]*b[c*4+k]; o[c*4+r]=s; }
+  return o; }
+function vwPerspective(fovy,aspect,near,far){ const f=1/Math.tan(fovy/2), nf=1/(near-far);
+  return new Float32Array([ f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0 ]); }
+function vwLookAt(e,c,up){
+  let zx=e[0]-c[0],zy=e[1]-c[1],zz=e[2]-c[2]; const zl=Math.hypot(zx,zy,zz)||1; zx/=zl;zy/=zl;zz/=zl;
+  let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx; const xl=Math.hypot(xx,xy,xz)||1; xx/=xl;xy/=xl;xz/=xl;
+  const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  return new Float32Array([ xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*e[0]+xy*e[1]+xz*e[2]), -(yx*e[0]+yy*e[1]+yz*e[2]), -(zx*e[0]+zy*e[1]+zz*e[2]), 1 ]); }
+function vwCompileShader(gl,type,src){
+  const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){ const e=gl.getShaderInfoLog(s); gl.deleteShader(s); throw new Error(e); }
+  return s; }
+function vwInitPov(){
+  if(vwGL){ vwResizePov(); return; }
   try{
-    const THREE=await import('https://unpkg.com/three@0.160.0/build/three.module.js');
-    const renderer=new THREE.WebGLRenderer({canvas:$('vwPov'), antialias:false});
-    const scene=new THREE.Scene(); scene.background=new THREE.Color(0x06090c);
-    const cam=new THREE.PerspectiveCamera(75,1,0.1,3000);
-    vwThree={THREE,renderer,scene,cam,mesh:null};
+    const cv=$('vwPov');
+    const gl=cv.getContext('webgl')||cv.getContext('experimental-webgl');
+    if(!gl) throw new Error('WebGL not supported');
+    const vs=vwCompileShader(gl, gl.VERTEX_SHADER,
+      'attribute vec3 aPos;attribute vec3 aCol;uniform mat4 uMVP;varying vec3 vCol;'
+      +'void main(){vCol=aCol;gl_Position=uMVP*vec4(aPos,1.0);}');
+    const fs=vwCompileShader(gl, gl.FRAGMENT_SHADER,
+      'precision mediump float;varying vec3 vCol;void main(){gl_FragColor=vec4(vCol,1.0);}');
+    const prog=gl.createProgram(); gl.attachShader(prog,vs); gl.attachShader(prog,fs); gl.linkProgram(prog);
+    if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    gl.enable(gl.DEPTH_TEST); gl.clearColor(0x06/255,0x09/255,0x0c/255,1);
+    vwGL={gl,prog,
+      locPos:gl.getAttribLocation(prog,'aPos'), locCol:gl.getAttribLocation(prog,'aCol'),
+      locMVP:gl.getUniformLocation(prog,'uMVP'),
+      bufPos:gl.createBuffer(), bufCol:gl.createBuffer(), count:0};
     vwResizePov(); $('vwPovMsg').style.display='none';
     vwFetchChunks();
   }catch(e){ const m=$('vwPovMsg'); if(m){ m.style.display='flex'; m.textContent='3D unavailable ('+e+')'; } }
 }
 function vwResizePov(){
-  if(!vwThree) return;
-  const cv=$('vwPov'), w=cv.clientWidth||600, h=cv.clientHeight||600;
-  vwThree.renderer.setSize(w,h,false); vwThree.cam.aspect=w/h; vwThree.cam.updateProjectionMatrix();
+  if(!vwGL) return;
+  const cv=$('vwPov'), dpr=Math.min(2, window.devicePixelRatio||1);
+  const w=Math.max(1,Math.round((cv.clientWidth||600)*dpr)), h=Math.max(1,Math.round((cv.clientHeight||600)*dpr));
+  if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; }
+  vwGL.gl.viewport(0,0,cv.width,cv.height);
 }
 async function vwFetchChunks(){
   if(vwChunkBusy||!VW||!vwRender.has) return;
@@ -6711,8 +6868,8 @@ const VW_FACES=[
   {n:[0,0,-1],s:0.70, c:[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]}
 ];
 function vwBuildMesh(buf){
-  if(!vwThree) return;
-  const T=vwThree.THREE, dv=new DataView(buf);
+  if(!vwGL) return;
+  const gl=vwGL.gl, dv=new DataView(buf);
   const ox=dv.getInt32(0), oy=dv.getInt32(4), oz=dv.getInt32(8);
   const sx=dv.getUint16(12), sy=dv.getUint16(14), sz=dv.getUint16(16);
   const pal=new Uint8Array(buf,18,192), vox=new Uint8Array(buf,210,sx*sy*sz);
@@ -6727,24 +6884,31 @@ function vwBuildMesh(buf){
       for(const i of [0,1,2,0,2,3]){ pos.push(wx+c[i][0],wy+c[i][1],wz+c[i][2]); col.push(cr,cg,cb); }
     }
   }
-  const geo=new T.BufferGeometry();
-  geo.setAttribute('position', new T.Float32BufferAttribute(pos,3));
-  geo.setAttribute('color', new T.Float32BufferAttribute(col,3));
-  const mesh=new T.Mesh(geo, new T.MeshBasicMaterial({vertexColors:true}));
-  if(vwThree.mesh){ vwThree.scene.remove(vwThree.mesh); vwThree.mesh.geometry.dispose(); }
-  vwThree.mesh=mesh; vwThree.scene.add(mesh);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufPos); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufCol); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(col), gl.STATIC_DRAW);
+  vwGL.count=pos.length/3;
   vwBox={cx:ox+sx/2, cz:oz+sz/2, sx:sx};
 }
 function vwPovRender(){
-  if(!vwThree) return;
-  const cam=vwThree.cam;
+  if(!vwGL) return;
+  const gl=vwGL.gl, cv=$('vwPov');
   const ex=vwRender.x+0.5, ey=vwRender.y+1.62, ez=vwRender.z+0.5;
   const yaw=vwRender.yaw*Math.PI/180, pit=vwRender.pitch*Math.PI/180;
   const lx=-Math.sin(yaw)*Math.cos(pit), ly=-Math.sin(pit), lz=Math.cos(yaw)*Math.cos(pit);
-  if(vwCam3rd){ const D=5; cam.position.set(ex-lx*D, ey-ly*D+1.4, ez-lz*D); cam.lookAt(ex,ey,ez); }
-  else { cam.position.set(ex,ey,ez); cam.lookAt(ex+lx, ey+ly, ez+lz); }
+  let eye, ctr;
+  if(vwCam3rd){ const D=5; eye=[ex-lx*D, ey-ly*D+1.4, ez-lz*D]; ctr=[ex,ey,ez]; }
+  else { eye=[ex,ey,ez]; ctr=[ex+lx, ey+ly, ez+lz]; }
+  const proj=vwPerspective(75*Math.PI/180, (cv.width/cv.height)||1, 0.1, 3000);
+  const mvp=vwM4Mul(proj, vwLookAt(eye, ctr, [0,1,0]));
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(vwGL.count){
+    gl.useProgram(vwGL.prog);
+    gl.uniformMatrix4fv(vwGL.locMVP, false, mvp);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufPos); gl.enableVertexAttribArray(vwGL.locPos); gl.vertexAttribPointer(vwGL.locPos,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufCol); gl.enableVertexAttribArray(vwGL.locCol); gl.vertexAttribPointer(vwGL.locCol,3,gl.FLOAT,false,0,0);
+    gl.drawArrays(gl.TRIANGLES, 0, vwGL.count);
+  }
   if(!vwBox || Math.hypot(vwRender.x-vwBox.cx, vwRender.z-vwBox.cz)>vwBox.sx*0.30 || performance.now()-vwChunkAt>6000) vwFetchChunks();
-  vwThree.renderer.render(vwThree.scene, cam);
 }
 function openDrawer(name){
   CUR=name; $('drawerName').textContent=name;
