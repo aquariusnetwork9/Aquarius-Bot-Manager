@@ -55,7 +55,7 @@ time from the top-bar dropdown; the Live Map is built into all of them.
 | **Vitals** (health, food, position, dimension, speed) | ✅ live | From the ~20 Hz SSE viewer feed. |
 | **Live Map** | ✅ live | Real bot-centred map tile + SSE entity overlay; **click the map to set an Elytra destination**. |
 | **Command palette / runner** | ✅ live | Runs any console command and shows the structured result. |
-| **Per-module settings (subcards)** | 🔒 preview | Shown read-only with an honest banner — **live config editing arrives in v3.1** (the `/control/config` API). |
+| **Live configuration (per module)** | ✅ live *(v3.1)* | A **⚙ Live configuration** panel on each module reads the bot's real config and writes single fields back instantly (`GET`/`POST /control/config`); secrets are redacted and never writable. The friendly mockup subcards remain as a read-only overview. |
 | **Pearl pins on the map · trade-list editor** | 🧩 planned | A later release; they need new bot-side data exposure. |
 
 > The settings subcards show **sensible defaults**, not the bot's live config yet. Don't
@@ -215,6 +215,7 @@ authenticated relay**:
 
 - `GET /control/state` → module list + enabled flags (the rail status dots + header chips).
 - `POST /control/command` → runs a console command, returns its structured output.
+- `GET /control/config` → the live config tree (**secrets redacted**); `POST /control/config` `{path,value}` sets one field by dot-path and persists. Powers the **⚙ Live configuration** panel.
 - `GET /viewer/stream` (SSE, ~20 Hz) → position, vitals, dimension, nearby entities.
 - `GET /viewer/map.png` → the bot-centred map tile (Live Map backdrop).
 - `GET /viewer/inventory` → vitals + armor + inventory (used by the cockpit panels).

@@ -207,7 +207,7 @@
     var b=document.createElement('div');
     b.style.cssText='display:flex;align-items:center;gap:.5rem;font-size:.74rem;color:#ffb454;background:#ffb4540d;'+
       'border:1px solid #5a3b1f;border-radius:10px;padding:.55rem .75rem;margin-bottom:.6rem';
-    b.innerHTML='⚠ Settings preview — these are defaults, not the bot’s live config. Live editing lands with the config API (v3.1).';
+    b.innerHTML='ℹ Friendly overview (read-only). Edit the bot’s real, live values in <b>⚙ Live configuration</b> above.';
     g.insertBefore(b, g.firstChild);
     [].forEach.call(g.querySelectorAll('input,select'), function(e){ e.setAttribute('disabled','disabled'); e.style.opacity='.65'; });
     [].forEach.call(g.querySelectorAll('.tgl,.seg button,.chip .x,.chip.add'), function(e){ e.style.pointerEvents='none'; e.style.opacity='.65'; });
@@ -347,11 +347,118 @@
     };
   }
 
+  /* ---------------- live config (v3.1) ---------------- */
+  /* modules not under client.extra.<lcfirst(raw)> get an explicit root */
+  var CFG_ROOT_OVERRIDE = { account:'authentication', discord:'discord', livemap:'server.viewer' };
+
+  function fetchConfig(){
+    return fetch(api('/control/config'), {cache:'no-store'})
+      .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+      .then(function(d){ LIVE.config = (d && !d.offline) ? d : null; return LIVE.config; })
+      .catch(function(){ LIVE.config = null; });
+  }
+  function getPath(obj, path){ var o=obj, ps=path.split('.'); for(var i=0;i<ps.length;i++){ if(o==null) return undefined; o=o[ps[i]]; } return o; }
+  function setLocalPath(obj, path, v){ var ps=path.split('.'), o=obj; for(var i=0;i<ps.length-1;i++){ if(o[ps[i]]==null) return; o=o[ps[i]]; } o[ps[ps.length-1]]=v; }
+  function lcfirst(s){ return s ? s.charAt(0).toLowerCase()+s.slice(1) : s; }
+  function prettyKey(k){ return k.replace(/([a-z0-9])([A-Z])/g,'$1 $2').replace(/[_-]+/g,' ').replace(/^./,function(c){return c.toUpperCase();}).trim(); }
+
+  function moduleRoot(m){
+    if(!m || !LIVE.config) return null;
+    if(CFG_ROOT_OVERRIDE[m.id]) return getPath(LIVE.config, CFG_ROOT_OVERRIDE[m.id])!==undefined ? CFG_ROOT_OVERRIDE[m.id] : null;
+    var guess='client.extra.'+lcfirst(m.raw||'');
+    if(getPath(LIVE.config, guess)!==undefined) return guess;
+    var ex=getPath(LIVE.config,'client.extra')||{}, t=(m.raw||'').toLowerCase();
+    for(var k in ex){ if(k.toLowerCase()===t) return 'client.extra.'+k; }
+    return null;
+  }
+
+  function cfgFieldHtml(path, label, v){
+    var t=typeof v, c='';
+    if(t==='boolean') c='<span class="lcTgl tgl '+(v?'on':'')+'" data-path="'+esc(path)+'"></span>';
+    else if(t==='number') c='<input class="lcInp" type="text" inputmode="decimal" spellcheck="false" data-path="'+esc(path)+'" data-kind="num" value="'+v+'">';
+    else c='<input class="lcInp" type="text" spellcheck="false" data-path="'+esc(path)+'" data-kind="str" value="'+esc(v)+'">';
+    return '<div class="lcRow"><span class="lcLbl">'+esc(label)+'</span><span class="lcCtl">'+c+'</span></div>';
+  }
+  function cfgNodeHtml(obj, base, depth){
+    var html='';
+    for(var k in obj){
+      var v=obj[k]; if(v===null||v===undefined) continue;
+      var path=base+'.'+k, t=typeof v;
+      if(t==='boolean'||t==='number'||t==='string') html+=cfgFieldHtml(path, prettyKey(k), v);
+      else if(Array.isArray(v)) html+='<div class="lcRow"><span class="lcLbl">'+esc(prettyKey(k))+'</span><span class="lcCtl lcRO">'+v.length+' item'+(v.length===1?'':'s')+' · edit via console</span></div>';
+      else if(t==='object' && depth<2) html+='<div class="lcSub">'+esc(prettyKey(k))+'</div>'+cfgNodeHtml(v, path, depth+1);
+    }
+    return html;
+  }
+  function buildLiveConfig(){
+    var m=MAP[cur]; if(!m) return;
+    var cont=$(LO.cfg); if(!cont || $('#lcPanel')) return;
+    var root=moduleRoot(m), sub=root?getPath(LIVE.config, root):null;
+    var panel=document.createElement('div'); panel.id='lcPanel'; panel.className='lcPanel';
+    if(!LIVE.config){
+      panel.innerHTML='<div class="lcHead">⚙ Live configuration</div><div class="lcNote">Config API not available on this bot — needs a v3.1+ build with <code>server.viewer.control</code>.</div>';
+    } else if(!sub || typeof sub!=='object' || Array.isArray(sub)){
+      panel.innerHTML='<div class="lcHead">⚙ Live configuration</div><div class="lcNote">No editable config is mapped for this module.</div>';
+    } else {
+      panel.innerHTML='<div class="lcHead">⚙ Live configuration <span class="lcRootTag">'+esc(root)+'</span></div>'+
+        '<div class="lcNote">Edits apply on the bot immediately and persist to its config.</div>'+cfgNodeHtml(sub, root, 0);
+    }
+    cont.insertBefore(panel, cont.firstChild);
+    [].forEach.call(panel.querySelectorAll('.lcTgl'), function(tg){
+      tg.addEventListener('click', function(){ var on=!this.classList.contains('on'); this.classList.toggle('on',on); setConfig(this.dataset.path, on, this); });
+    });
+    [].forEach.call(panel.querySelectorAll('.lcInp'), function(inp){
+      inp.addEventListener('change', function(){
+        var val=this.dataset.kind==='num'?parseFloat(this.value):this.value;
+        if(this.dataset.kind==='num' && !isFinite(val)){ toast('not a number','err'); return; }
+        setConfig(this.dataset.path, val, this);
+      });
+    });
+  }
+  function setConfig(path, value, el){
+    if(el) el.classList.add('lcBusy');
+    fetch(api('/control/config'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:path,value:value})})
+      .then(function(r){ if(r.status===403) throw new Error('protected field / control disabled'); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(d){ if(d && d.ok===false) throw new Error(d.error||'set failed');
+        var nv=(d && d.value!==undefined)?d.value:value;
+        if(LIVE.config) setLocalPath(LIVE.config, path, nv);
+        toast(prettyKey(path.split('.').pop())+' = '+nv, 'ok');
+        if(el){ el.classList.remove('lcBusy'); el.classList.add('lcOk'); setTimeout(function(){ el.classList.remove('lcOk'); }, 900); }
+      })
+      .catch(function(e){ if(el) el.classList.remove('lcBusy'); toast(path.split('.').pop()+': '+e.message,'err',4200); });
+  }
+
+  function injectLiveConfigCss(){
+    if($('#lcCss')) return;
+    var s=document.createElement('style'); s.id='lcCss';
+    s.textContent=
+      '.lcPanel{border:1px solid var(--acc-dim,#1f7a55);border-radius:12px;background:#3ddc970a;padding:.55rem .8rem .7rem;margin-bottom:.7rem}'+
+      '.lcHead{font-weight:700;font-size:.84rem;display:flex;align-items:center;gap:.5rem;margin-bottom:.15rem}'+
+      '.lcRootTag{font-family:var(--mono,monospace);font-size:.58rem;color:var(--dim,#7b8a98);border:1px solid var(--line,#1d2730);border-radius:5px;padding:.04rem .32rem;font-weight:400}'+
+      '.lcNote{font-family:var(--mono,monospace);font-size:.6rem;color:var(--dim,#7b8a98);margin-bottom:.45rem}'+
+      '.lcNote code{color:var(--warn,#ffb454)}'+
+      '.lcSub{font-family:var(--mono,monospace);font-size:.58rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim,#7b8a98);margin:.5rem 0 .15rem;border-top:1px solid #ffffff10;padding-top:.35rem}'+
+      '.lcRow{display:flex;align-items:center;gap:.7rem;min-height:32px;padding:.12rem 0}'+
+      '.lcRow+.lcRow{border-top:1px solid #ffffff08}'+
+      '.lcLbl{flex:1;font-size:.8rem}'+
+      '.lcCtl{display:flex;align-items:center;justify-content:flex-end;min-width:40%}'+
+      '.lcInp{font-family:var(--mono,monospace);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line,#1d2730);border-radius:7px;padding:.32rem .45rem;width:130px;text-align:right;transition:.2s}'+
+      '.lcInp:focus{outline:none;border-color:var(--acc,#3ddc97)}'+
+      '.lcInp.lcOk,.lcTgl.lcOk{box-shadow:0 0 0 1px var(--acc,#3ddc97)}'+
+      '.lcInp.lcBusy{opacity:.5}'+
+      '.lcTgl{position:relative;display:inline-block;width:38px;height:20px;border-radius:20px;background:#2a3640;border:1px solid var(--line,#1d2730);cursor:pointer;transition:.15s}'+
+      '.lcTgl::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#8696a3;transition:.15s}'+
+      '.lcTgl.on{background:var(--acc-dim,#1f7a55);border-color:var(--acc,#3ddc97)}.lcTgl.on::after{left:20px;background:var(--acc,#3ddc97)}'+
+      '.lcRO{font-family:var(--mono,monospace);font-size:.62rem;color:var(--dim,#7b8a98)}';
+    document.head.appendChild(s);
+  }
+
   /* ---------------- render hook ---------------- */
   function afterRender(){
     injectEnableToggle();
     wireActions();
     lockConfig();
+    buildLiveConfig();
     if(MAP[cur] && MAP[cur].signature==='liveMap') bindMap();
     refreshHeaderStatus();
   }
@@ -368,11 +475,15 @@
     MODULES.forEach(function(m){ if(m.id!=='livemap'){ m.status='idle'; m.sdot=''; m.enabled=false; } });
     // label the Live Map with the real bot + drop the mockup's fake pins
     if(typeof ABMMap!=='undefined' && ABMMap.bot){ ABMMap.bot.name = INST || ABMMap.bot.name; ABMMap.pins=[]; }
+    injectLiveConfigCss();
     injectTopbar();
     // default the surface to the Live Map (the headline) on first load
     if(typeof cur!=='undefined' && MAP['livemap']){ try{ cur='livemap'; render(); }catch(e){} }
     else { try{ render(); }catch(e){} }
     pollState(); setInterval(pollState, 3000);
+    // pull the live config once (then re-render so the settings panel populates), refresh occasionally
+    fetchConfig().then(function(){ try{ render(); }catch(e){} });
+    setInterval(function(){ fetchConfig(); }, 15000);
     startStream();
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);

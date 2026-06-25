@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3880,8 +3880,8 @@ class Handler(BaseHTTPRequestHandler):
         """Relay a bot's loopback /control/* endpoints. GET state|commands; POST command (forwards the JSON body).
         Same per-bot port resolution + cross-box behaviour as the viewer relay. The bot 403s `command` unless its
         `server.viewer.control` flag is on — that status is forwarded through."""
-        parts = path.split("/")  # ['', 'api', 'instances', '<name>', 'control', 'state'|'commands'|'command']
-        if len(parts) < 6 or parts[4] != "control" or parts[5] not in ("state", "commands", "command"):
+        parts = path.split("/")  # ['', 'api', 'instances', '<name>', 'control', 'state'|'commands'|'command'|'config']
+        if len(parts) < 6 or parts[4] != "control" or parts[5] not in ("state", "commands", "command", "config"):
             return self._json({"error": "not found"}, 404)
         sub = parts[5]
         name = urllib.parse.unquote(parts[3])
@@ -3895,8 +3895,10 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError, IndexError):
                 pass
         url = f"http://127.0.0.1:{port}/control/{sub}"
+        # command is always a POST; config mirrors the incoming method (GET read / POST field write)
+        is_post = sub == "command" or (sub == "config" and self.command == "POST")
         try:
-            if sub == "command":
+            if is_post:
                 data = self._read_body() if self.command == "POST" else b"{}"
                 req = urllib.request.Request(url, data=data or b"{}", method="POST",
                                             headers={"Content-Type": "application/json"})
@@ -4307,8 +4309,8 @@ class Handler(BaseHTTPRequestHandler):
         if node is not None and not self._is_switcher_path(path):
             return self._proxy_to_node(node)
 
-        # live control plane: POST a command to a bot (forwarded to its loopback /control/command)
-        if path.startswith("/api/instances/") and path.endswith("/control/command"):
+        # live control plane: POST a command to a bot, or write a config field (forwarded to its loopback /control/*)
+        if path.startswith("/api/instances/") and (path.endswith("/control/command") or path.endswith("/control/config")):
             return self._control_relay(path, parse_qs(urlparse(self.path).query))
 
         # controller: set/clear which box this browser is viewing (abm_node cookie)

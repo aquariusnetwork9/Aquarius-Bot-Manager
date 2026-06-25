@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.0.0 — *latest*
+## v3.1.0 — *latest*
+
+- **Live configuration editing in the Control Surface.** Each module now has a **⚙ Live configuration** panel that reads the bot's *real* config and writes single fields back to the running bot instantly (toggles, numbers, text), persisted to its config — no restart. Powered by new bot-side endpoints `GET /control/config` (the live tree with **all secrets redacted** — auth/proxy/discord/db passwords + tokens are never exposed) and `POST /control/config` `{path,value}` (sets one field by dot-path; secret paths are refused). The friendly mockup subcards stay as a read-only overview above it. Requires a bot on **AquariusProxy 5.7.0+** with `server.viewer.control=true`.
+
+## v3.0.0
 
 - **Live Control Surface (Mission Control).** Each bot gets a front-facing cockpit at **`/control?inst=<name>`** (open it from the viewer drawer's **Control → ⛶ Open full control surface**) — every module, the world map, vitals, and a command palette on one page. It's served by the manager and relayed over the same authenticated, loopback-only tunnel as the live viewer, so nothing the bot serves is exposed.
   - **Live:** module status dots + **enable toggles**, per-module action buttons, **vitals** (health / food / position / dimension / speed from the ~20 Hz SSE feed), a **command runner**, and an interactive **Live Map** — a real bot-centred map tile with an entity overlay where you **click to set an Elytra destination** (`fly trip <dim> <x> <z>`).
