@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.15.0"
+__version__ = "1.16.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3726,6 +3726,48 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _viewer_relay(self, path, q):
+        """Relay a bot's loopback viewer feed to the dashboard. The bot binds the viewer to 127.0.0.1 only, so the
+        browser can't reach it directly — we fetch it server-side and pass it through. Cross-box is automatic: a
+        selected remote node already proxies this whole request to that box's manager, which serves its local bot.
+        Path: /api/instances/<name>/viewer/{state|map}. Port defaults to 2998 (override ?port=)."""
+        parts = path.split("/")
+        # ['', 'api', 'instances', '<name>', 'viewer', 'state'|'map']
+        if len(parts) < 6 or parts[4] != "viewer" or parts[5] not in ("state", "map"):
+            return self._json({"error": "not found"}, 404)
+        sub = parts[5]
+        try:
+            port = int(q.get("port", ["2998"])[0])
+        except (ValueError, TypeError, IndexError):
+            port = 2998
+        if not (1024 <= port <= 65535):
+            port = 2998
+        url = f"http://127.0.0.1:{port}/viewer/{'state.json' if sub == 'state' else 'map.png'}"
+        if sub == "map":
+            try:
+                sz = max(64, min(512, int(q.get("size", ["256"])[0])))
+                url += f"?size={sz}"
+            except (ValueError, TypeError, IndexError):
+                pass
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            body = resp.read()
+            ctype = resp.headers.get("Content-Type") or ("application/json" if sub == "state" else "image/png")
+        except Exception as e:
+            if sub == "state":
+                return self._json({"offline": True, "error": str(e)[:120]})
+            self.send_response(502)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     # ---- routing ----
     def do_GET(self):
         u = urlparse(self.path)
@@ -3773,6 +3815,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+
+        if path.startswith("/api/instances/") and "/viewer/" in path:
+            return self._viewer_relay(path, q)
 
         if path == "/api/scan":
             return self._json({"sessions": scan(self._cfg())})
@@ -6064,6 +6109,19 @@ table.tbl tr:hover td{background:#ffffff05}
   </div>
 </div>
 
+<div class="scrim" id="vwScrim" onclick="closeViewer(event)">
+  <div class="modal" style="width:min(720px,96vw)" onclick="event.stopPropagation()">
+    <div class="mhead">Live viewer — <span id="vwName"></span></div>
+    <div id="vwWrap" style="position:relative;width:100%;max-width:560px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
+      <img id="vwMap" alt="" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;display:none">
+      <canvas id="vwCanvas" width="512" height="512" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+      <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port 2998).</div>
+    </div>
+    <div id="vwHud" style="display:flex;flex-wrap:wrap;gap:.45rem 1rem;justify-content:center;margin-top:.7rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)"></div>
+    <div style="text-align:center;margin-top:.5rem;color:var(--dim);font-size:.66rem;font-family:var(--mono)">N ↑ &nbsp;·&nbsp; map follows the bot (centered)</div>
+  </div>
+</div>
+
 <div class="scrim" id="settingsScrim" onclick="closeSettings(event)">
   <div class="modal" style="width:min(620px,94vw)" onclick="event.stopPropagation()">
     <div class="mhead">Settings</div>
@@ -6344,6 +6402,7 @@ async function refresh(){
         <button class="warn" onclick="act('${jsq(i.name)}','restart',this)"><i class="ic">⟳</i><span class="lbl">Restart</span></button>
         <button class="danger" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i><span class="lbl">Stop</span></button>
         <button class="mini" title="More" onclick="openDrawer('${jsq(i.name)}')">⋯</button>
+        <button class="mini" title="Live viewer" onclick="openViewer('${jsq(i.name)}')">👁</button>
         <button class="mini" title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
         <button class="mini danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
       </div>
@@ -6393,6 +6452,58 @@ async function bulk(action){
   refresh();
 }
 
+// ---- live viewer (polls the bot's relayed /viewer feed) ----
+let VW=null, vwStateT=null, vwMapT=null;
+function openViewer(name){
+  VW=name; $('vwName').textContent=name;
+  $('vwScrim').classList.add('open');
+  $('vwOff').style.display='flex'; $('vwMap').style.display='none';
+  vwRefreshMap(); vwTickState();
+  clearInterval(vwStateT); clearInterval(vwMapT);
+  vwStateT=setInterval(vwTickState,1000);
+  vwMapT=setInterval(vwRefreshMap,1500);
+}
+function closeViewer(e){
+  if(e && e.target!==$('vwScrim')) return;
+  $('vwScrim').classList.remove('open');
+  clearInterval(vwStateT); clearInterval(vwMapT); vwStateT=vwMapT=null; VW=null;
+}
+function vwRefreshMap(){
+  if(!VW) return;
+  const img=$('vwMap');
+  img.onload=()=>{ img.style.display='block'; $('vwOff').style.display='none'; };
+  img.onerror=()=>{ img.style.display='none'; };
+  img.src='/api/instances/'+encodeURIComponent(VW)+'/viewer/map?size=256&ts='+Date.now();
+}
+async function vwTickState(){
+  if(!VW) return;
+  let d=null;
+  try{ d=await (await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/state')).json(); }catch(e){}
+  const hud=$('vwHud');
+  if(!d || d.offline){ hud.innerHTML='<span style="color:var(--crash)">● viewer offline</span>'; vwDrawOverlay(null); return; }
+  hud.innerHTML='<span>📍 '+Math.round(d.x)+', '+Math.round(d.y)+', '+Math.round(d.z)+'</span>'
+    +'<span>❤ '+(+d.health).toFixed(0)+'</span><span>🍗 '+d.food+'</span>'
+    +'<span>✈ '+esc(d.flightPhase||'-')+'</span><span>↻ '+Math.round(d.yaw)+'°</span>';
+  vwDrawOverlay(d);
+}
+function vwDrawOverlay(d){
+  const c=$('vwCanvas'); if(!c) return;
+  const x=c.getContext('2d'), W=c.width, H=c.height, cx=W/2, cy=H/2;
+  x.clearRect(0,0,W,H);
+  x.strokeStyle='rgba(255,255,255,.30)'; x.lineWidth=2;            // center crosshair = the bot
+  x.beginPath(); x.moveTo(cx-12,cy); x.lineTo(cx+12,cy); x.moveTo(cx,cy-12); x.lineTo(cx,cy+12); x.stroke();
+  if(!d) return;
+  // heading arrow. MC yaw: facing = (-sin, cos) in (x,z); map is x->right, z->down, N(-z) up.
+  const yaw=(+d.yaw||0)*Math.PI/180, dx=-Math.sin(yaw), dz=Math.cos(yaw), L=52;
+  const ex=cx+dx*L, ey=cy+dz*L, a=Math.atan2(dz,dx);
+  x.strokeStyle='#30d158'; x.fillStyle='#30d158'; x.lineWidth=3;
+  x.beginPath(); x.moveTo(cx,cy); x.lineTo(ex,ey); x.stroke();
+  x.beginPath(); x.moveTo(ex,ey);
+  x.lineTo(ex-14*Math.cos(a-0.42), ey-14*Math.sin(a-0.42));
+  x.lineTo(ex-14*Math.cos(a+0.42), ey-14*Math.sin(a+0.42));
+  x.closePath(); x.fill();
+  x.fillStyle='#fff'; x.beginPath(); x.arc(cx,cy,4,0,7); x.fill();  // bot dot
+}
 function openDrawer(name){
   CUR=name; $('drawerName').textContent=name;
   $('scrim').classList.add('open'); $('drawer').classList.add('open');
