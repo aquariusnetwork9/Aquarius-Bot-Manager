@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6294,48 +6294,55 @@ table.tbl tr:hover td{background:#ffffff05}
       <div class="tab" id="vwTabCtl" onclick="vwSetTab('control')">🎛 Control</div>
     </div>
     <style>
-      .vw-ctl{max-height:66vh;overflow-y:auto;padding:.1rem .2rem .3rem}
-      .vw-vitals{display:flex;flex-wrap:wrap;gap:.5rem .8rem;align-items:center;margin-bottom:.7rem}
-      .vw-stat{display:flex;align-items:center;gap:.35rem;font-family:var(--mono);font-size:.74rem}
-      .vw-bar{width:84px;height:9px;border-radius:5px;background:#0006;overflow:hidden;border:1px solid var(--line)}
-      .vw-bar i{display:block;height:100%;border-radius:5px}
-      .vw-chip{font-family:var(--mono);font-size:.66rem;color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:.12rem .5rem}
-      .vw-banner{font-size:.7rem;color:var(--warn);background:#3a2d0e;border:1px solid #6b520f;border-radius:8px;padding:.4rem .6rem;margin-bottom:.6rem}
-      .vw-cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
-      @media(max-width:680px){.vw-cols{grid-template-columns:1fr}}
-      .vw-sec{font-size:.64rem;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin:.7rem 0 .35rem;font-weight:700}
-      .vw-equip{display:flex;gap:.4rem;flex-wrap:wrap}
-      .vw-eq{display:flex;flex-direction:column;align-items:center;gap:.15rem}
-      .vw-eqlab{font-size:.54rem;color:var(--dim);font-family:var(--mono)}
-      .vw-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:3px}
-      .vw-hot{margin-top:5px}
-      .vw-slot{position:relative;aspect-ratio:1;min-width:34px;border-radius:7px;background:var(--panel);border:1px solid var(--line);overflow:hidden}
-      .vw-eq .vw-slot{width:44px}
-      .vw-slot.vw-ench{box-shadow:0 0 0 1px #a371f7aa,0 0 7px #a371f755;border-color:#a371f7aa}
-      .vw-ic{position:absolute;inset:14%;width:72%;height:72%;image-rendering:pixelated;object-fit:contain}
-      .vw-lbl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:600 .46rem/1.05 var(--mono);color:var(--dim);text-align:center;padding:2px}
-      .vw-cnt{position:absolute;right:2px;bottom:0;font:700 .6rem/1 var(--mono);color:#fff;text-shadow:0 1px 2px #000,0 0 2px #000;z-index:2}
-      .vw-dur{position:absolute;left:3px;right:3px;bottom:2px;height:3px;background:#000a;border-radius:2px;overflow:hidden;z-index:2}
+      .vw-ctl{max-height:70vh;overflow-y:auto;padding:.1rem .3rem .4rem}
+      .vw-card{background:linear-gradient(180deg,#ffffff06,#ffffff02);border:1px solid var(--line);border-radius:12px;padding:.65rem .75rem;margin-bottom:.7rem}
+      .vw-vitals{display:flex;flex-wrap:wrap;gap:.5rem 1rem;align-items:center}
+      .vw-stat{display:flex;align-items:center;gap:.4rem;font-family:var(--mono);font-size:.78rem}
+      .vw-stat .vw-i{font-size:.92rem}
+      .vw-bar{width:104px;height:10px;border-radius:6px;background:#0007;overflow:hidden;border:1px solid var(--line)}
+      .vw-bar i{display:block;height:100%;border-radius:6px;transition:width .3s ease}
+      .vw-stat b{min-width:1.5em;text-align:right}
+      .vw-chip{font-family:var(--mono);font-size:.67rem;color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:.16rem .58rem;white-space:nowrap}
+      .vw-banner{font-size:.7rem;color:var(--warn);background:#3a2d0e;border:1px solid #6b520f;border-radius:9px;padding:.45rem .65rem;margin-bottom:.6rem}
+      .vw-cols{display:grid;grid-template-columns:320px 1fr;gap:.7rem;align-items:start}
+      @media(max-width:760px){.vw-cols{grid-template-columns:1fr}}
+      .vw-sec{font-size:.6rem;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);margin:0 0 .5rem;font-weight:700;display:flex;align-items:center;gap:.45rem}
+      .vw-sec::before{content:'';width:3px;height:11px;border-radius:2px;background:var(--acc)}
+      .vw-mini{position:relative;width:100%;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+      .vw-equip{display:grid;grid-template-columns:repeat(6,1fr);gap:.4rem}
+      .vw-eq{display:flex;flex-direction:column;align-items:center;gap:.22rem}
+      .vw-eqlab{font-size:.52rem;color:var(--dim);font-family:var(--mono);text-transform:uppercase;letter-spacing:.04em}
+      .vw-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:4px}
+      .vw-hot{margin-top:6px;padding-top:6px;border-top:1px dashed #ffffff14}
+      .vw-slot{position:relative;aspect-ratio:1;border-radius:8px;background:#ffffff07;border:1px solid var(--line);overflow:hidden;transition:border-color .12s}
+      .vw-slot:hover{border-color:var(--acc-dim)}
+      .vw-eq .vw-slot{width:100%}
+      .vw-slot.vw-ench{box-shadow:inset 0 0 0 1px #a371f7aa,0 0 8px #a371f74d;border-color:#a371f7aa;background:#a371f714}
+      .vw-ic{position:absolute;inset:13%;width:74%;height:74%;image-rendering:pixelated;object-fit:contain;z-index:1}
+      .vw-lbl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:600 .46rem/1.05 var(--mono);color:#8b97a3;text-align:center;padding:2px}
+      .vw-cnt{position:absolute;right:2px;bottom:0;font:700 .62rem/1 var(--mono);color:#fff;text-shadow:0 1px 2px #000,0 0 3px #000;z-index:3}
+      .vw-dur{position:absolute;left:3px;right:3px;bottom:2px;height:3px;background:#000b;border-radius:2px;overflow:hidden;z-index:3}
       .vw-dur i{display:block;height:100%}
-      .vw-quick{display:flex;flex-wrap:wrap;gap:.35rem}
-      .vw-qbtn{font-size:.7rem;padding:.32rem .6rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:7px;cursor:pointer}
-      .vw-qbtn:hover{border-color:var(--acc-dim);color:var(--acc)}
-      .vw-search{width:100%;box-sizing:border-box;font-size:.72rem;padding:.35rem .5rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:7px;font-family:var(--mono);margin-bottom:.35rem}
-      .vw-modules{max-height:188px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
-      .vw-mod{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.22rem .15rem;font-size:.72rem;border-bottom:1px solid #ffffff08}
-      .vw-sw{width:30px;height:17px;border-radius:999px;background:#3a3f46;position:relative;cursor:pointer;flex:0 0 auto;transition:background .15s}
+      .vw-quick{display:flex;flex-wrap:wrap;gap:.4rem}
+      .vw-qbtn{font-size:.72rem;padding:.38rem .7rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:8px;cursor:pointer;transition:all .12s}
+      .vw-qbtn:hover{border-color:var(--acc-dim);color:var(--acc);background:var(--bg)}
+      .vw-search{width:100%;box-sizing:border-box;font-size:.72rem;padding:.4rem .55rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:8px;font-family:var(--mono);margin-bottom:.4rem}
+      .vw-modules{max-height:214px;overflow-y:auto;display:grid;grid-template-columns:1fr 1fr;gap:0 1rem}
+      @media(max-width:760px){.vw-modules{grid-template-columns:1fr}}
+      .vw-mod{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.27rem .1rem;font-size:.72rem;border-bottom:1px solid #ffffff0a}
+      .vw-sw{width:32px;height:18px;border-radius:999px;background:#3a3f46;position:relative;cursor:pointer;flex:0 0 auto;transition:background .15s}
       .vw-sw.on{background:var(--acc)}
-      .vw-sw i{position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;transition:left .15s}
-      .vw-sw.on i{left:15px}
-      .vw-palette{max-height:170px;overflow-y:auto;display:flex;flex-direction:column;gap:1px;margin-bottom:.4rem}
-      .vw-cmd{display:flex;flex-direction:column;padding:.28rem .45rem;border-radius:6px;cursor:pointer}
-      .vw-cmd:hover{background:#ffffff0c}
-      .vw-cmd b{font-size:.74rem;color:var(--acc)}
+      .vw-sw i{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:left .15s}
+      .vw-sw.on i{left:16px}
+      .vw-palette{max-height:184px;overflow-y:auto;display:flex;flex-direction:column;gap:1px;margin-bottom:.45rem}
+      .vw-cmd{display:flex;flex-direction:column;padding:.3rem .5rem;border-radius:7px;cursor:pointer;transition:background .12s}
+      .vw-cmd:hover{background:#ffffff0e}
+      .vw-cmd b{font-size:.75rem;color:var(--acc)}
       .vw-cmd span{font-size:.64rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      .vw-cmdbar{display:flex;gap:.35rem;margin-bottom:.4rem}
-      .vw-cmdbar input{flex:1;font-family:var(--mono);font-size:.72rem;padding:.35rem .5rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:7px}
-      .vw-result{font-family:var(--mono);font-size:.68rem;color:var(--txt);background:#06090c;border:1px solid var(--line);border-radius:8px;padding:.4rem .55rem;min-height:2.2rem;max-height:160px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
-      .vw-rcmd{color:var(--acc);margin-bottom:.2rem}
+      .vw-cmdbar{display:flex;gap:.4rem;margin-bottom:.45rem}
+      .vw-cmdbar input{flex:1;font-family:var(--mono);font-size:.74rem;padding:.42rem .55rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:8px}
+      .vw-result{font-family:var(--mono);font-size:.7rem;color:var(--txt);background:#06090c;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem;min-height:2.4rem;max-height:170px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+      .vw-rcmd{color:var(--acc);margin-bottom:.25rem;font-weight:700}
     </style>
     <div id="vwPovWrap" style="display:none;position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
       <canvas id="vwPov" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
@@ -6358,36 +6365,48 @@ table.tbl tr:hover td{background:#ffffff05}
       <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
     </div>
     <div id="vwControlWrap" class="vw-ctl" style="display:none">
-      <div id="vwVitals" class="vw-vitals"></div>
       <div id="vwCtlBanner"></div>
+      <div class="vw-card"><div id="vwVitals" class="vw-vitals"></div></div>
       <div class="vw-cols">
         <div>
-          <div class="vw-sec">Location</div>
-          <div style="position:relative;width:100%;max-width:320px;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
-            <canvas id="vwMiniCanvas" width="520" height="520" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
-            <div style="position:absolute;top:.3rem;left:.4rem;font-family:var(--mono);font-size:.55rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
+          <div class="vw-card">
+            <div class="vw-sec">Location</div>
+            <div class="vw-mini">
+              <canvas id="vwMiniCanvas" width="520" height="520" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
+              <div style="position:absolute;top:.3rem;left:.4rem;font-family:var(--mono);font-size:.55rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
+            </div>
           </div>
-          <div class="vw-sec">Equipment</div>
-          <div id="vwEquip" class="vw-equip"></div>
-          <div class="vw-sec">Inventory</div>
-          <div id="vwInv"></div>
+          <div class="vw-card">
+            <div class="vw-sec">Quick actions</div>
+            <div id="vwQuick" class="vw-quick"></div>
+          </div>
         </div>
         <div>
-          <div class="vw-sec">Quick actions</div>
-          <div id="vwQuick" class="vw-quick"></div>
-          <div class="vw-sec">Modules</div>
-          <input id="vwModFilter" class="vw-search" placeholder="filter modules…" oninput="vwRenderModules()">
-          <div id="vwModules" class="vw-modules"></div>
+          <div class="vw-card">
+            <div class="vw-sec">Equipment</div>
+            <div id="vwEquip" class="vw-equip"></div>
+          </div>
+          <div class="vw-card">
+            <div class="vw-sec">Inventory</div>
+            <div id="vwInv"></div>
+          </div>
+          <div class="vw-card">
+            <div class="vw-sec">Modules</div>
+            <input id="vwModFilter" class="vw-search" placeholder="filter modules…" oninput="vwRenderModules()">
+            <div id="vwModules" class="vw-modules"></div>
+          </div>
         </div>
       </div>
-      <div class="vw-sec">Command palette</div>
-      <div class="vw-cmdbar">
-        <input id="vwCmdInput" placeholder="type a command, or pick one below…" onkeydown="if(event.key==='Enter')vwRunInput()">
-        <button class="vw-qbtn" onclick="vwRunInput()">Run</button>
+      <div class="vw-card">
+        <div class="vw-sec">Command palette</div>
+        <div class="vw-cmdbar">
+          <input id="vwCmdInput" placeholder="type a command, or pick one below…" onkeydown="if(event.key==='Enter')vwRunInput()">
+          <button class="vw-qbtn" onclick="vwRunInput()">Run</button>
+        </div>
+        <input id="vwCmdSearch" class="vw-search" placeholder="search commands…" oninput="vwRenderPalette()">
+        <div id="vwPalette" class="vw-palette"></div>
+        <div id="vwCmdResult" class="vw-result">—</div>
       </div>
-      <input id="vwCmdSearch" class="vw-search" placeholder="search commands…" oninput="vwRenderPalette()">
-      <div id="vwPalette" class="vw-palette"></div>
-      <div id="vwCmdResult" class="vw-result">—</div>
     </div>
     <div id="vwHud" style="display:flex;flex-wrap:wrap;gap:.45rem 1rem;justify-content:center;margin-top:.7rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)"></div>
     <div style="text-align:center;margin-top:.4rem;color:var(--dim);font-size:.64rem;font-family:var(--mono)">drag to pan · scroll to zoom · ⌖ to follow</div>
@@ -7116,7 +7135,7 @@ function vwSlot(it){
 function vwRenderVitals(){
   const d=vwData||{}, iv=vwInvData||{};
   const hp=+((d.health!=null)?d.health:iv.health)||0, food=+((d.food!=null)?d.food:iv.food)||0;
-  const bar=(l,v,mx,c)=>'<div class="vw-stat"><span>'+l+'</span><div class="vw-bar"><i style="width:'+(Math.max(0,Math.min(1,v/mx))*100).toFixed(0)+'%;background:'+c+'"></i></div><b>'+Math.round(v)+'</b></div>';
+  const bar=(l,v,mx,c)=>'<div class="vw-stat"><span class="vw-i">'+l+'</span><div class="vw-bar"><i style="width:'+(Math.max(0,Math.min(1,v/mx))*100).toFixed(0)+'%;background:'+c+'"></i></div><b>'+Math.round(v)+'</b></div>';
   let h=bar('❤',hp,20,'#f85149')+bar('🍗',food,20,'#d29922');
   if(iv.totems!=null) h+='<div class="vw-chip">⛨ '+iv.totems+' totem'+(iv.totems===1?'':'s')+'</div>';
   if(d.dimension) h+='<div class="vw-chip">'+esc(d.dimension.replace('minecraft:',''))+'</div>';
