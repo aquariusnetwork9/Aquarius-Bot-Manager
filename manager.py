@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3770,8 +3770,8 @@ class Handler(BaseHTTPRequestHandler):
         Path: /api/instances/<name>/viewer/{state|map}. Port is resolved per-bot (instances.json
         `viewer_port`, else the bot's own config.json `server.viewer.port`, else 2998); ?port= overrides."""
         parts = path.split("/")
-        # ['', 'api', 'instances', '<name>', 'viewer', 'state'|'map'|'chunks']
-        if len(parts) < 6 or parts[4] != "viewer" or parts[5] not in ("state", "map", "chunks"):
+        # ['', 'api', 'instances', '<name>', 'viewer', 'state'|'map'|'chunks'|'inventory']
+        if len(parts) < 6 or parts[4] != "viewer" or parts[5] not in ("state", "map", "chunks", "inventory"):
             return self._json({"error": "not found"}, 404)
         sub = parts[5]
         name = urllib.parse.unquote(parts[3])
@@ -3784,7 +3784,7 @@ class Handler(BaseHTTPRequestHandler):
                     port = p
             except (ValueError, TypeError, IndexError):
                 pass
-        upstream = {"state": "state.json", "map": "map.png", "chunks": "chunks"}[sub]
+        upstream = {"state": "state.json", "map": "map.png", "chunks": "chunks", "inventory": "inventory"}[sub]
         url = f"http://127.0.0.1:{port}/viewer/{upstream}"
         if sub == "map":
             try:
@@ -3802,9 +3802,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             body = resp.read()
-            ctype = resp.headers.get("Content-Type") or ("application/json" if sub == "state" else "image/png")
+            ctype = resp.headers.get("Content-Type") or ("application/json" if sub in ("state", "inventory") else "image/png")
         except Exception as e:
-            if sub == "state":
+            if sub in ("state", "inventory"):
                 return self._json({"offline": True, "error": str(e)[:120]})
             self.send_response(502)
             self.send_header("Content-Length", "0")
@@ -3816,6 +3816,57 @@ class Handler(BaseHTTPRequestHandler):
             hv = resp.headers.get(hk)
             if hv:
                 self.send_header(hk, hv)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _control_relay(self, path, q):
+        """Relay a bot's loopback /control/* endpoints. GET state|commands; POST command (forwards the JSON body).
+        Same per-bot port resolution + cross-box behaviour as the viewer relay. The bot 403s `command` unless its
+        `server.viewer.control` flag is on — that status is forwarded through."""
+        parts = path.split("/")  # ['', 'api', 'instances', '<name>', 'control', 'state'|'commands'|'command']
+        if len(parts) < 6 or parts[4] != "control" or parts[5] not in ("state", "commands", "command"):
+            return self._json({"error": "not found"}, 404)
+        sub = parts[5]
+        name = urllib.parse.unquote(parts[3])
+        inst = self._cfg()["by_name"].get(name) or {}
+        port = viewer_port_for(inst)
+        if q.get("port"):
+            try:
+                p = int(q["port"][0])
+                if 1024 <= p <= 65535:
+                    port = p
+            except (ValueError, TypeError, IndexError):
+                pass
+        url = f"http://127.0.0.1:{port}/control/{sub}"
+        try:
+            if sub == "command":
+                data = self._read_body() if self.command == "POST" else b"{}"
+                req = urllib.request.Request(url, data=data or b"{}", method="POST",
+                                            headers={"Content-Type": "application/json"})
+                resp = urllib.request.urlopen(req, timeout=20)   # a command may take a while
+            else:
+                resp = urllib.request.urlopen(url, timeout=8)
+            body = resp.read()
+            ctype = resp.headers.get("Content-Type") or "application/json"
+        except urllib.error.HTTPError as e:                       # forward the bot's status (e.g. 403 control off)
+            try:
+                body = e.read()
+            except Exception:
+                body = b"{}"
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
+        except Exception as e:
+            return self._json({"offline": True, "error": str(e)[:120]})
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -3931,6 +3982,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/instances/") and "/viewer/" in path:
             return self._viewer_relay(path, q)
+
+        if path.startswith("/api/instances/") and "/control/" in path:
+            return self._control_relay(path, q)
 
         if path == "/api/scan":
             return self._json({"sessions": scan(self._cfg())})
@@ -4193,6 +4247,10 @@ class Handler(BaseHTTPRequestHandler):
         node = self._selected_node()
         if node is not None and not self._is_switcher_path(path):
             return self._proxy_to_node(node)
+
+        # live control plane: POST a command to a bot (forwarded to its loopback /control/command)
+        if path.startswith("/api/instances/") and path.endswith("/control/command"):
+            return self._control_relay(path, parse_qs(urlparse(self.path).query))
 
         # controller: set/clear which box this browser is viewing (abm_node cookie)
         if path == "/api/node/select":
@@ -6223,7 +6281,7 @@ table.tbl tr:hover td{background:#ffffff05}
 </div>
 
 <div class="scrim" id="vwScrim" onclick="closeViewer(event)">
-  <div class="modal" style="width:min(760px,96vw)" onclick="event.stopPropagation()">
+  <div class="modal" id="vwModal" style="width:min(760px,96vw)" onclick="event.stopPropagation()">
     <div class="mhead" style="display:flex;align-items:center;gap:.55rem">
       <span>Live viewer — <span id="vwName"></span></span>
       <span id="vwMode" style="font-family:var(--mono);font-size:.6rem;color:var(--acc);border:1px solid var(--acc-dim);border-radius:5px;padding:.05rem .35rem"></span>
@@ -6233,7 +6291,52 @@ table.tbl tr:hover td{background:#ffffff05}
     <div class="tabs" style="padding:0;margin:.1rem 0 .6rem;display:flex;gap:.4rem">
       <div class="tab active" id="vwTabMap" onclick="vwSetTab('map')">🗺 Map</div>
       <div class="tab" id="vwTabPov" onclick="vwSetTab('pov')">◳ POV</div>
+      <div class="tab" id="vwTabCtl" onclick="vwSetTab('control')">🎛 Control</div>
     </div>
+    <style>
+      .vw-ctl{max-height:66vh;overflow-y:auto;padding:.1rem .2rem .3rem}
+      .vw-vitals{display:flex;flex-wrap:wrap;gap:.5rem .8rem;align-items:center;margin-bottom:.7rem}
+      .vw-stat{display:flex;align-items:center;gap:.35rem;font-family:var(--mono);font-size:.74rem}
+      .vw-bar{width:84px;height:9px;border-radius:5px;background:#0006;overflow:hidden;border:1px solid var(--line)}
+      .vw-bar i{display:block;height:100%;border-radius:5px}
+      .vw-chip{font-family:var(--mono);font-size:.66rem;color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:.12rem .5rem}
+      .vw-banner{font-size:.7rem;color:var(--warn);background:#3a2d0e;border:1px solid #6b520f;border-radius:8px;padding:.4rem .6rem;margin-bottom:.6rem}
+      .vw-cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+      @media(max-width:680px){.vw-cols{grid-template-columns:1fr}}
+      .vw-sec{font-size:.64rem;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin:.7rem 0 .35rem;font-weight:700}
+      .vw-equip{display:flex;gap:.4rem;flex-wrap:wrap}
+      .vw-eq{display:flex;flex-direction:column;align-items:center;gap:.15rem}
+      .vw-eqlab{font-size:.54rem;color:var(--dim);font-family:var(--mono)}
+      .vw-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:3px}
+      .vw-hot{margin-top:5px}
+      .vw-slot{position:relative;aspect-ratio:1;min-width:34px;border-radius:7px;background:var(--panel);border:1px solid var(--line);overflow:hidden}
+      .vw-eq .vw-slot{width:44px}
+      .vw-slot.vw-ench{box-shadow:0 0 0 1px #a371f7aa,0 0 7px #a371f755;border-color:#a371f7aa}
+      .vw-ic{position:absolute;inset:14%;width:72%;height:72%;image-rendering:pixelated;object-fit:contain}
+      .vw-lbl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:600 .46rem/1.05 var(--mono);color:var(--dim);text-align:center;padding:2px}
+      .vw-cnt{position:absolute;right:2px;bottom:0;font:700 .6rem/1 var(--mono);color:#fff;text-shadow:0 1px 2px #000,0 0 2px #000;z-index:2}
+      .vw-dur{position:absolute;left:3px;right:3px;bottom:2px;height:3px;background:#000a;border-radius:2px;overflow:hidden;z-index:2}
+      .vw-dur i{display:block;height:100%}
+      .vw-quick{display:flex;flex-wrap:wrap;gap:.35rem}
+      .vw-qbtn{font-size:.7rem;padding:.32rem .6rem;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:7px;cursor:pointer}
+      .vw-qbtn:hover{border-color:var(--acc-dim);color:var(--acc)}
+      .vw-search{width:100%;box-sizing:border-box;font-size:.72rem;padding:.35rem .5rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:7px;font-family:var(--mono);margin-bottom:.35rem}
+      .vw-modules{max-height:188px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
+      .vw-mod{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.22rem .15rem;font-size:.72rem;border-bottom:1px solid #ffffff08}
+      .vw-sw{width:30px;height:17px;border-radius:999px;background:#3a3f46;position:relative;cursor:pointer;flex:0 0 auto;transition:background .15s}
+      .vw-sw.on{background:var(--acc)}
+      .vw-sw i{position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;transition:left .15s}
+      .vw-sw.on i{left:15px}
+      .vw-palette{max-height:170px;overflow-y:auto;display:flex;flex-direction:column;gap:1px;margin-bottom:.4rem}
+      .vw-cmd{display:flex;flex-direction:column;padding:.28rem .45rem;border-radius:6px;cursor:pointer}
+      .vw-cmd:hover{background:#ffffff0c}
+      .vw-cmd b{font-size:.74rem;color:var(--acc)}
+      .vw-cmd span{font-size:.64rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .vw-cmdbar{display:flex;gap:.35rem;margin-bottom:.4rem}
+      .vw-cmdbar input{flex:1;font-family:var(--mono);font-size:.72rem;padding:.35rem .5rem;border:1px solid var(--line);background:var(--bg);color:var(--txt);border-radius:7px}
+      .vw-result{font-family:var(--mono);font-size:.68rem;color:var(--txt);background:#06090c;border:1px solid var(--line);border-radius:8px;padding:.4rem .55rem;min-height:2.2rem;max-height:160px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+      .vw-rcmd{color:var(--acc);margin-bottom:.2rem}
+    </style>
     <div id="vwPovWrap" style="display:none;position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
       <canvas id="vwPov" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
       <div id="vwPovMsg" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.74rem;padding:1rem">loading 3D…</div>
@@ -6253,6 +6356,38 @@ table.tbl tr:hover td{background:#ffffff05}
       <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
       <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port auto-detected).</div>
       <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
+    </div>
+    <div id="vwControlWrap" class="vw-ctl" style="display:none">
+      <div id="vwVitals" class="vw-vitals"></div>
+      <div id="vwCtlBanner"></div>
+      <div class="vw-cols">
+        <div>
+          <div class="vw-sec">Location</div>
+          <div style="position:relative;width:100%;max-width:320px;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden">
+            <canvas id="vwMiniCanvas" width="520" height="520" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
+            <div style="position:absolute;top:.3rem;left:.4rem;font-family:var(--mono);font-size:.55rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
+          </div>
+          <div class="vw-sec">Equipment</div>
+          <div id="vwEquip" class="vw-equip"></div>
+          <div class="vw-sec">Inventory</div>
+          <div id="vwInv"></div>
+        </div>
+        <div>
+          <div class="vw-sec">Quick actions</div>
+          <div id="vwQuick" class="vw-quick"></div>
+          <div class="vw-sec">Modules</div>
+          <input id="vwModFilter" class="vw-search" placeholder="filter modules…" oninput="vwRenderModules()">
+          <div id="vwModules" class="vw-modules"></div>
+        </div>
+      </div>
+      <div class="vw-sec">Command palette</div>
+      <div class="vw-cmdbar">
+        <input id="vwCmdInput" placeholder="type a command, or pick one below…" onkeydown="if(event.key==='Enter')vwRunInput()">
+        <button class="vw-qbtn" onclick="vwRunInput()">Run</button>
+      </div>
+      <input id="vwCmdSearch" class="vw-search" placeholder="search commands…" oninput="vwRenderPalette()">
+      <div id="vwPalette" class="vw-palette"></div>
+      <div id="vwCmdResult" class="vw-result">—</div>
     </div>
     <div id="vwHud" style="display:flex;flex-wrap:wrap;gap:.45rem 1rem;justify-content:center;margin-top:.7rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)"></div>
     <div style="text-align:center;margin-top:.4rem;color:var(--dim);font-size:.64rem;font-family:var(--mono)">drag to pan · scroll to zoom · ⌖ to follow</div>
@@ -6613,6 +6748,7 @@ function openViewer(name){
   vwMap={img:null,cx:0,cz:0,size:0,loading:false,fetchedAt:0};
   vwCam={x:0,z:0}; vwFollow=true; vwDrag=null; vwBox=null; vwChunkAt=0;
   if(vwGL){ vwGL.count=0; }   // drop the old mesh; context is reused on reopen
+  vwInvData=null; vwModData=null; vwCmdData=null; vwCmdLoaded=false;   // fresh control data per bot
   vwZoom=$('vwCanvas').width/220;          // ~220 blocks across by default
   vwUpdMode(); vwOnlineSet(false); vwSetTab('map'); vwSetCam('1st');
   $('vwScrim').classList.add('open');
@@ -6626,7 +6762,7 @@ function closeViewer(e){
   $('vwScrim').classList.remove('open');
   clearInterval(vwStateT); vwStateT=null;
   clearTimeout(vwStreamRetry); vwStreamRetry=null;
-  vwCloseStream();
+  vwCloseStream(); vwControlStop();
   if(vwRAF){ cancelAnimationFrame(vwRAF); vwRAF=null; }
   VW=null;
 }
@@ -6697,6 +6833,7 @@ function vwFrame(){
            vwRender.yaw=vwLerpAng(vwRender.yaw,s.yaw,0.30); vwRender.pitch+=(s.pitch-vwRender.pitch)*0.30; }
     if(vwFollow){ vwCam.x=vwRender.x; vwCam.z=vwRender.z; }
     if(vwTab==='pov'){ if(vwGL) vwPovRender(); }
+    else if(vwTab==='control'){ vwMaybeFetchMap(); vwDrawMini(); }
     else { vwMaybeFetchMap(); vwDraw(); }
   }
   vwRAF=requestAnimationFrame(vwFrame);
@@ -6796,9 +6933,14 @@ function vwSetTab(t){
   vwTab=t;
   $('vwTabMap').classList.toggle('active', t==='map');
   $('vwTabPov').classList.toggle('active', t==='pov');
+  $('vwTabCtl').classList.toggle('active', t==='control');
   $('vwWrap').style.display = t==='map'?'block':'none';
   $('vwPovWrap').style.display = t==='pov'?'block':'none';
-  if(t==='pov'){ vwInitPov(); }
+  $('vwControlWrap').style.display = t==='control'?'block':'none';
+  const md=$('vwModal'); if(md) md.style.width = (t==='control'?'min(1040px,96vw)':'min(760px,96vw)');
+  if(t==='pov'){ vwInitPov(); vwControlStop(); }
+  else if(t==='control'){ vwControlStart(); }
+  else { vwControlStop(); }
 }
 function vwSetCam(m){
   vwCam3rd=(m==='3rd');
@@ -6951,6 +7093,113 @@ function vwPovRender(){
     gl.drawArrays(gl.TRIANGLES, 0, vwGL.count);
   }
   if(!vwBox || Math.hypot(vwRender.x-vwBox.cx, vwRender.z-vwBox.cz)>vwBox.sx*0.30 || performance.now()-vwChunkAt>6000) vwFetchChunks();
+}
+// ---- Control tab: live vitals + inventory (real MC item icons), module toggles, command palette, mini-map ----
+let vwInvData=null, vwModData=null, vwCmdData=null, vwInvT=null, vwModT=null, vwCmdLoaded=false;
+const VW_ICON='https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/1.21.4/assets/minecraft/textures/';
+function vwIconFallback(img,next){ if(img.dataset.f){ img.style.display='none'; } else { img.dataset.f='1'; img.src=next; } }
+function vwIconHtml(name){
+  if(!name) return '';
+  const n=name.replace('minecraft:','');
+  return '<img class="vw-ic" loading="lazy" src="'+VW_ICON+'item/'+n+'.png" onerror="vwIconFallback(this,\''+VW_ICON+'block/'+n+'.png\')" alt="">';
+}
+function vwShort(n){ return (n||'').replace('minecraft:','').replace(/_/g,' '); }
+function vwSlot(it){
+  if(!it) return '<div class="vw-slot"></div>';
+  const n=it.name||''; let extra='';
+  if(it.max){ const f=Math.max(0,Math.min(1,it.dur/it.max)); const c=f>0.5?'#3fb950':(f>0.25?'#d29922':'#f85149');
+    extra+='<div class="vw-dur"><i style="width:'+(f*100).toFixed(0)+'%;background:'+c+'"></i></div>'; }
+  if(it.count>1) extra+='<span class="vw-cnt">'+it.count+'</span>';
+  const tip=esc(vwShort(n))+(it.max?(' • '+it.dur+'/'+it.max):'')+(it.ench?' • enchanted':'');
+  return '<div class="vw-slot'+(it.ench?' vw-ench':'')+'" title="'+tip+'"><span class="vw-lbl">'+esc(vwShort(n))+'</span>'+vwIconHtml(n)+extra+'</div>';
+}
+function vwRenderVitals(){
+  const d=vwData||{}, iv=vwInvData||{};
+  const hp=+((d.health!=null)?d.health:iv.health)||0, food=+((d.food!=null)?d.food:iv.food)||0;
+  const bar=(l,v,mx,c)=>'<div class="vw-stat"><span>'+l+'</span><div class="vw-bar"><i style="width:'+(Math.max(0,Math.min(1,v/mx))*100).toFixed(0)+'%;background:'+c+'"></i></div><b>'+Math.round(v)+'</b></div>';
+  let h=bar('❤',hp,20,'#f85149')+bar('🍗',food,20,'#d29922');
+  if(iv.totems!=null) h+='<div class="vw-chip">⛨ '+iv.totems+' totem'+(iv.totems===1?'':'s')+'</div>';
+  if(d.dimension) h+='<div class="vw-chip">'+esc(d.dimension.replace('minecraft:',''))+'</div>';
+  if(d.flightPhase&&d.flightPhase!=='IDLE') h+='<div class="vw-chip">✈ '+esc(d.flightPhase)+'</div>';
+  $('vwVitals').innerHTML=h;
+}
+function vwRenderEquip(){
+  const iv=vwInvData||{}, a=iv.armor||{};
+  const slots=[['Helm',a.helmet],['Chest',a.chestplate],['Legs',a.leggings],['Boots',a.boots],['Main',iv.mainHand],['Off',iv.offHand]];
+  $('vwEquip').innerHTML=slots.map(s=>'<div class="vw-eq">'+vwSlot(s[1])+'<span class="vw-eqlab">'+s[0]+'</span></div>').join('');
+}
+function vwRenderInv(){
+  const iv=vwInvData||{}, g=a=>(a||[]).map(vwSlot).join('');
+  $('vwInv').innerHTML='<div class="vw-grid">'+g(iv.main)+'</div><div class="vw-grid vw-hot">'+g(iv.hotbar)+'</div>';
+}
+function vwRenderModules(){
+  const mods=(vwModData&&vwModData.modules)||[];
+  const f=(($('vwModFilter')||{}).value||'').toLowerCase();
+  $('vwModules').innerHTML=mods.filter(m=>m.name.toLowerCase().includes(f)).map(m=>
+    '<label class="vw-mod"><span>'+esc(m.name)+'</span><span class="vw-sw'+(m.enabled?' on':'')+'" onclick="vwModToggle(\''+jsq(m.name)+'\','+(!m.enabled)+')"><i></i></span></label>').join('')
+    || '<div style="color:var(--dim);font-size:.7rem;padding:.3rem">no modules</div>';
+}
+function vwRenderPalette(){
+  const cmds=vwCmdData||[];
+  const f=(($('vwCmdSearch')||{}).value||'').toLowerCase();
+  const list=cmds.filter(c=>c.name.toLowerCase().includes(f)||((c.description||'').toLowerCase().includes(f))).slice(0,100);
+  $('vwPalette').innerHTML=list.map(c=>'<div class="vw-cmd" onclick="vwPickCmd(\''+jsq(c.name)+'\')"><b>'+esc(c.name)+'</b><span>'+esc((c.description||'').replace(/\s+/g,' ').trim().slice(0,90))+'</span></div>').join('');
+}
+function vwPickCmd(n){ const i=$('vwCmdInput'); if(i){ i.value=n+' '; i.focus(); } }
+function vwRunInput(){ const v=(($('vwCmdInput')||{}).value||'').trim(); if(v) vwRunCommand(v); }
+function vwRunCommand(cmd,quiet){
+  if(!VW) return;
+  fetch('/api/instances/'+encodeURIComponent(VW)+'/control/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd})})
+   .then(r=>r.json().catch(()=>({error:'HTTP '+r.status}))).then(d=>{
+     if(!quiet){ const lines=(d&&d.lines)||[(d&&d.error)||'(no output)'];
+       $('vwCmdResult').innerHTML='<div class="vw-rcmd">› '+esc(cmd)+'</div>'+lines.map(l=>'<div>'+esc(l)+'</div>').join(''); }
+     setTimeout(vwTickInv,500);
+   }).catch(e=>{ if(!quiet&&$('vwCmdResult')) $('vwCmdResult').textContent='error: '+e; });
+}
+function vwModToggle(name,on){ vwRunCommand(name.toLowerCase()+' '+(on?'on':'off'),true); setTimeout(vwTickMod,700); setTimeout(vwTickMod,1700); }
+async function vwTickInv(){
+  if(!VW||vwTab!=='control') return;
+  try{ const d=await(await fetch('/api/instances/'+encodeURIComponent(VW)+'/viewer/inventory')).json();
+    if(d&&!d.offline){ vwInvData=d; vwRenderVitals(); vwRenderEquip(); vwRenderInv(); } }catch(e){}
+}
+async function vwTickMod(){
+  if(!VW||vwTab!=='control') return;
+  try{ const d=await(await fetch('/api/instances/'+encodeURIComponent(VW)+'/control/state')).json();
+    if(d&&!d.offline){ vwModData=d; vwRenderModules(); vwCtlBanner(d.control); } }catch(e){}
+}
+function vwCtlBanner(on){ const b=$('vwCtlBanner'); if(b) b.innerHTML = on ? '' :
+  '<div class="vw-banner">Control is read-only. Enable <code>server.viewer.control</code> on the bot to run commands &amp; toggles.</div>'; }
+async function vwLoadCommands(){
+  if(vwCmdLoaded||!VW) return;
+  try{ const d=await(await fetch('/api/instances/'+encodeURIComponent(VW)+'/control/commands')).json();
+    if(Array.isArray(d)){ vwCmdData=d; vwCmdLoaded=true; vwRenderPalette(); } }catch(e){}
+}
+function vwControlStart(){
+  const q=$('vwQuick'); if(q&&!q.dataset.init){ q.dataset.init='1';
+    q.innerHTML=[['Connect','connect'],['Disconnect','disconnect'],['Status','info'],['Reconnect','reconnect']]
+      .map(a=>'<button class="vw-qbtn" onclick="vwRunCommand(\''+a[1]+'\')">'+a[0]+'</button>').join(''); }
+  vwRenderVitals(); vwTickInv(); vwTickMod(); vwLoadCommands();
+  clearInterval(vwInvT); vwInvT=setInterval(vwTickInv,1500);
+  clearInterval(vwModT); vwModT=setInterval(vwTickMod,2800);
+}
+function vwControlStop(){ clearInterval(vwInvT); vwInvT=null; clearInterval(vwModT); vwModT=null; }
+function vwDrawMini(){
+  const cv=$('vwMiniCanvas'); if(!cv) return;
+  const x=cv.getContext('2d'), W=cv.width, H=cv.height, z=W/110;   // ~110 blocks across
+  x.fillStyle='#06090c'; x.fillRect(0,0,W,H);
+  if(!vwRender.has) return;
+  const camx=vwRender.x, camz=vwRender.z, m=vwMap;
+  if(m.img){ const x0=(m.cx-m.size/2-camx)*z+W/2, y0=(m.cz-m.size/2-camz)*z+H/2;
+    x.imageSmoothingEnabled=false; x.drawImage(m.img, x0, y0, m.size*z, m.size*z); }
+  const bx=W/2, by=H/2;
+  x.strokeStyle='rgba(255,255,255,.35)'; x.lineWidth=2;
+  x.beginPath(); x.moveTo(bx-9,by); x.lineTo(bx+9,by); x.moveTo(bx,by-9); x.lineTo(bx,by+9); x.stroke();
+  const yaw=vwRender.yaw*Math.PI/180, dx=-Math.sin(yaw), dz=Math.cos(yaw), L=22, a=Math.atan2(dz,dx);
+  const ex=bx+dx*L, ey=by+dz*L;
+  x.strokeStyle='#30d158'; x.fillStyle='#30d158'; x.lineWidth=3;
+  x.beginPath(); x.moveTo(bx,by); x.lineTo(ex,ey); x.stroke();
+  x.beginPath(); x.moveTo(ex,ey); x.lineTo(ex-10*Math.cos(a-0.42),ey-10*Math.sin(a-0.42)); x.lineTo(ex-10*Math.cos(a+0.42),ey-10*Math.sin(a+0.42)); x.closePath(); x.fill();
+  x.fillStyle='#fff'; x.beginPath(); x.arc(bx,by,3,0,7); x.fill();
 }
 function openDrawer(name){
   CUR=name; $('drawerName').textContent=name;
