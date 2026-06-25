@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3763,6 +3763,60 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    # ---- live control surface (Mission Control) ----
+    CONTROL_STYLES = {"v1": "index.html", "v2": "v2.html", "v3": "v3.html"}
+    CONTROL_ASSETS = {"abm-control-data.js", "control-live.js",
+                      "index.html", "v2.html", "v3.html"}
+
+    def _control_dir(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "control")
+
+    def _serve_control_page(self, q):
+        """Serve the live Mission-Control surface page (themeable via ?style=v1|v2|v3).
+        Assets are referenced absolutely (/control/<file>) so the page URL's trailing
+        slash doesn't matter; the live wiring is in control-live.js."""
+        style = (q.get("style", ["v1"])[0] or "v1").lower()
+        fname = self.CONTROL_STYLES.get(style, "index.html")
+        fp = os.path.join(self._control_dir(), fname)
+        if not os.path.isfile(fp):
+            fp = os.path.join(self._control_dir(), "index.html")
+        try:
+            with open(fp, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self._json({"error": "control UI not installed on this box"}, 404)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _serve_control_asset(self, path):
+        """Serve a whitelisted static asset from the repo's control/ dir."""
+        rel = path[len("/control/"):]
+        if rel not in self.CONTROL_ASSETS:
+            return self._json({"error": "not found"}, 404)
+        fp = os.path.join(self._control_dir(), rel)
+        if not os.path.isfile(fp):
+            return self._json({"error": "not found"}, 404)
+        ctype = ("application/javascript; charset=utf-8" if rel.endswith(".js")
+                 else "text/html; charset=utf-8" if rel.endswith(".html")
+                 else "application/octet-stream")
+        try:
+            with open(fp, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self._json({"error": "not found"}, 404)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     def _viewer_relay(self, path, q):
         """Relay a bot's loopback viewer feed to the dashboard. The bot binds the viewer to 127.0.0.1 only, so the
         browser can't reach it directly — we fetch it server-side and pass it through. Cross-box is automatic: a
@@ -3979,6 +4033,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+
+        if path == "/control" or path == "/control/":
+            return self._serve_control_page(q)
+        if path.startswith("/control/"):
+            return self._serve_control_asset(path)
 
         if path.startswith("/api/instances/") and "/viewer/" in path:
             return self._viewer_relay(path, q)
@@ -6374,6 +6433,11 @@ table.tbl tr:hover td{background:#ffffff05}
     </div>
     <div id="vwControlWrap" class="vw-ctl" style="display:none">
       <div id="vwCtlBanner"></div>
+      <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.7rem;flex-wrap:wrap">
+        <button class="vw-qbtn" onclick="vwOpenFullControl()"
+          style="border-color:var(--acc-dim);color:var(--acc);font-weight:700">⛶ Open full control surface</button>
+        <span style="font-size:.64rem;color:var(--dim)">live Mission Control — every module, the world map, vitals &amp; a command palette on one page</span>
+      </div>
       <div class="vw-card"><div id="vwVitals" class="vw-vitals"></div></div>
       <div class="vw-card">
         <div class="vw-sec">Flight — ElytraPilot</div>
@@ -7259,6 +7323,10 @@ function vwControlStart(){
   clearInterval(vwModT); vwModT=setInterval(vwTickMod,2800);
 }
 function vwControlStop(){ clearInterval(vwInvT); vwInvT=null; clearInterval(vwModT); vwModT=null; }
+function vwOpenFullControl(){
+  const style=localStorage.getItem('abmControlStyle')||'v1';
+  window.open('/control?inst='+encodeURIComponent(VW)+'&style='+style, '_blank');
+}
 function vwDrawMini(){
   const cv=$('vwMiniCanvas'); if(!cv) return;
   const x=cv.getContext('2d'), W=cv.width, H=cv.height, z=W/110;   // ~110 blocks across
