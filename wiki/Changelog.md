@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.7.0 — *latest*
+## v3.7.1 — *latest*
+
+- **Fix: Tailscale Funnel guidance (no more "command timed-out").** Tailscale Funnel needs a **one-time tailnet enablement** beyond signing in — ABM wasn't surfacing that step and instead showed a confusing *command timed-out*. The Funnel attempt now runs detached (so a slow first HTTPS-cert provisioning never blocks or leaves stuck processes), and when the tailnet hasn't enabled Funnel the Share panel shows a direct **"Enable Funnel"** link. Click it once (in your Tailscale admin) and the address goes live automatically. *(The Cloudflare Quick Tunnel remains the zero-setup option if you just want a public link now.)*
+- **Fix: invite links warn when they're private.** Like share links, the one-time invite link now warns if it points at a `localhost`/private address — turn on **Public sharing** first so the invitee can actually open it.
+
+## v3.7.0
 
 - **One-click "Migrate to AquariusProxy".** Any bot detected as **ZenithProxy** now shows an **⇪ Aquarius** button on its card (owner/admin). It converts the bot to AquariusProxy **in place, keeping its `config.json` and Minecraft account** (`mc_auth_cache.json`): it stops the bot, **backs up** `config.json` / `mc_auth_cache.json` / `launch_config.json` / `launch` / the jar to a `premigrate-…` folder, repoints the launcher to `aquariusnetwork9/AquariusProxy` (keeping the valid version), **swaps the `launch` binary** for the Aquarius launcher (the step that actually makes it stick), and restarts. A dialog shows the steps + a live log and warns that external plugin jars won't load on AquariusProxy (many have baked-in equivalents). A **Roll back** button restores the backup if anything looks off. Works on remote-box bots too.
 

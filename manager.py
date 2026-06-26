@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.7.0"
+__version__ = "3.7.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3327,16 +3327,21 @@ class Tailscale:
     _STATE = os.path.join(_AQ_DIR, "ts-state")
     _SOCK = os.path.join(_AQ_DIR, "tailscaled.sock")
     _LOG = os.path.join(_AQ_DIR, "tailscaled.log")
+    _FLOG = os.path.join(_AQ_DIR, "ts-funnel.log")
+
+    _FUNNEL_URL_RE = re.compile(r"https://login\.tailscale\.com/f/funnel\S*")
 
     def __init__(self):
         self.lock = threading.Lock()
         self.enabled = False
         self.error = None
         self.auth_url = None
+        self.funnel_url = None          # tailnet "enable Funnel" URL (a separate one-time step)
         self.port = None
         self._mon = None
         self._worker = None
         self.installing = False
+        self._last_funnel_try = 0.0
 
     def _bin(self, name):
         for c in ("/usr/bin/" + name, "/usr/local/bin/" + name):
@@ -3442,8 +3447,19 @@ class Tailscale:
         dn = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
         url = ("https://" + dn) if dn else None
         on = self._funnel_on(dn)                # operational truth; _ShareManager ANDs with settings.enabled
-        return {"enabled": self.enabled, "running": bool(on), "url": url if on else None,
-                "installed": True, "error": self.error}
+        if on:                                  # live — drop any stale enable-Funnel guidance
+            with self.lock:
+                self.funnel_url = None
+                if self.error and "Funnel" in self.error:
+                    self.error = None
+        else:
+            self._read_funnel_log()             # refresh the enable URL if the tailnet hasn't enabled Funnel
+        out = {"enabled": self.enabled, "running": bool(on), "url": url if on else None,
+               "installed": True, "error": self.error}
+        if not on and self.funnel_url:          # signed in, but the tailnet must enable Funnel (one-time)
+            out["needs_funnel"] = True
+            out["funnel_url"] = self.funnel_url
+        return out
 
     def start(self, port, conf):
         # NON-BLOCKING: everything slow (download, daemon, `tailscale up`, funnel) runs in a background
@@ -3489,33 +3505,75 @@ class Tailscale:
                 pass
         self._monitor()        # loops while enabled: brings the funnel up once signed in
 
-    def _funnel_up(self, port):
+    def _kill_stale_funnel(self):
         try:
-            r = subprocess.run(self._ts_args("funnel", "--bg", str(port)),
-                               capture_output=True, text=True, timeout=25)
-            if r.returncode != 0:
-                with self.lock:
-                    self.error = (r.stderr or r.stdout or "tailscale funnel failed").strip()[:200]
-            else:
-                with self.lock:
-                    self.error = None
+            subprocess.run(["pkill", "-f", "tailscale .*funnel --bg"], timeout=6)
+        except Exception:
+            pass
+
+    def _funnel_running(self):
+        try:
+            r = subprocess.run(["pgrep", "-f", "tailscale .*funnel --bg"],
+                               capture_output=True, text=True, timeout=6)
+            return any(x.strip().isdigit() for x in r.stdout.split())
+        except Exception:
+            return False
+
+    def _funnel_up(self, port):
+        """Spawn `tailscale funnel --bg <port>` DETACHED, capturing its output. We don't wait on it:
+        the first run blocks for a long time provisioning the HTTPS cert, and if the tailnet hasn't
+        enabled Funnel it prints an enable URL — both are read from the log, never via a blocking
+        timeout (which is what produced the old "command timed-out")."""
+        self._kill_stale_funnel()              # never let attempts pile up
+        with self.lock:
+            self._last_funnel_try = time.time()
+        try:
+            logf = open(self._FLOG, "wb")      # truncate — only this attempt's output matters
+            try:
+                subprocess.Popen(self._ts_args("funnel", "--bg", str(port)),
+                                 stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            finally:
+                logf.close()
         except Exception as e:
             with self.lock:
                 self.error = str(e)[:200]
 
+    def _read_funnel_log(self):
+        """Pull the 'enable Funnel' URL out of the funnel attempt's log, if the tailnet hasn't enabled it."""
+        try:
+            with open(self._FLOG, "r", errors="replace") as f:
+                out = f.read()
+        except OSError:
+            return None
+        mu = self._FUNNEL_URL_RE.search(out)
+        if mu:
+            with self.lock:
+                self.funnel_url = mu.group(0)
+                self.error = ("Funnel isn't enabled on your tailnet yet — open the “Enable Funnel” "
+                              "link below (one-time, in your Tailscale admin console).")
+            return mu.group(0)
+        return None
+
     def _monitor(self):
-        """While enabled, once the user has signed in, bring the funnel up automatically."""
+        """While enabled and signed in, bring the funnel up automatically. Spawns at most one funnel
+        attempt at a time and backs off — Funnel needs a one-time tailnet enable + a slow first cert."""
         while True:
             with self.lock:
-                enabled, port = self.enabled, self.port
+                enabled, port, last = self.enabled, self.port, self._last_funnel_try
             if not enabled:
                 return
             d = self._status_json()
             if d.get("BackendState") == "Running":
                 dn = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
-                if dn and not self._funnel_on(dn):
-                    self._funnel_up(port)
-            time.sleep(4)
+                if dn and self._funnel_on(dn):
+                    with self.lock:               # we're live — clear any stale guidance
+                        self.funnel_url = None
+                        self.error = None
+                else:
+                    self._read_funnel_log()        # surface the enable URL if it was printed
+                    if not self._funnel_running() and (time.time() - last) > 15:
+                        self._funnel_up(port)
+            time.sleep(6)
 
     def stop(self):
         with self.lock:
@@ -11360,6 +11418,9 @@ function paintTunStatus(d){
     if(d.needs_login && d.auth_url){
       login.style.display='block';
       login.innerHTML='<div class="shurl" style="margin:.4rem 0"><b>One step left</b> — sign in to Tailscale: <a href="'+esc(d.auth_url)+'" target="_blank" rel="noopener">open the sign-in link</a>. It goes live automatically once you\'re signed in.</div>';
+    } else if(d.needs_funnel && d.funnel_url){
+      login.style.display='block';
+      login.innerHTML='<div class="shurl" style="margin:.4rem 0"><b>One step left</b> — Funnel isn\'t enabled on your tailnet yet. <a href="'+esc(d.funnel_url)+'" target="_blank" rel="noopener">Enable Funnel</a> (one-time, in your Tailscale admin console), then it goes live automatically.</div>';
     } else login.style.display='none';
   }
   if(d.enabled && d.running && d.url){
@@ -11370,9 +11431,10 @@ function paintTunStatus(d){
   } else if(d.enabled && !d.running){
     if(d.installing) st.innerHTML='<span class="spin"></span> setting up… downloading (this can take a minute)';
     else if(d.needs_login) st.innerHTML='<span class="spin"></span> waiting for Tailscale sign-in…';
+    else if(d.needs_funnel) st.innerHTML='<span class="spin"></span> waiting for Funnel to be enabled…';
     else st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting… (a few seconds)';
     if(btn){ btn.style.display=''; btn.textContent='Turn off'; } urlb.style.display='none';
-    if((!d.error || d.needs_login || d.installing)){ if(!_tunPoll) _tunPoll=setInterval(pollTunStatus,1800); }
+    if((!d.error || d.needs_login || d.needs_funnel || d.installing)){ if(!_tunPoll) _tunPoll=setInterval(pollTunStatus,1800); }
     else if(_tunPoll){ clearInterval(_tunPoll); _tunPoll=null; }
   } else {
     st.textContent='Off — links only work on your own (tunnel/localhost) connection.';
@@ -11529,7 +11591,9 @@ async function createInvite(btn){
   if(d.error){ $('invMsg').innerHTML='<span style="color:var(--crash)">'+esc(d.error)+'</span>'; return; }
   $('invMsg').textContent='';
   const r=$('invResult'); r.style.display='block';
-  r.innerHTML='<div class="shurl"><div style="font-size:.74rem;color:var(--dim);margin-bottom:.3rem">One-time invite link — copy it now, it won\'t be shown again:</div><div style="display:flex;gap:.4rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="copyText(\''+jsq(d.url)+'\',this)">Copy</button></div></div>';
+  const priv=/\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:|\/)/.test(d.url||'');
+  const warn=priv?'<div class="hint" style="color:var(--warn);margin-top:.3rem">⚠ This link points at your private address, so the invitee can\'t open it. Turn on <b>Public sharing</b> (the Share panel) first, then create the invite again.</div>':'';
+  r.innerHTML='<div class="shurl"><div style="font-size:.74rem;color:var(--dim);margin-bottom:.3rem">One-time invite link — copy it now, it won\'t be shown again:</div><div style="display:flex;gap:.4rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="copyText(\''+jsq(d.url)+'\',this)">Copy</button></div>'+warn+'</div>';
   loadUsers();
 }
 function scopeSummary(u){ return u.all?'all bots':((u.targets||[]).map(t=>t.name).join(', ')||'no bots'); }
