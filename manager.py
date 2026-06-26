@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.4.2"
+__version__ = "3.5.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -4870,6 +4870,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # ---- /i/<token> invite redemption (create a named account) ----
+    _INVITE_RE = re.compile(r"^/i/([A-Za-z0-9_-]+)$")
+
+    def _serve_invite_page(self, cfg, token):
+        inv = find_invite_by_token(cfg, token)
+        if not inv:
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            body = (b"<!doctype html><meta charset=utf-8><title>Invite unavailable</title>"
+                    b"<div style='max-width:460px;margin:14vh auto;font:400 15px/1.6 system-ui,sans-serif;"
+                    b"color:#cdd9e2;background:#0d141b;border:1px solid #1c2a36;border-radius:12px;padding:1.4rem'>"
+                    b"<h2 style='margin:.2rem 0 .6rem'>This invite is invalid, used, or expired</h2>"
+                    b"<p style='opacity:.8'>Ask the owner for a new invite link.</p></div>")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
+        # render the account-creation page (token + any preset username are baked in)
+        scope = "all bots" if inv.get("all") else (", ".join(t.get("name", "") for t in inv.get("targets", [])) or "selected bots")
+        html = (INVITE_PAGE
+                .replace("__TOKEN__", token)
+                .replace("__ROLE__", inv.get("role", "view"))
+                .replace("__SCOPE__", scope)
+                .replace("__PRESET_USER__", inv.get("username") or ""))
+        return self._html(html)
+
     def _authstatus(self, cfg):
         princ = self._principal(cfg)
         out = {"required": self._auth_required(cfg),
@@ -4879,6 +4906,15 @@ class Handler(BaseHTTPRequestHandler):
             out["principal"] = "anon"
         elif princ["type"] == "owner":
             out["principal"] = "owner"
+        elif princ["type"] == "user":
+            sc = princ["scope"]
+            out["principal"] = "user"
+            out["username"] = princ.get("username")
+            out["role"] = princ.get("role")
+            out["is_admin"] = princ.get("role") == "admin"
+            out["capability"] = sc.get("capability")
+            out["targets"] = sc.get("targets", [])
+            out["all"] = sc.get("all", False)
         else:
             sc = princ["scope"]
             out["principal"] = "guest"
@@ -4986,7 +5022,9 @@ class Handler(BaseHTTPRequestHandler):
                 or path.startswith("/api/nodes")     # /api/nodes, .../remove, .../do*
                 or path.startswith("/api/fleet/")
                 or path.startswith("/api/shares")    # share grants live on the controller
-                or path.startswith("/api/share/"))   # public-sharing tunnel exposes THIS dashboard, never a node
+                or path.startswith("/api/share/")    # public-sharing tunnel exposes THIS dashboard, never a node
+                or path.startswith("/api/users")     # named accounts live on the controller
+                or path.startswith("/api/invite"))   # invite links + redemption are controller-local
 
     def _inject_switcher_str(self, text, current, label=""):
         if "<body>" not in text or "abmNodeBar" in text:
@@ -5303,6 +5341,12 @@ class Handler(BaseHTTPRequestHandler):
         if msh:
             return self._redeem_share(cfg, msh.group(1))
 
+        # invite-link landing page: the invitee sets a username+password to create their account
+        # (before the auth gate — they don't have one yet)
+        miv = self._INVITE_RE.match(path)
+        if miv:
+            return self._serve_invite_page(cfg, miv.group(1))
+
         # First run: the setup wizard owns the UI until a login is created
         # (or the user explicitly skips to run open on localhost).
         if self._needs_setup(cfg):
@@ -5543,8 +5587,9 @@ class Handler(BaseHTTPRequestHandler):
                 return row
 
             insts = cfg["instances"]
-            if princ and princ["type"] == "guest":
-                # guests see only their granted bots — local filtered here, remote fetched per-node
+            if princ and not self._is_owner(princ) and princ.get("type") in ("guest", "user"):
+                # scoped principals (guest links + non-admin users) see only their granted bots —
+                # local filtered here, remote fetched per-node
                 sc = princ["scope"]
                 local_names = {t["name"] for t in sc.get("targets", []) if not t.get("node")}
                 local = cfg["instances"] if sc.get("all") else [i for i in insts if i["name"] in local_names]
@@ -5579,6 +5624,15 @@ class Handler(BaseHTTPRequestHandler):
             if not self._guard_owner(princ):
                 return
             return self._json({"audit": list(reversed(_GUEST_AUDIT[-60:]))})
+
+        if path == "/api/users":
+            if not self._guard_owner(princ):
+                return
+            cfg = self._cfg()
+            return self._json({"users": [user_public_view(cfg, u) for u in _users(cfg)],
+                               "invites": [invite_public_view(i) for i in _invites(cfg)
+                                           if invite_status(i) == "pending"],
+                               "owner": _owner_username(cfg)})
 
         if path == "/api/share/tunnel":
             if not self._guard_owner(princ):
@@ -5651,12 +5705,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad request"}, 400)
             user = p.get("username", "")
             pw = p.get("password", "")
-            ok = verify_password(cfg, user, pw) if auth_configured(cfg) else (
+            # owner login first (settings.auth or legacy env), then named user accounts
+            owner_ok = verify_password(cfg, user, pw) if auth_configured(cfg) else (
                 bool(ABM_USER) and user == ABM_USER and pw == ABM_PASS)
-            if not ok:
+            if owner_ok:
+                return self._json({"ok": True}, cookie=_new_session(session_epoch(cfg)))
+            u = verify_user(cfg, user, pw)
+            if u:
+                touch_user_login(cfg, u["id"])
+                return self._json({"ok": True, "user": u.get("username"), "role": u.get("role")},
+                                  cookie=_new_session(session_epoch(cfg), user=u))
+            _record_fail(ip)
+            return self._json({"error": "invalid credentials"}, 401)
+
+        # invite redemption: create a named account from an invite link, then sign in (pre-auth —
+        # the invitee has no account yet). Rate-limited like login/share redemption.
+        if path == "/api/invite/redeem":
+            ip = self._client_ip()
+            if _rate_limited(ip):
+                return self._json({"error": "too many attempts, wait a few minutes"}, 429)
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            try:
+                u = redeem_invite(cfg, p.get("token", ""), p.get("username", ""), p.get("password", ""))
+            except ValueError as e:
                 _record_fail(ip)
-                return self._json({"error": "invalid credentials"}, 401)
-            return self._json({"ok": True}, cookie=_new_session(session_epoch(cfg)))
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True, "user": u.get("username")},
+                              cookie=_new_session(session_epoch(cfg), user=u))
 
         princ = self._principal(cfg)
         if princ is None:
@@ -5730,6 +5808,86 @@ class Handler(BaseHTTPRequestHandler):
                 return
             cfg = self._cfg()
             return self._json({"ok": True, "epoch": bump_shares_epoch(cfg)})
+
+        # named user accounts + invites (owner/admin only; controller-local)
+        if path == "/api/users":
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            try:
+                u = new_user(cfg, p.get("username", ""), p.get("password", ""),
+                             p.get("role", "view"), bool(p.get("all")), p.get("targets") or [])
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True, "user": user_public_view(cfg, u)})
+
+        mu = re.match(r"^/api/users/([^/]+)/password$", path)
+        if mu:
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            try:
+                ok = set_user_password(cfg, mu.group(1), p.get("password", ""))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"ok": True}) if ok else self._json({"error": "no such user"}, 404)
+
+        mu = re.match(r"^/api/users/([^/]+)/delete$", path)
+        if mu:
+            if not self._guard_owner(princ):
+                return
+            cfg = self._cfg()
+            return self._json({"ok": delete_user(cfg, mu.group(1))})
+
+        mu = re.match(r"^/api/users/([^/]+)$", path)
+        if mu:
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            try:
+                u = update_user(cfg, mu.group(1), role=p.get("role"), all_=p.get("all"),
+                                targets=p.get("targets"), disabled=p.get("disabled"))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            if not u:
+                return self._json({"error": "no such user"}, 404)
+            return self._json({"ok": True, "user": user_public_view(cfg, u)})
+
+        if path == "/api/invites":
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            try:
+                inv, token = new_invite(cfg, p.get("label"), p.get("role", "view"),
+                                        bool(p.get("all")), p.get("targets") or [],
+                                        p.get("username"), p.get("ttl_days"))
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, 400)
+            url = f"{share_base_url(self)}/i/{token}"
+            return self._json({"ok": True, "invite": invite_public_view(inv), "url": url})
+
+        mi = re.match(r"^/api/invites/([^/]+)/revoke$", path)
+        if mi:
+            if not self._guard_owner(princ):
+                return
+            cfg = self._cfg()
+            return self._json({"ok": revoke_invite(cfg, mi.group(1))})
 
         if path == "/api/share/tunnel":
             if not self._guard_owner(princ):
@@ -7146,6 +7304,83 @@ init();
 </html>
 """
 
+INVITE_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Bot Manager — Accept invite</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0e12;--panel:#11171e;--line:#1d2730;--txt:#dfe7ee;--dim:#7b8a98;--acc:#3ddc97;--acc-dim:#1f7a55;--crash:#ff5d5d}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  font-family:'Sora',system-ui,sans-serif;color:var(--txt);
+  background:radial-gradient(900px 500px at 80% -10%,#12372a33,transparent 60%),
+   radial-gradient(700px 400px at 0% 0%,#10202e55,transparent 55%),var(--bg)}
+.card{width:min(400px,92vw);background:linear-gradient(180deg,var(--panel),#0d1319);
+  border:1px solid var(--line);border-radius:16px;padding:2rem 1.8rem;box-shadow:0 30px 80px #000a}
+.brand{display:flex;align-items:center;gap:.6rem;font-weight:800;font-size:1.2rem;letter-spacing:-.02em;margin-bottom:.3rem}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc)}
+.sub{color:var(--dim);font-size:.8rem;margin-bottom:1rem;line-height:1.5}
+.grant{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1rem}
+.chip{font-family:'Space Mono',monospace;font-size:.7rem;padding:.25rem .55rem;border-radius:20px;
+  border:1px solid var(--acc-dim);background:#15201b;color:var(--acc)}
+.chip.s{border-color:var(--line);background:#0d141b;color:var(--dim)}
+label{display:block;font-size:.78rem;font-weight:600;color:var(--dim);margin:.8rem 0 .3rem}
+input{width:100%;font-family:'Space Mono',monospace;font-size:.85rem;background:#06090c;color:#cdd9e2;
+  border:1px solid var(--line);border-radius:9px;padding:.6rem .7rem}
+input:focus{outline:none;border-color:var(--acc)}
+input:disabled{opacity:.7}
+button{width:100%;margin-top:1.3rem;cursor:pointer;border:1px solid var(--acc-dim);background:var(--panel);
+  color:var(--acc);font-weight:700;font-size:.9rem;padding:.65rem;border-radius:10px;font-family:inherit;transition:.15s}
+button:hover{background:#15201b}
+button:disabled{opacity:.5;cursor:not-allowed}
+.msg{margin-top:.9rem;font-family:'Space Mono',monospace;font-size:.74rem;color:var(--crash);min-height:1em;text-align:center}
+.hint{margin-top:1.2rem;font-size:.68rem;color:#586675;text-align:center;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand"><span class="dot"></span>Aquarius Bot Manager</div>
+  <div class="sub">You've been invited to control bots. Pick a password to create your account.</div>
+  <div class="grant"><span class="chip">role: __ROLE__</span><span class="chip s">access: __SCOPE__</span></div>
+  <label for="u">Username</label>
+  <input id="u" autocomplete="username" autofocus onkeydown="k(event)">
+  <label for="p">Password</label>
+  <input id="p" type="password" autocomplete="new-password" onkeydown="k(event)" placeholder="at least 6 characters">
+  <label for="p2">Confirm password</label>
+  <input id="p2" type="password" autocomplete="new-password" onkeydown="k(event)">
+  <button id="btn" onclick="redeem()">Create account &amp; sign in</button>
+  <div class="msg" id="msg"></div>
+  <div class="hint">This link works once. After you create your account, sign in normally with your username and password.</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const TOKEN="__TOKEN__", PRESET="__PRESET_USER__";
+if(PRESET){ $('u').value=PRESET; $('u').disabled=true; $('p').focus(); }
+function k(e){ if(e.key==='Enter') redeem(); }
+async function redeem(){
+  const username=(PRESET||$('u').value.trim()), password=$('p').value, p2=$('p2').value;
+  if(!username){ $('msg').textContent='enter a username'; return; }
+  if(!password||password.length<6){ $('msg').textContent='password must be at least 6 characters'; return; }
+  if(password!==p2){ $('msg').textContent='passwords do not match'; return; }
+  $('btn').disabled=true; $('msg').style.color='var(--dim)'; $('msg').textContent='creating account…';
+  try{
+    const r=await fetch('/api/invite/redeem',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:TOKEN,username,password})});
+    const d=await r.json();
+    if(r.ok&&d.ok){ location.href='/'; return; }
+    $('msg').style.color='var(--crash)'; $('msg').textContent='✗ '+(d.error||'could not create account');
+  }catch(e){ $('msg').style.color='var(--crash)'; $('msg').textContent='✗ connection error'; }
+  $('btn').disabled=false;
+}
+</script>
+</body>
+</html>
+"""
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7523,6 +7758,7 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     <button class="owner-only" onclick="openFiles()">📁 Files</button>
     <button class="owner-only" onclick="openProxies()">🌐 Proxies</button>
     <button class="owner-only" onclick="openShares()">👥 Share</button>
+    <button class="owner-only" onclick="openUsers()">👤 Users</button>
     <button class="owner-only" onclick="openScan()">⟲ Scan existing</button>
     <button class="go owner-only" onclick="openDeploy()">➕ Add Bot</button>
     <button class="go owner-only" onclick="bulk('start')">▶ Start all</button>
@@ -7588,6 +7824,45 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     <div class="modcard" id="shAuditCard" style="margin-top:.4rem">
       <div class="mhd" onclick="document.getElementById('shAuditCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Recent guest activity</span></div>
       <div class="mbody"><div id="shAudit" style="display:flex;flex-direction:column;gap:.2rem;font-size:.76rem;font-family:var(--mono);max-height:200px;overflow:auto"><span class="hint">No guest actions recorded.</span></div></div>
+    </div>
+  </div>
+</div>
+<div class="scrim" id="usersScrim" onclick="closeUsers(event)">
+  <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">👤 Users &amp; access</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Give people their own login with a role and a set of bots. Roles: <b>View</b> (read-only) · <b>Operate</b> (+ start/stop/commands) · <b>Config</b> (+ edit settings) · <b>Admin</b> (full control, like a second owner). Your owner account is separate and always full-access.</div>
+    <div class="modcard open">
+      <div class="mhd"><span class="mtitle">Add a user</span></div>
+      <div class="mbody" style="gap:.55rem">
+        <label style="color:var(--dim)">Username <input id="usrName" placeholder="alice" maxlength="32" autocomplete="off"></label>
+        <label style="color:var(--dim)">Password <input id="usrPass" type="password" placeholder="at least 6 characters" autocomplete="new-password"></label>
+        <div id="usrRole_add"></div>
+        <div id="usrScope_add"></div>
+        <div class="mbar"><span class="msg" id="usrMsg" style="flex:1;color:var(--dim)"></span><button class="go" onclick="addUser(this)">Add user</button></div>
+      </div>
+    </div>
+    <div class="modcard open">
+      <div class="mhd"><span class="mtitle">Invite link</span></div>
+      <div class="mbody" style="gap:.55rem">
+        <div class="hint">Generate a one-time link with a preset role + bots. They open it, pick their own password, and they're in — no password handoff.</div>
+        <label style="color:var(--dim)">Preset username <span class="hint">(optional — blank lets them choose)</span><input id="invName" placeholder="(optional)" maxlength="32" autocomplete="off"></label>
+        <div id="usrRole_inv"></div>
+        <div id="usrScope_inv"></div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.82rem">
+          <span class="hint">Expires</span>
+          <select id="invTtl" style="width:auto"><option value="1">1 day</option><option value="7" selected>7 days</option><option value="30">30 days</option><option value="">Never</option></select>
+        </div>
+        <div class="mbar"><span class="msg" id="invMsg" style="flex:1;color:var(--dim)"></span><button onclick="createInvite(this)">Create invite link</button></div>
+        <div id="invResult" style="display:none"></div>
+      </div>
+    </div>
+    <div class="modcard open" style="margin-top:.4rem">
+      <div class="mhd"><span class="mtitle">People</span></div>
+      <div class="mbody"><div id="usrList" style="display:flex;flex-direction:column;gap:.4rem;font-size:.82rem"><span class="hint">No users yet.</span></div></div>
+    </div>
+    <div class="modcard" id="invListCard" style="margin-top:.4rem">
+      <div class="mhd" onclick="document.getElementById('invListCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Pending invites</span></div>
+      <div class="mbody"><div id="invList" style="display:flex;flex-direction:column;gap:.3rem;font-size:.8rem"><span class="hint">None.</span></div></div>
     </div>
   </div>
 </div>
@@ -9316,6 +9591,7 @@ function navModel(){
     {ic:'➕',lbl:'Add Bot',act:'openDeploy()'},
     {ic:'📁',lbl:'Files',act:'openFiles()'},
     {ic:'👥',lbl:'Share',act:'openShares()'},
+    {ic:'👤',lbl:'Users',act:'openUsers()'},
     {g:'System'},
     {ic:'🔗',lbl:'Connect',act:'openConnection()'},
     {ic:'⟲',lbl:'Scan',act:'openScan()'},
@@ -9747,7 +10023,7 @@ function palItems(){
   const modal=[
     {ic:'🖥',lbl:'Boxes',go:()=>openBoxes()},{ic:'🌐',lbl:'Proxies',go:()=>openProxies()},
     {ic:'➕',lbl:'Add Bot',go:()=>openDeploy()},{ic:'📁',lbl:'Files',go:()=>openFiles()},
-    {ic:'👥',lbl:'Share',go:()=>openShares()},
+    {ic:'👥',lbl:'Share',go:()=>openShares()},{ic:'👤',lbl:'Users',go:()=>openUsers()},
     {ic:'🔗',lbl:'Connect',go:()=>openConnection()},{ic:'⟲',lbl:'Scan existing',go:()=>openScan()},
     {ic:'⚙',lbl:'Settings',go:()=>openSettings()},
   ];
@@ -10772,17 +11048,108 @@ async function loadShares(){
 async function revokeShare(id,btn){ btn.disabled=true; try{ await fetch('/api/shares/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }catch(e){} loadShares(); }
 async function revokeAllShares(btn){ if(!confirm('Revoke ALL share links? Anyone using one loses access immediately.'))return; btn.disabled=true; try{ await fetch('/api/shares/revoke_all',{method:'POST'}); }catch(e){} btn.disabled=false; loadShares(); }
 
+/* ---- users & access (owner/admin) ---- */
+const ROLES=[['view','View'],['operate','Operate'],['config','Config'],['admin','Admin']];
+let _usrBots=[];
+function roleRadiosHtml(grp){
+  return '<div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;font-size:.82rem"><span class="hint">Role</span>'+
+    ROLES.map(r=>'<label class="rrow"><input type="radio" name="'+grp+'" value="'+r[0]+'"'+(r[0]==='view'?' checked':'')+' style="width:auto" onchange="syncRole(\''+grp+'\')"> '+r[1]+'</label>').join('')+
+    '<span class="hint" style="flex-basis:100%;margin:.1rem 0 0">Admin = full control (a second owner). View/Operate/Config are scoped to the bots you pick.</span></div>';
+}
+function scopeHtml(idp){
+  return '<div id="'+idp+'Wrap"><label class="rrow"><input type="checkbox" id="'+idp+'All" style="width:auto" onchange="syncScope(\''+idp+'\')"> All bots (current + future)</label>'+
+    '<div id="'+idp+'BotsWrap"><div style="color:var(--dim);font-size:.8rem;margin:.25rem 0">Bots</div><div id="'+idp+'Bots" class="shbots"><span class="hint">loading…</span></div></div></div>';
+}
+function getRole(grp){ const el=document.querySelector('input[name='+grp+']:checked'); return el?el.value:'view'; }
+function syncRole(grp){
+  const idp = grp==='roleA'?'usA':'usI';
+  const admin = getRole(grp)==='admin';
+  const all=$(idp+'All'); if(all){ if(admin) all.checked=true; all.disabled=admin; $(idp+'Wrap').style.opacity=admin?.55:1; syncScope(idp); }
+}
+function syncScope(idp){ const on=$(idp+'All').checked; const w=$(idp+'BotsWrap'); if(w){ w.style.opacity=on?.4:1; w.style.pointerEvents=on?'none':'auto'; } }
+function gatherScope(idp){
+  return {all:$(idp+'All').checked, targets:[...$(idp+'Bots').querySelectorAll('input:checked')].map(c=>({node:c.dataset.node||null,name:c.value}))};
+}
+function botCheckboxes(){ return _usrBots.map(i=>'<label class="shbot"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto"> '+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</label>').join('')||'<span class="hint">No bots.</span>'; }
+async function openUsers(){
+  $('usersScrim').classList.add('open'); $('usrMsg').textContent=''; $('invMsg').textContent=''; $('invResult').style.display='none';
+  $('usrRole_add').innerHTML=roleRadiosHtml('roleA'); $('usrScope_add').innerHTML=scopeHtml('usA');
+  $('usrRole_inv').innerHTML=roleRadiosHtml('roleI'); $('usrScope_inv').innerHTML=scopeHtml('usI');
+  await loadUserBots(); syncRole('roleA'); syncRole('roleI'); loadUsers();
+}
+function closeUsers(e){ if(!e||e.target.id==='usersScrim') $('usersScrim').classList.remove('open'); }
+async function loadUserBots(){
+  try{ const d=await (await fetch('/api/instances')).json(); _usrBots=d.instances||[]; }catch(e){ _usrBots=[]; }
+  ['usA','usI'].forEach(idp=>{ const el=$(idp+'Bots'); if(el) el.innerHTML=botCheckboxes(); });
+}
+async function addUser(btn){
+  const username=$('usrName').value.trim(), password=$('usrPass').value, role=getRole('roleA'), sc=gatherScope('usA');
+  if(!username){ $('usrMsg').textContent='enter a username'; return; }
+  if(!password||password.length<6){ $('usrMsg').textContent='password must be at least 6 characters'; return; }
+  if(role!=='admin' && !sc.all && !sc.targets.length){ $('usrMsg').textContent='pick at least one bot, or All'; return; }
+  btn.disabled=true; $('usrMsg').textContent='Adding…';
+  const d=await api('/api/users','POST',{username,password,role,all:sc.all,targets:sc.targets});
+  btn.disabled=false;
+  if(d.error){ $('usrMsg').innerHTML='<span style="color:var(--crash)">'+esc(d.error)+'</span>'; return; }
+  $('usrMsg').textContent='Added '+username+'.'; $('usrName').value=''; $('usrPass').value=''; loadUsers();
+}
+async function createInvite(btn){
+  const role=getRole('roleI'), sc=gatherScope('usI'), username=$('invName').value.trim(), ttl=$('invTtl').value;
+  if(role!=='admin' && !sc.all && !sc.targets.length){ $('invMsg').textContent='pick at least one bot, or All'; return; }
+  btn.disabled=true; $('invMsg').textContent='Creating…';
+  const d=await api('/api/invites','POST',{role,all:sc.all,targets:sc.targets,username:username||null,ttl_days:ttl?Number(ttl):null});
+  btn.disabled=false;
+  if(d.error){ $('invMsg').innerHTML='<span style="color:var(--crash)">'+esc(d.error)+'</span>'; return; }
+  $('invMsg').textContent='';
+  const r=$('invResult'); r.style.display='block';
+  r.innerHTML='<div class="shurl"><div style="font-size:.74rem;color:var(--dim);margin-bottom:.3rem">One-time invite link — copy it now, it won\'t be shown again:</div><div style="display:flex;gap:.4rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="copyText(\''+jsq(d.url)+'\',this)">Copy</button></div></div>';
+  loadUsers();
+}
+function scopeSummary(u){ return u.all?'all bots':((u.targets||[]).map(t=>t.name).join(', ')||'no bots'); }
+async function loadUsers(){
+  let d; try{ d=await (await fetch('/api/users')).json(); }catch(e){ return; }
+  const us=d.users||[];
+  $('usrList').innerHTML = us.length? us.map(u=>{
+    const opts=ROLES.map(r=>'<option value="'+r[0]+'"'+(u.role===r[0]?' selected':'')+'>'+r[1]+'</option>').join('');
+    const last=u.last_login?('last in '+new Date(u.last_login*1000).toLocaleDateString()):'never signed in';
+    const dis=u.disabled?'<span style="color:var(--crash)">disabled</span> · ':'';
+    return '<div class="shrow" style="flex-wrap:wrap;gap:.4rem"><b style="min-width:6rem">'+esc(u.username)+'</b>'+
+      '<select onchange="changeRole(\''+u.id+'\',this.value)" style="width:auto">'+opts+'</select>'+
+      '<span class="hint" style="flex:1;min-width:8rem">'+esc(scopeSummary(u))+' · '+dis+last+'</span>'+
+      '<button onclick="resetPw(\''+u.id+'\',\''+jsq(u.username)+'\')">Reset pw</button>'+
+      '<button onclick="toggleDisable(\''+u.id+'\','+(u.disabled?'false':'true')+')">'+(u.disabled?'Enable':'Disable')+'</button>'+
+      '<button class="danger" onclick="delUser(\''+u.id+'\',\''+jsq(u.username)+'\')">Delete</button></div>';
+  }).join('') : '<span class="hint">No users yet. Add one above, or send an invite link.</span>';
+  const invs=d.invites||[];
+  $('invList').innerHTML = invs.length? invs.map(i=>{
+    const exp=i.expires?('expires '+new Date(i.expires*1000).toLocaleDateString()):'never expires';
+    return '<div class="shrow"><span style="flex:1">'+esc(i.role)+' · '+esc(scopeSummary(i))+(i.username?(' · for '+esc(i.username)):'')+' <span class="hint">('+exp+')</span></span><button class="danger" onclick="revokeInvite(\''+i.id+'\')">Revoke</button></div>';
+  }).join('') : '<span class="hint">None.</span>';
+}
+async function changeRole(id,role){ const d=await api('/api/users/'+id,'POST',{role}); if(d&&d.error)alert(d.error); loadUsers(); }
+async function toggleDisable(id,dis){ const d=await api('/api/users/'+id,'POST',{disabled:dis}); if(d&&d.error)alert(d.error); loadUsers(); }
+async function delUser(id,name){ if(!confirm('Delete user "'+name+'"? They lose access immediately.'))return; const d=await api('/api/users/'+id+'/delete','POST',{}); if(d&&d.error)alert(d.error); loadUsers(); }
+async function resetPw(id,name){ const pw=prompt('New password for "'+name+'" (min 6 chars):'); if(!pw)return; const d=await api('/api/users/'+id+'/password','POST',{password:pw}); if(d&&d.error)alert(d.error); else alert('Password reset — their other sessions were signed out.'); }
+async function revokeInvite(id){ const d=await api('/api/invites/'+id+'/revoke','POST',{}); if(d&&d.error)alert(d.error); loadUsers(); }
+
 /* ---- principal gating (owner vs scoped guest) ---- */
 async function applyPrincipal(){
   let d; try{ d=await (await fetch('/api/authstatus')).json(); }catch(e){ return; }
   const p=d.principal||'owner';
-  if(p==='guest'){
-    document.body.classList.add('guest','guest-'+(d.capability||'view'));
-    const b=$('guestBadge'); if(b){ b.style.display='inline-flex'; b.textContent='Guest · '+(d.capability||'view'); }
+  // a named non-admin user is gated exactly like a guest link (same scope/capability tiers);
+  // an admin user is owner-equivalent (full UI). Anonymous guests unchanged.
+  const scoped = (p==='guest') || (p==='user' && !d.is_admin);
+  const b=$('guestBadge');
+  if(scoped){
+    const cap=d.capability||'view';
+    document.body.classList.add('guest','guest-'+cap);
+    if(b){ b.style.display='inline-flex'; b.textContent=(p==='user')?(d.username+' · '+(d.role||cap)):('Guest · '+cap); }
     // belt-and-suspenders: hide any owner-only control the layout built without the class
     document.querySelectorAll('button[onclick]').forEach(el=>{
-      if(/open(Settings|Connection|Boxes|Files|Proxies|Scan|Deploy|Shares)\(|bulk\(/.test(el.getAttribute('onclick')||'')) el.classList.add('owner-only');
+      if(/open(Settings|Connection|Boxes|Files|Proxies|Scan|Deploy|Shares|Users)\(|bulk\(/.test(el.getAttribute('onclick')||'')) el.classList.add('owner-only');
     });
+  } else if(p==='user' && d.is_admin && b){
+    b.style.display='inline-flex'; b.textContent=d.username+' · admin';
   }
 }
 

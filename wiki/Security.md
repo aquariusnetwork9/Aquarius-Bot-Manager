@@ -15,7 +15,7 @@ Anyone who can use the web UI can:
 - **Reboot the box or run OS updates** — *if* System Actions are enabled (off by default).
 - **Read your proxy pool and Webshare token** by viewing configs / `instances.json` through the file manager.
 
-**Treat dashboard access as equivalent to a shell on the box.** There is no "read-only" or "limited" user role.
+**Treat owner/admin dashboard access as equivalent to a shell on the box.** (Scoped roles — view/operate/config — and guest links *do* limit what a person can reach; see *Named user accounts* and *Shareable-link guest access* below. But the owner and any **admin** user have full control.)
 
 ---
 
@@ -57,6 +57,20 @@ Beyond the single owner login, you can hand out **scoped guest links** (owner he
 - **HTTPS advisory**: the token travels over whatever transport the manager is exposed on. Use an HTTPS access mode (or keep it tunnel-only) **before sharing a link externally**. Recent guest actions are logged to an in-memory ring buffer shown in the Share panel.
 
 > Guest access is **`manager.py`-only** — it scopes the dashboard/control plane. The proxy bots themselves are unchanged.
+
+---
+
+## Named user accounts
+
+Beyond the single owner and anonymous share links (above), you can give people **their own login** (owner/admin → **👤 Users**). Each account has a **role** and, for non-admin roles, a **scope** of specific bots.
+
+- **Roles:** **view** (read-only) · **operate** (+ start/stop/restart, console commands, module toggles) · **config** (+ edit `config.json` / proxy / limits / autostart and live `/control/config`) · **admin** (full control — **a second owner**, who can also manage users/settings/deploy/system). The first three map exactly to the guest-link capability tiers; admin is owner-equivalent.
+- **Scope (non-admin):** fleet-wide, or a specific set of bots (including bots on remote boxes). Enforced on **every request** — an out-of-scope bot returns **404** (indistinguishable from missing), owner-only actions return **403**. Admins are implicitly fleet-wide.
+- **Provisioning:** create a user with a password directly, **or** generate a **one-time invite link** with a preset role + scope (and optional preset username + expiry). The invitee opens it, sets their own password, and the link is consumed — no password handoff. Invite tokens are 256-bit; only the **sha256** is stored and the full link is shown once.
+- **Live control:** role/scope edits, **disable**, **delete**, and **password reset** all take effect immediately — a logged-in user's session is re-validated from disk each request (a reset bumps a per-user generation so their *other* sessions drop too). Passwords are salted **PBKDF2** hashes, never plaintext.
+- **Owner account is separate** (`settings.auth`, not in the user list) and always full-access. There is no API to change the owner password — only the first-run wizard or the `abm setpassword` CLI on the box — so an admin user cannot lock the owner out.
+
+> Like guest links, named accounts are **`manager.py`-only** and scope the dashboard/control plane; the proxy bots are unchanged.
 
 ---
 
@@ -131,7 +145,7 @@ The manager uses `sudo -n` (non-interactive), so if sudo isn't configured it fai
 
 ## 7. Scope / honest limitations
 
-- There is **no role separation** — every authenticated user is an admin.
+- **Roles exist** (see *Named user accounts* and *Shareable-link guest access* above): view/operate/config/admin, scoped per user. The **owner** and any **admin** user have full control of the host (a shell-equivalent). Non-admin roles are scoped, but treat anyone you grant operate/config to as trusted on their bots.
 - Secrets at rest are protected by **file permissions**, not encryption. There is no secret vault.
 - The tool does what you tell it on **one host**; it has no audit log of who did what.
 - It does not make bots undetectable and does not change any game server's rules — compliance with those rules and with your proxy provider's terms is on you.

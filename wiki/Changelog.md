@@ -2,7 +2,14 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.4.2 — *latest*
+## v3.5.0 — *latest*
+
+- **Named user accounts with roles (multi-user RBAC).** Beyond the single owner login and anonymous share links, you can now give people their **own username + password** with a role and a set of bots — open **👤 Users** (owner/admin only). Roles: **View** (read-only) · **Operate** (+ start/stop/restart, console commands, module toggles) · **Config** (+ edit settings / live config) · **Admin** (full control — a second owner who can also manage users). Each non-admin user is **scoped to the bots you pick** (or fleet-wide), enforced on every request exactly like share links — out-of-scope bots return 404, owner-only actions return 403.
+  - **Two ways to add people:** create a user directly (set their password), or generate a **one-time invite link** with a preset role + bots — they open it, choose their own password, and they're in (no password handoff). Invites can carry a preset username and an expiry.
+  - **Live control:** change a user's role, **disable** (instant lockout), **reset their password** (signs out their other sessions), or **delete** them — all take effect immediately, even mid-session. Passwords are stored as salted **PBKDF2** hashes, never plaintext; the owner account stays separate and always full-access.
+  - `manager.py`-only — the proxy bots are untouched. See **[Security → Named user accounts](Security#named-user-accounts)**.
+
+## v3.4.2
 
 - **Fix: choosing/enabling a tunnel provider could time out** (Tailscale especially). Two causes, both fixed: (1) the install (a tens-of-MB download) and the Tailscale start (`tailscaled` + `tailscale up` + funnel) ran **synchronously in the web request**, so the browser gave up before they finished — both now run in the **background** and the panel shows live "setting up… / waiting for sign-in…" progress; (2) with a remote box selected in the switcher, the public-sharing call was being **proxied to that node** (with a short timeout) instead of staying on the dashboard you're actually exposing — public-sharing requests are now always controller-local.
 
