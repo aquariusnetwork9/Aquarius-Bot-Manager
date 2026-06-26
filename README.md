@@ -1,10 +1,12 @@
 # Aquarius Bot Manager
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.6.0-blue.svg" alt="Version"/>
-  <img src="https://img.shields.io/badge/python-3.8+_stdlib_only-3776AB.svg" alt="Python"/>
-  <img src="https://img.shields.io/badge/runs_on-Linux_+_tmux-444.svg" alt="Platform"/>
-  <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="No dependencies"/>
+  <a href="https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases"><img src="https://img.shields.io/github/v/release/aquariusnetwork9/Aquarius-Bot-Manager?label=release&color=blue" alt="Latest release"/></a>
+  <img src="https://img.shields.io/badge/Minecraft-1.21.4-brightgreen.svg" alt="Minecraft 1.21.4"/>
+  <a href="https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases"><img src="https://img.shields.io/github/downloads/aquariusnetwork9/Aquarius-Bot-Manager/total.svg?label=downloads&color=success" alt="Downloads"/></a>
+  <a href="https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/stargazers"><img src="https://img.shields.io/github/stars/aquariusnetwork9/Aquarius-Bot-Manager?label=stars&style=flat" alt="Stars"/></a>
+  <a href="https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/commits/main"><img src="https://img.shields.io/github/last-commit/aquariusnetwork9/Aquarius-Bot-Manager" alt="Last commit"/></a>
+  <img src="https://img.shields.io/badge/python-3.8+_stdlib_only-3776AB.svg" alt="Python stdlib only"/>
 </p>
 
 **Aquarius Bot Manager (ABM)** is a control plane for a whole VPS — or a whole *fleet* of VPSes — of **[AquariusProxy](https://github.com/aquariusnetwork9/AquariusProxy)** and **[ZenithProxy](https://github.com/rfresh2/ZenithProxy)** bots, each in its own tmux session, driven from a CLI and a web UI. Spin up a fresh box, install the manager, deploy proxies, then monitor and operate them. Pure Python stdlib + tmux — no pip installs, no Docker.
