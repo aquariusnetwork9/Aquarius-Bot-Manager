@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2426,7 +2426,7 @@ def audit_guest(entry):
 # process tunnelling to our loopback port. So a guest link can be handed to someone
 # who's never touched the VPS and they just click it. The URL is ephemeral (it
 # changes whenever the tunnel restarts) — fine for the expiry/revoke share model.
-_CF_URL_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
+_CF_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 _CF_DL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 
@@ -2439,6 +2439,7 @@ class _ShareTunnel:
         self.error = None
         self.port = None
         self._mon = None
+        self.logfile = os.path.join(os.path.expanduser("~"), ".aquarius", "tunnel.log")
 
     def bin_path(self):
         # prefer a system cloudflared; else our cached copy
@@ -2462,10 +2463,42 @@ class _ShareTunnel:
         os.replace(tmp, p)
         return p
 
+    def _pid_for(self, port):
+        """PID of a running cloudflared quick tunnel for this port, or None. Used so the tunnel can be
+        *adopted* across manager restarts (it runs in its own session and outlives us) instead of respawned
+        — which keeps the same public URL through selfupdates; it only re-rolls on a reboot or crash."""
+        if not port:
+            return None
+        try:
+            r = subprocess.run(["pgrep", "-f", f"cloudflared .*--url http://127.0.0.1:{port}"],
+                               capture_output=True, text=True, timeout=8)
+            pids = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+            return pids[0] if pids else None
+        except Exception:
+            return None
+
+    def _url_from_log(self):
+        try:
+            with open(self.logfile, "r", errors="replace") as f:
+                found = _CF_URL_RE.findall(f.read())
+            return found[-1] if found else None
+        except OSError:
+            return None
+
+    def _spawn(self, port, binp):
+        os.makedirs(os.path.dirname(self.logfile), exist_ok=True)
+        logf = open(self.logfile, "wb")          # truncate — only the current tunnel's URL lives here
+        try:
+            subprocess.Popen([binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+                             stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        finally:
+            logf.close()
+
     def status(self):
         with self.lock:
-            running = bool(self.proc and self.proc.poll() is None)
-            return {"enabled": self.enabled, "running": running, "url": self.url, "error": self.error}
+            port, enabled, url, err = self.port, self.enabled, self.url, self.error
+        running = bool(enabled and self._pid_for(port))
+        return {"enabled": enabled, "running": running, "url": url, "error": err}
 
     def start(self, port):
         with self.lock:
@@ -2478,19 +2511,16 @@ class _ShareTunnel:
             with self.lock:
                 self.error = "cloudflared download failed: " + str(e)[:160]
             return self.status()
-        # clean up any orphaned tunnel for this port (manager uses KillMode=process,
-        # so a prior child can outlive a manager restart)
-        try:
-            subprocess.run(["pkill", "-f", f"cloudflared .*--url http://127.0.0.1:{port}"],
-                           timeout=8)
-        except Exception:
-            pass
-        time.sleep(0.4)
+        # adopt an already-running tunnel (survived a manager restart) instead of respawning it
+        if self._pid_for(port) is None:
+            try:
+                self._spawn(port, binp)
+            except Exception as e:
+                with self.lock:
+                    self.error = str(e)[:160]
+                return self.status()
         with self.lock:
-            self.url = None
-            self.proc = subprocess.Popen(
-                [binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+            self.url = self._url_from_log()
             if self._mon is None or not self._mon.is_alive():
                 self._mon = threading.Thread(target=self._monitor, daemon=True)
                 self._mon.start()
@@ -2500,47 +2530,41 @@ class _ShareTunnel:
         with self.lock:
             self.enabled = False
             self.url = None
-            p, self.proc = self.proc, None
-            port = self.port
-        if p:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+            self.proc = None
+        # port-agnostic: matches exactly how we spawn it, so cleanup never depends on self.port
+        # being set (e.g. a stop right after a manager restart, before any start())
         try:
-            if port:
-                subprocess.run(["pkill", "-f", f"cloudflared .*--url http://127.0.0.1:{port}"],
-                               timeout=8)
+            subprocess.run(["pkill", "-f", "cloudflared tunnel --no-autoupdate --url"], timeout=8)
         except Exception:
+            pass
+        try:
+            os.remove(self.logfile)
+        except OSError:
             pass
         return self.status()
 
     def _monitor(self):
-        """Read cloudflared output for the assigned URL; restart it if it dies while enabled."""
+        """Keep self.url fresh from the tunnel log; relaunch (fresh URL) if it dies while still enabled."""
         while True:
             with self.lock:
-                p, enabled, port = self.proc, self.enabled, self.port
+                enabled, port = self.enabled, self.port
             if not enabled:
                 return
-            if p is None:
-                time.sleep(1)
-                continue
-            line = p.stdout.readline() if p.stdout else b""
-            if line:
-                m = _CF_URL_RE.search(line)
-                if m:
-                    with self.lock:
-                        self.url = m.group(0).decode()
-                continue
-            # readline returned empty: process likely exited
-            if p.poll() is not None:
+            u = self._url_from_log()
+            if u:
                 with self.lock:
-                    still = self.enabled
-                if not still:
-                    return
-                time.sleep(2)              # crashed/ended while enabled — relaunch with a fresh URL
-                self.start(port)
-                return
+                    self.url = u
+            if self._pid_for(port) is None:       # died while enabled — relaunch (gets a new URL)
+                with self.lock:
+                    if not self.enabled:
+                        return
+                    self.url = None
+                try:
+                    self._spawn(port, self.bin_path())
+                except Exception:
+                    pass
+                time.sleep(3)
+            time.sleep(1.5)
 
 
 SHARE_TUNNEL = _ShareTunnel()

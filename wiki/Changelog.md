@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.3.0 — *latest*
+## v3.3.1 — *latest*
+
+- **Public sharing: the tunnel URL now stays stable.** The Cloudflare quick tunnel runs detached and ABM **adopts** the running tunnel across manager updates/restarts instead of respawning it — so the public address (and therefore your share links) only changes on an actual VPS reboot or crash, not every time the manager restarts. Teardown is also more reliable. *(No domain needed — this is the no-account, no-domain option. For a URL that survives even reboots without a domain, a Tailscale-Funnel mode can be added.)*
+
+## v3.3.0
 
 - **One-click public sharing for guest links.** Guest links only work for people who can reach the dashboard — which, on the default SSH-tunnel setup, is just you. The Share panel now has a **Public sharing** toggle: flip it on and ABM spins up a **Cloudflare quick tunnel** (downloads `cloudflared`, runs it, no account/domain/cert) to give the dashboard a public HTTPS address. Every link you create then uses that address, so someone who's never touched your VPS can click it and land straight in, scoped to their bots. Requires a dashboard password (it refuses to expose an open/no-login dashboard). The quick-tunnel URL is **ephemeral** (changes if the tunnel restarts), so generate links fresh; a stable named-tunnel mode is coming.
 
