@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.2.2"
+__version__ = "3.2.3"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6294,7 +6294,8 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .content{flex:1;min-width:0;display:flex;flex-direction:column}
 .app.has-side .content main{max-width:none;margin:0;width:100%}
 .side{flex:none;background:linear-gradient(180deg,var(--panel),var(--panel-2));
-  border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;width:238px}
+  border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;width:238px;
+  overflow-y:auto}
 .app.right .side{border-right:none;border-left:1px solid var(--line)}
 .sbrand{display:flex;align-items:center;gap:.6rem;padding:1.05rem 1rem .7rem;font-weight:800;letter-spacing:-.02em;font-size:1.02rem}
 .sbrand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc);flex:none}
