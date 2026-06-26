@@ -2,7 +2,13 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.1.0 — *latest*
+## v3.2.0 — *latest*
+
+- **Shareable-link guest access (tiered).** Hand someone a single URL that lets them operate **only the bots you choose**, at a capability tier — **View** (read-only) / **Operate** (+ start/stop/restart + console commands) / **Config** (+ edit settings). No guest accounts, no password handout. Open the **👥 Share** panel (owner header) to create a link (pick bots — including bots on remote boxes — a capability, and an expiry), copy it **once** (only its hash is stored), and share it. Manage or **revoke** links anytime; **Revoke all** kills every active link instantly.
+  - **Security:** the grant is re-checked on **every request**, so expiry/revoke/scope-edits take effect immediately — even for a guest who's already in. Out-of-scope bots return 404 (indistinguishable from missing); guests can never list/switch boxes, see node credentials, or touch fleet/owner settings (delete, rename, deploy, proxies, system are owner-only). Redemption is rate-limited; the link travels over whatever transport the manager is exposed on, so use an HTTPS access mode before sharing externally. Recent guest activity is shown in the Share panel.
+  - The control surface honors the same tiers (a View guest sees a read-only ⚙ Live configuration and no command runner). `manager.py`-only — the proxy bots are untouched.
+
+## v3.1.0
 
 - **Live configuration editing in the Control Surface.** Each module now has a **⚙ Live configuration** panel that reads the bot's *real* config and writes single fields back to the running bot instantly (toggles, numbers, text), persisted to its config — no restart. Powered by new bot-side endpoints `GET /control/config` (the live tree with **all secrets redacted** — auth/proxy/discord/db passwords + tokens are never exposed) and `POST /control/config` `{path,value}` (sets one field by dot-path; secret paths are refused). The friendly mockup subcards stay as a read-only overview above it. Requires a bot on **AquariusProxy 5.7.0+** with `server.viewer.control=true`.
 

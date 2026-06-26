@@ -45,6 +45,21 @@ If you must expose it directly, put it behind TLS (the HTTPS installer mode does
 
 ---
 
+## 3a. Shareable-link guest access (v3.2.0)
+
+Beyond the single owner login, you can hand out **scoped guest links** (owner header → **👥 Share**). A link grants access to **only the bots you pick**, at a capability tier, and the bearer of the link is the credential — there are no guest accounts.
+
+- **Capability tiers** (`view < operate < config`): **view** = read-only (logs, live viewer/map, config read); **operate** = + start/stop/restart + console commands + module toggles; **config** = + edit `config.json` / proxy / limits / autostart and the live `/control/config`. **Owner-only at every tier:** delete, rename, deploy, adopt, add, proxies bulk/import, box switching, fleet/node management, settings, backup/restore, system actions.
+- **Tokens**: a 256-bit `token_urlsafe`; only its **sha256 is stored** (`settings.shares`). The full URL is revealed **once** at creation and never again. Compared with `hmac.compare_digest`.
+- **Enforced on every request**: the grant is re-validated from disk each call, so **expiry, revoke, and scope edits take effect immediately** — even for a guest whose session is already live. **Revoke all** bumps `shares_epoch` and kills every guest at once (an owner password change does too).
+- **Enumeration-resistant**: a bot outside the grant returns **404**, identical to a missing bot. Guests are **blocked from box-switching and never receive node credentials** — access to a bot on another box is mediated by the controller with the owner's creds, which the guest never sees.
+- **Rate-limited** redemption (shares the login limiter: 5 bad `/s/<token>` per 5 min per IP). Redemption sets a `SameSite=Lax` cookie (so a link clicked from chat/email works) — still CSRF-safe for the mutating POSTs; the owner login stays `Strict`.
+- **HTTPS advisory**: the token travels over whatever transport the manager is exposed on. Use an HTTPS access mode (or keep it tunnel-only) **before sharing a link externally**. Recent guest actions are logged to an in-memory ring buffer shown in the Share panel.
+
+> Guest access is **`manager.py`-only** — it scopes the dashboard/control plane. The proxy bots themselves are unchanged.
+
+---
+
 ## 4. What's stored on disk (`instances.json`)
 
 This single file holds, in one place:
