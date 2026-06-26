@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -8212,6 +8212,7 @@ function navModel(){
     {ic:'🌐',lbl:'Proxies',act:'openProxies()'},
     {ic:'➕',lbl:'Add Bot',act:'openDeploy()'},
     {ic:'📁',lbl:'Files',act:'openFiles()'},
+    {ic:'👥',lbl:'Share',act:'openShares()'},
     {g:'System'},
     {ic:'🔗',lbl:'Connect',act:'openConnection()'},
     {ic:'⟲',lbl:'Scan',act:'openScan()'},
@@ -8643,6 +8644,7 @@ function palItems(){
   const modal=[
     {ic:'🖥',lbl:'Boxes',go:()=>openBoxes()},{ic:'🌐',lbl:'Proxies',go:()=>openProxies()},
     {ic:'➕',lbl:'Add Bot',go:()=>openDeploy()},{ic:'📁',lbl:'Files',go:()=>openFiles()},
+    {ic:'👥',lbl:'Share',go:()=>openShares()},
     {ic:'🔗',lbl:'Connect',go:()=>openConnection()},{ic:'⟲',lbl:'Scan existing',go:()=>openScan()},
     {ic:'⚙',lbl:'Settings',go:()=>openSettings()},
   ];
