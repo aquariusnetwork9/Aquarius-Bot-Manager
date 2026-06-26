@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.4.1 — *latest*
+## v3.4.2 — *latest*
+
+- **Fix: choosing/enabling a tunnel provider could time out** (Tailscale especially). Two causes, both fixed: (1) the install (a tens-of-MB download) and the Tailscale start (`tailscaled` + `tailscale up` + funnel) ran **synchronously in the web request**, so the browser gave up before they finished — both now run in the **background** and the panel shows live "setting up… / waiting for sign-in…" progress; (2) with a remote box selected in the switcher, the public-sharing call was being **proxied to that node** (with a short timeout) instead of staying on the dashboard you're actually exposing — public-sharing requests are now always controller-local.
+
+## v3.4.1
 
 - **Public sharing: pick from a dropdown, and ABM installs the provider for you.** The provider list is now a **dropdown** that reveals a single card for whatever you choose (instead of five stacked option boxes). And when you pick a provider that needs a helper installed, **ABM downloads and sets it up automatically — no root, no manual steps**:
   - **Cloudflare** (quick & domain) → fetches `cloudflared`; **ngrok** → fetches the ngrok binary; **Tailscale** → downloads the static binaries and runs it in **userspace** (so it needs no root and no system service), then shows you a one-time **sign-in link** and brings the funnel up automatically once you've signed in.

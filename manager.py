@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.4.1"
+__version__ = "3.4.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3041,6 +3041,8 @@ class Tailscale:
         self.auth_url = None
         self.port = None
         self._mon = None
+        self._worker = None
+        self.installing = False
 
     def _bin(self, name):
         for c in ("/usr/bin/" + name, "/usr/local/bin/" + name):
@@ -3150,19 +3152,40 @@ class Tailscale:
                 "installed": True, "error": self.error}
 
     def start(self, port, conf):
+        # NON-BLOCKING: everything slow (download, daemon, `tailscale up`, funnel) runs in a background
+        # worker so the HTTP request returns instantly; the UI polls status for progress/login/URL.
         with self.lock:
             self.enabled = True
             self.error = None
             self.port = port
-        if not self.installed() and not self.install():
-            return self.status(conf)
+        self._start_worker()
+        return self.status(conf)
+
+    def _start_worker(self):
+        with self.lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+
+    def _run(self):
+        if not self.installed():
+            with self.lock:
+                self.installing = True
+            try:
+                ok = self.install()
+            finally:
+                with self.lock:
+                    self.installing = False
+            if not ok:
+                return
         self._ensure_daemon()
         d = self._status_json()
         if d.get("BackendState") in (None, "NoState", "NeedsLogin"):
-            # kick off login and capture the auth URL for the UI (returns after the timeout)
+            # kick off login and capture the auth URL for the UI (returns after the short timeout)
             try:
                 r = subprocess.run(self._ts_args("up", "--hostname=aquarius-bots", "--timeout=8s"),
-                                   capture_output=True, text=True, timeout=20)
+                                   capture_output=True, text=True, timeout=25)
                 out = (r.stderr or "") + (r.stdout or "")
                 mu = re.search(r"https://login\.tailscale\.com/\S+", out)
                 if mu:
@@ -3170,11 +3193,7 @@ class Tailscale:
                         self.auth_url = mu.group(0)
             except Exception:
                 pass
-            self._start_monitor()
-            return self.status(conf)
-        self._funnel_up(port)
-        self._start_monitor()
-        return self.status(conf)
+        self._monitor()        # loops while enabled: brings the funnel up once signed in
 
     def _funnel_up(self, port):
         try:
@@ -3189,13 +3208,6 @@ class Tailscale:
         except Exception as e:
             with self.lock:
                 self.error = str(e)[:200]
-
-    def _start_monitor(self):
-        with self.lock:
-            if self._mon is not None and self._mon.is_alive():
-                return
-            self._mon = threading.Thread(target=self._monitor, daemon=True)
-            self._mon.start()
 
     def _monitor(self):
         """While enabled, once the user has signed in, bring the funnel up automatically."""
@@ -3272,6 +3284,22 @@ class _ShareManager:
         self.providers = {p.id: p for p in provs}
         self.order = [p.id for p in provs]
         self._last_active = None
+        self._installing = set()        # provider ids whose (async) install is in flight
+
+    def install_async(self, cfg, pid):
+        """Kick off a provider install in the background (downloads can take many seconds — never block
+        the HTTP request on them). Returns immediately; status()/catalog() report installing=True until done."""
+        prov = self.providers.get(pid)
+        if not prov or pid in self._installing:
+            return
+        conf = self.conf_for(cfg, pid)
+        self._installing.add(pid)
+        def _do():
+            try:
+                prov.install(conf)
+            finally:
+                self._installing.discard(pid)
+        threading.Thread(target=_do, daemon=True).start()
 
     def _ps(self, cfg):
         return (cfg["raw"].get("settings", {}) or {}).get("public_share", {}) or {}
@@ -3288,10 +3316,12 @@ class _ShareManager:
 
     def status(self, cfg):
         pid = self.active_id(cfg)
-        st = self.providers[pid].status(self.conf_for(cfg, pid))
+        p = self.providers[pid]
+        st = p.status(self.conf_for(cfg, pid))
         st["provider"] = pid
         st["enabled"] = self.enabled(cfg)
         st["running"] = bool(st.get("running") and self.enabled(cfg))
+        st["installing"] = (pid in self._installing) or bool(getattr(p, "installing", False))
         return st
 
     def _public_conf(self, p, conf):
@@ -3315,6 +3345,7 @@ class _ShareManager:
                         "needs": [dict(n) for n in getattr(p, "needs", [])],
                         "installable": bool(getattr(p, "installable", True)),
                         "installed": bool(inst),
+                        "installing": (pid in self._installing) or bool(getattr(p, "installing", False)),
                         "config": self._public_conf(p, self.conf_for(cfg, pid))})
         return out
 
@@ -4691,12 +4722,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- authorization guards (owner vs scoped guest) ----
     def _is_owner(self, princ):
-        return princ is not None and princ.get("type") == "owner"
+        # the configured owner, OR a named user with the admin role (admin = a second owner)
+        if princ is None:
+            return False
+        if princ.get("type") == "owner":
+            return True
+        return princ.get("type") == "user" and princ.get("role") == "admin"
 
     def _cap_ok(self, princ, level):
         if princ is None:
             return False
-        if princ["type"] == "owner":
+        if self._is_owner(princ):
             return True
         return CAP_RANK.get(princ["scope"].get("capability"), -1) >= CAP_RANK.get(level, 99)
 
@@ -4775,10 +4811,14 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _guest_gate(self, princ, path, method, q):
-        """Enforce a guest's scope for this request. Returns (allow, node): allow=False means a response
-        was already sent; node is the box to route instance requests to (None=local). Owners pass through."""
-        if not princ or princ["type"] != "guest":
-            return True, self._selected_node()      # owner: cookie-driven node as today
+        """Enforce a scoped principal's reach for this request. Returns (allow, node): allow=False means a
+        response was already sent; node is the box to route instance requests to (None=local). Owners
+        (incl. admin users) pass through unchanged. Anonymous guest links AND named non-admin users share
+        the same scope={targets,all,capability} gating."""
+        if self._is_owner(princ):
+            return True, self._selected_node()      # owner/admin: cookie-driven node as today
+        if not princ or princ.get("type") not in ("guest", "user"):
+            return True, self._selected_node()
         cls = self._classify_guest(path, method, q)
         if cls is None:
             self._json({"error": "forbidden"}, 403)
@@ -4790,8 +4830,9 @@ class Handler(BaseHTTPRequestHandler):
                 return False, None                  # 404 sent
             if not self._guard_cap(princ, tier):
                 return False, None                  # 403 sent
-            if method == "POST":                     # audit guest mutations (best-effort)
-                audit_guest({"ts": time.time(), "grant_id": princ.get("grant_id"),
+            if method == "POST":                     # audit scoped mutations (best-effort)
+                audit_guest({"ts": time.time(), "grant_id": princ.get("grant_id") or princ.get("uid"),
+                             "user": princ.get("username"),
                              "ip": self._client_ip(), "path": path, "target": name, "tier": tier})
             return True, gnode                       # route to the bot's box (None=local)
         return True, None                            # 'open' → handled locally
@@ -4944,7 +4985,8 @@ class Handler(BaseHTTPRequestHandler):
                 or path.startswith("/api/node/")     # /api/node/select
                 or path.startswith("/api/nodes")     # /api/nodes, .../remove, .../do*
                 or path.startswith("/api/fleet/")
-                or path.startswith("/api/shares"))   # share grants live on the controller
+                or path.startswith("/api/shares")    # share grants live on the controller
+                or path.startswith("/api/share/"))   # public-sharing tunnel exposes THIS dashboard, never a node
 
     def _inject_switcher_str(self, text, current, label=""):
         if "<body>" not in text or "abmNodeBar" in text:
@@ -5734,20 +5776,24 @@ class Handler(BaseHTTPRequestHandler):
                                                 "otherwise expose full control to anyone with the URL."}, 400)
                 ps["enabled"] = enable
             elif action == "install":
-                # download / set up the chosen provider's helper now (so picking it is one-and-done).
-                # No settings change and no reconcile — just fetch the binary and report back.
+                # download / set up the chosen provider's helper in the BACKGROUND (downloads are tens of
+                # MB and would otherwise block the request long enough for the browser to time out). Return
+                # immediately; the UI polls until catalog.installed flips true. No settings change / reconcile.
                 pid = p.get("provider")
                 prov = SHARE.providers.get(pid)
                 if not prov:
                     return self._json({"error": "unknown provider"}, 400)
                 if not getattr(prov, "installable", True):
                     return self._json({"error": "nothing to install for this provider"}, 400)
-                ok = prov.install(SHARE.conf_for(cfg, pid))
+                try:
+                    already = prov.installed()
+                except Exception:
+                    already = False
+                if not already:
+                    SHARE.install_async(cfg, pid)
                 st = SHARE.status(cfg)
                 st["password_set"] = auth_configured(cfg)
                 st["providers"] = SHARE.catalog(cfg)
-                if not ok:
-                    st["install_error"] = getattr(prov, "error", None) or "install failed"
                 return self._json(st)
             else:
                 return self._json({"error": "bad request"}, 400)
@@ -10545,7 +10591,7 @@ setInterval(tick,1000);tick();
 
 /* ---- share access (owner) ---- */
 function openShares(){ $('shareScrim').classList.add('open'); $('shResult').style.display='none'; $('shMsg').textContent=''; shToggleAll(); loadShareBots(); loadShares(); loadAudit(); loadTunnel(); }
-let _tunPoll=null;
+let _tunPoll=null, _instPoll=null;
 async function tunGet(){ return await (await fetch('/api/share/tunnel')).json(); }
 async function tunPost(payload){
   const r=await fetch('/api/share/tunnel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -10564,7 +10610,9 @@ function provCard(d){
   const canEnable = (!ap.installable) || ap.installed;
   let h='<div class="provcard">';
   h+='<div class="pblurb">'+esc(ap.blurb||'')+'</div>';
-  if(needsSetup){
+  if(ap.installing){
+    h+='<div class="setuprow"><span class="msg" id="shSetupMsg" style="flex:1;color:var(--dim)"><span class="spin"></span> setting up '+esc(ap.name)+'… downloading (this can take a minute)</span></div>';
+  } else if(needsSetup){
     h+='<div class="setuprow"><span class="msg" id="shSetupMsg" style="flex:1;color:var(--dim)">ABM will install this for you — no extra steps, no root.</span><button id="shSetupBtn" onclick="installProvider(\''+esc(active)+'\',this)">⬇ Set up '+esc(ap.name)+'</button></div>';
   }
   if(ap.needs && ap.needs.length){
@@ -10597,6 +10645,8 @@ function renderTunnel(d){
   h+=provCard(d);
   body.innerHTML=h;
   paintTunStatus(d);
+  const ap=provs.find(p=>p.id===active);
+  if(ap && ap.installing) watchInstall(active);   // keep polling until the download finishes
 }
 /* repaint just the status line + login link + enable button (poller-safe — won't wipe config inputs) */
 function paintTunStatus(d){
@@ -10615,10 +10665,11 @@ function paintTunStatus(d){
     urlb.innerHTML='<div style="display:flex;gap:.4rem;margin-top:.2rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="navigator.clipboard&&navigator.clipboard.writeText(\''+jsq(d.url)+'\')">Copy</button></div>';
     if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
   } else if(d.enabled && !d.running){
-    if(d.needs_login) st.innerHTML='<span class="spin"></span> waiting for Tailscale sign-in…';
+    if(d.installing) st.innerHTML='<span class="spin"></span> setting up… downloading (this can take a minute)';
+    else if(d.needs_login) st.innerHTML='<span class="spin"></span> waiting for Tailscale sign-in…';
     else st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting… (a few seconds)';
     if(btn){ btn.style.display=''; btn.textContent='Turn off'; } urlb.style.display='none';
-    if((!d.error || d.needs_login)){ if(!_tunPoll) _tunPoll=setInterval(pollTunStatus,1800); }
+    if((!d.error || d.needs_login || d.installing)){ if(!_tunPoll) _tunPoll=setInterval(pollTunStatus,1800); }
     else if(_tunPoll){ clearInterval(_tunPoll); _tunPoll=null; }
   } else {
     st.textContent='Off — links only work on your own (tunnel/localhost) connection.';
@@ -10629,10 +10680,20 @@ function paintTunStatus(d){
 async function pollTunStatus(){ try{ paintTunStatus(await tunGet()); }catch(e){} }
 async function installProvider(pid,btn){
   const m=$('shSetupMsg'); if(btn){ btn.disabled=true; btn.textContent='Setting up…'; }
-  if(m) m.innerHTML='<span class="spin"></span> downloading &amp; setting up… (this can take up to a minute)';
+  if(m) m.innerHTML='<span class="spin"></span> starting download…';
   let d; try{ d=await tunPost({action:'install',provider:pid}); }catch(e){ d={_ok:false}; }
-  if(!d._ok || d.install_error){ if(m) m.innerHTML='<span style="color:var(--danger)">'+esc(d.install_error||d.error||'setup failed')+'</span>'; if(btn){ btn.disabled=false; btn.textContent='Retry set up'; } return; }
-  renderTunnel(d);
+  if(!d._ok){ if(m) m.innerHTML='<span style="color:var(--danger)">'+esc(d.error||'setup failed')+'</span>'; if(btn){ btn.disabled=false; btn.textContent='Retry set up'; } return; }
+  renderTunnel(d);          // install runs in the background now; poll until it finishes
+  watchInstall(pid);
+}
+/* poll while a provider's background install runs; re-render when it lands (or errors) */
+function watchInstall(pid){
+  if(_instPoll) clearInterval(_instPoll);
+  _instPoll=setInterval(async ()=>{
+    let d; try{ d=await tunGet(); }catch(e){ return; }
+    const ap=(d.providers||[]).find(p=>p.id===pid);
+    if(!ap || !ap.installing){ clearInterval(_instPoll); _instPoll=null; if(d.provider===pid) renderTunnel(d); }
+  }, 2000);
 }
 async function selectProvider(pid){
   const d=await tunPost({action:'select',provider:pid});
@@ -10665,7 +10726,7 @@ async function loadAudit(){
     $('shAudit').innerHTML=a.length?a.map(e=>'<div>'+new Date(e.ts*1000).toLocaleString()+' · <b>'+esc(e.target||'')+'</b> · '+esc((e.path||'').replace('/api/instances/'+(e.target||''),''))+' <span class="hint">['+esc(e.tier||'')+']</span></div>').join(''):'<span class="hint">No guest actions recorded.</span>';
   }catch(e){ $('shAudit').innerHTML='<span class="hint">Could not load.</span>'; }
 }
-function closeShares(e){ if(!e||e.target.id==='shareScrim') $('shareScrim').classList.remove('open'); }
+function closeShares(e){ if(!e||e.target.id==='shareScrim'){ $('shareScrim').classList.remove('open'); if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;} if(_instPoll){clearInterval(_instPoll);_instPoll=null;} } }
 function shToggleAll(){ const on=$('shAll').checked; $('shBotsWrap').style.opacity=on?.4:1; $('shBotsWrap').style.pointerEvents=on?'none':'auto'; }
 async function loadShareBots(){
   const w=$('shBots');
