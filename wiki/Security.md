@@ -62,13 +62,13 @@ Beyond the single owner login, you can hand out **scoped guest links** (owner he
 
 ## Public sharing
 
-A guest link is only useful if the recipient can actually **reach** your dashboard. On the default setup that's loopback-only (SSH tunnel) — so a link points at `localhost` and is useless to anyone else. The Share panel's **Public sharing** card (v3.4.0) lets you give the dashboard a real public HTTPS address, and offers a **menu of providers** so you can pick whichever you trust / already have:
+A guest link is only useful if the recipient can actually **reach** your dashboard. On the default setup that's loopback-only (SSH tunnel) — so a link points at `localhost` and is useless to anyone else. The Share panel's **Public sharing** card (v3.4.0) lets you give the dashboard a real public HTTPS address, and offers a **dropdown menu of providers** so you can pick whichever you trust / already have. When a provider needs a helper installed, **ABM downloads and sets it up for you automatically when you choose it — no root, no manual steps** (Tailscale runs in userspace; cloudflared/ngrok are single static binaries):
 
 | Provider | Account / domain | URL stability | Notes |
 |----------|------------------|---------------|-------|
-| **Cloudflare Quick Tunnel** | none | re-rolls on reboot | One click. Downloads `cloudflared`, opens a `*.trycloudflare.com` tunnel to your loopback port. No account, no domain, no cert. |
-| **Tailscale Funnel** | free Tailscale login (once, on the VPS) | **stable, survives reboots** | Install Tailscale + `sudo tailscale up`, then enable here. Stable `https://<machine>.<tailnet>.ts.net` with a valid cert. Best no-domain option. |
-| **ngrok** | free ngrok account + authtoken | stable (reserve a domain) | Downloads `ngrok`; reserve a free static `*.ngrok-free.app` domain so the address doesn't change. |
+| **Cloudflare Quick Tunnel** | none | re-rolls on reboot | One click. ABM downloads `cloudflared`, opens a `*.trycloudflare.com` tunnel to your loopback port. No account, no domain, no cert. |
+| **Tailscale Funnel** | free Tailscale login (once, via a link) | **stable, survives reboots** | ABM **installs Tailscale for you (no root)** and runs it in userspace; you click a one-time sign-in link and it goes live automatically. Stable `https://<machine>.<tailnet>.ts.net` with a valid cert. Best no-domain option. |
+| **ngrok** | free ngrok account + authtoken | stable (reserve a domain) | ABM downloads `ngrok`; reserve a free static `*.ngrok-free.app` domain so the address doesn't change. |
 | **Cloudflare Tunnel (your domain)** | a domain on Cloudflare + a tunnel token | **stable custom hostname** | Create a tunnel in Zero Trust, route a Public Hostname to `http://127.0.0.1:<port>`, paste the token + hostname. |
 | **My own domain / reverse proxy** | your own HTTPS setup | whatever you run | You already expose the dashboard (Caddy/nginx/domain). ABM runs nothing — it just builds links from the URL you give it. |
 

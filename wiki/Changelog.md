@@ -2,7 +2,13 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.4.0 — *latest*
+## v3.4.1 — *latest*
+
+- **Public sharing: pick from a dropdown, and ABM installs the provider for you.** The provider list is now a **dropdown** that reveals a single card for whatever you choose (instead of five stacked option boxes). And when you pick a provider that needs a helper installed, **ABM downloads and sets it up automatically — no root, no manual steps**:
+  - **Cloudflare** (quick & domain) → fetches `cloudflared`; **ngrok** → fetches the ngrok binary; **Tailscale** → downloads the static binaries and runs it in **userspace** (so it needs no root and no system service), then shows you a one-time **sign-in link** and brings the funnel up automatically once you've signed in.
+  - There's a manual **Set up** button as a fallback/retry, and **Custom URL** stays install-free (you supply the address).
+
+## v3.4.0
 
 - **Public sharing is now a menu of providers — pick whatever fits.** The Share panel's **Public sharing** card lets you choose *how* your dashboard gets a public HTTPS address, so a guest link works for anyone:
   - **Cloudflare Quick Tunnel** — no account, no domain, one click (the v3.3 default). URL re-rolls on reboot.

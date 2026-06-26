@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -87,6 +87,8 @@ def load_config(path):
     s.setdefault("system_actions_enabled", False)
     s.setdefault("shares", [])               # shareable-link guest grants
     s.setdefault("shares_epoch", 0)          # revoke-all generation for shares
+    s.setdefault("users", [])                # named multi-user accounts (RBAC)
+    s.setdefault("invites", [])              # pending invite links (preset role+scope)
     ps = s.setdefault("public_share", {})    # public-exposure provider for guest links (multi-provider menu)
     ps.setdefault("enabled", False)
     ps.setdefault("provider", "cloudflare-quick")
@@ -2271,14 +2273,19 @@ def verify_password(cfg, username, password):
     return hmac.compare_digest(calc, a["hash"])
 
 
-def _new_session(gen=0, scope=None):
-    """Mint a session token. Owner sessions pass scope=None. Guest sessions (from a share link)
-    pass scope={grant_id, targets, all, capability, shares_epoch} and are tagged principal=guest."""
+def _new_session(gen=0, scope=None, user=None):
+    """Mint a session token. Owner sessions pass scope=None/user=None. Guest sessions (from a share
+    link) pass scope={grant_id, targets, all, capability, shares_epoch} → principal=guest. Named-user
+    sessions pass a user record → principal=user (carrying uid + pwgen for live revalidation)."""
     tok = secrets.token_urlsafe(32)
     s = {"exp": time.time() + SESSION_TTL, "gen": gen}
     if scope is not None:
         s["scope"] = scope
         s["principal"] = "guest"
+    elif user is not None:
+        s["principal"] = "user"
+        s["uid"] = user["id"]
+        s["pwgen"] = int(user.get("pwgen", 0))
     _SESSIONS[tok] = s
     return tok
 
@@ -2422,6 +2429,244 @@ def audit_guest(entry):
 
 
 # ---------------------------------------------------------------------------
+# Named multi-user accounts (RBAC)
+# ---------------------------------------------------------------------------
+# Beyond the single owner + anonymous share links: real accounts, each with its
+# own login. A non-admin user is authorization-identical to a guest link (same
+# scope = {targets, all, capability} at tier view < operate < config); an admin
+# user is owner-equivalent. Accounts live in settings.users; invite links (a
+# preset role+scope the invitee redeems by setting their own password) live in
+# settings.invites. Like guest grants, the user is re-resolved from cfg on every
+# request, so role/scope edits, disable, and delete take effect instantly.
+
+USER_ROLES = ("view", "operate", "config", "admin")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,31}$")
+
+
+def role_capability(role):
+    """Map a role to its guest-style capability tier. Admin is owner-equivalent (handled separately);
+    we report 'config' for completeness."""
+    return "config" if role == "admin" else role
+
+
+def _users(cfg):
+    return cfg["raw"].setdefault("settings", {}).setdefault("users", [])
+
+
+def _invites(cfg):
+    return cfg["raw"].setdefault("settings", {}).setdefault("invites", [])
+
+
+def _owner_username(cfg):
+    return (cfg["raw"].get("settings", {}).get("auth", {}) or {}).get("user", "") or ""
+
+
+def find_user_by_id(cfg, uid):
+    for u in _users(cfg):
+        if u.get("id") == uid:
+            return u
+    return None
+
+
+def find_user_by_name(cfg, username):
+    un = (username or "").strip().lower()
+    if not un:
+        return None
+    for u in _users(cfg):
+        if (u.get("username") or "").lower() == un:
+            return u
+    return None
+
+
+def _validate_new_username(cfg, username):
+    un = (username or "").strip()
+    if not _USERNAME_RE.match(un):
+        raise ValueError("username must be 2–32 chars: letters, digits, _ . -")
+    if un.lower() == _owner_username(cfg).lower():
+        raise ValueError("that name is the owner account")
+    if find_user_by_name(cfg, un):
+        raise ValueError("username already exists")
+    return un
+
+
+def new_user(cfg, username, password, role, all_, targets):
+    if role not in USER_ROLES:
+        raise ValueError("invalid role")
+    un = _validate_new_username(cfg, username)
+    if not password or len(password) < 6:
+        raise ValueError("password must be at least 6 characters")
+    salt = secrets.token_hex(16)
+    u = {
+        "id": secrets.token_hex(4),
+        "username": un,
+        "salt": salt,
+        "hash": _hash_password(password, salt),
+        "role": role,
+        "all": True if role == "admin" else bool(all_),
+        "targets": [] if role == "admin" else (targets or []),
+        "pwgen": 0,
+        "disabled": False,
+        "created": time.time(),
+        "last_login": None,
+    }
+    _users(cfg).append(u)
+    save_config(cfg)
+    return u
+
+
+def verify_user(cfg, username, password):
+    u = find_user_by_name(cfg, username)
+    if not u or u.get("disabled"):
+        return None
+    calc = _hash_password(password, u.get("salt", ""))
+    return u if hmac.compare_digest(calc, u.get("hash", "")) else None
+
+
+def set_user_password(cfg, uid, password):
+    u = find_user_by_id(cfg, uid)
+    if not u:
+        return False
+    if not password or len(password) < 6:
+        raise ValueError("password must be at least 6 characters")
+    u["salt"] = secrets.token_hex(16)
+    u["hash"] = _hash_password(password, u["salt"])
+    u["pwgen"] = int(u.get("pwgen", 0)) + 1   # invalidate the user's other live sessions
+    save_config(cfg)
+    return True
+
+
+def update_user(cfg, uid, role=None, all_=None, targets=None, disabled=None):
+    u = find_user_by_id(cfg, uid)
+    if not u:
+        return None
+    if role is not None:
+        if role not in USER_ROLES:
+            raise ValueError("invalid role")
+        u["role"] = role
+        if role == "admin":
+            u["all"] = True
+            u["targets"] = []
+    if all_ is not None and u["role"] != "admin":
+        u["all"] = bool(all_)
+    if targets is not None and u["role"] != "admin":
+        u["targets"] = targets
+    if disabled is not None:
+        u["disabled"] = bool(disabled)
+    save_config(cfg)
+    return u
+
+
+def delete_user(cfg, uid):
+    us = _users(cfg)
+    before = len(us)
+    us[:] = [u for u in us if u.get("id") != uid]
+    save_config(cfg)
+    return len(us) < before
+
+
+def touch_user_login(cfg, uid):
+    u = find_user_by_id(cfg, uid)
+    if u:
+        u["last_login"] = time.time()
+        save_config(cfg)
+
+
+def user_public_view(cfg, u):
+    """Owner-facing view of a user — never includes the salt/hash."""
+    return {k: u.get(k) for k in
+            ("id", "username", "role", "all", "targets", "disabled", "created", "last_login")}
+
+
+def new_invite(cfg, label, role, all_, targets, username, ttl_days):
+    if role not in USER_ROLES:
+        raise ValueError("invalid role")
+    un = (username or "").strip()
+    if un:
+        _validate_new_username(cfg, un)        # fail now rather than issue a doomed invite
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    inv = {
+        "id": secrets.token_hex(4),
+        "token_hash": _share_token_hash(token),
+        "label": (label or "").strip()[:80] or "Invite",
+        "role": role,
+        "all": True if role == "admin" else bool(all_),
+        "targets": [] if role == "admin" else (targets or []),
+        "username": un or None,
+        "created": now,
+        "expires": (now + float(ttl_days) * 86400) if ttl_days else None,
+        "revoked": False,
+        "used_by": None,
+    }
+    _invites(cfg).append(inv)
+    save_config(cfg)
+    return inv, token
+
+
+def _invite_active(inv):
+    if inv.get("revoked") or inv.get("used_by"):
+        return False
+    exp = inv.get("expires")
+    if exp is not None and time.time() > exp:
+        return False
+    return True
+
+
+def find_invite_by_token(cfg, token):
+    th = _share_token_hash(token)
+    match = None
+    for inv in _invites(cfg):
+        if hmac.compare_digest(inv.get("token_hash", ""), th) and _invite_active(inv):
+            match = inv
+    return match
+
+
+def find_invite_by_id(cfg, iid):
+    for inv in _invites(cfg):
+        if inv.get("id") == iid:
+            return inv
+    return None
+
+
+def revoke_invite(cfg, iid):
+    inv = find_invite_by_id(cfg, iid)
+    if not inv:
+        return False
+    inv["revoked"] = True
+    save_config(cfg)
+    return True
+
+
+def invite_status(inv):
+    if inv.get("used_by"):
+        return "used"
+    if inv.get("revoked"):
+        return "revoked"
+    exp = inv.get("expires")
+    if exp is not None and time.time() > exp:
+        return "expired"
+    return "pending"
+
+
+def invite_public_view(inv):
+    v = {k: inv.get(k) for k in ("id", "label", "role", "all", "targets", "username", "created", "expires")}
+    v["status"] = invite_status(inv)
+    return v
+
+
+def redeem_invite(cfg, token, username, password):
+    """Consume an active invite → create the user it confers; returns the user record. Raises ValueError."""
+    inv = find_invite_by_token(cfg, token)
+    if not inv:
+        raise ValueError("This invite is invalid, already used, or expired.")
+    un = (inv.get("username") or username or "").strip()
+    u = new_user(cfg, un, password, inv["role"], inv.get("all"), inv.get("targets"))
+    inv["used_by"] = u["id"]
+    save_config(cfg)
+    return u
+
+
+# ---------------------------------------------------------------------------
 # Public sharing — a pluggable menu of exposure providers
 # ---------------------------------------------------------------------------
 # A guest share link is only useful if the person can actually reach the
@@ -2454,6 +2699,7 @@ class _ProcTunnel:
     across selfupdates. Output is captured to a per-provider logfile we parse for the URL."""
     id = name = blurb = ""
     needs = []                       # [{key,label,secret,placeholder,help}]
+    installable = True               # ABM can fetch/set this provider up itself
     bin_names = ()                   # absolute system paths to prefer
     bin_cache = ""                   # ~/.aquarius/<bin> fallback (auto-downloaded)
     download_url = None              # raw binary URL; override ensure_binary for archives
@@ -2475,6 +2721,22 @@ class _ProcTunnel:
                 return c
         w = shutil.which(os.path.basename(self.bin_cache))
         return w or self.bin_cache
+
+    def installed(self):
+        """Is the helper binary present (system or our cached copy)?"""
+        p = self.bin_path()
+        return bool(p) and os.path.exists(p)
+
+    def install(self, conf=None):
+        """Fetch the helper binary now (so 'choose a provider' can set it up before enabling).
+        Returns True on success; on failure records self.error and returns False."""
+        try:
+            self.ensure_binary()
+            return True
+        except Exception as e:
+            with self.lock:
+                self.error = (self.name + " download failed: " + str(e))[:200]
+            return False
 
     def ensure_binary(self):
         p = self.bin_path()
@@ -2755,94 +3017,209 @@ class Ngrok(_ProcTunnel):
 
 
 class Tailscale:
-    """Tailscale Funnel — not a process we own; tailscaled (a system daemon) holds the funnel
-    config and persists it across reboots, so there's nothing to adopt/monitor. We just toggle
-    funnel on/off for our port and read the stable *.ts.net hostname."""
+    """Tailscale Funnel — ABM installs and runs it itself, no root required. We download the static
+    Linux binaries into ~/.aquarius and run `tailscaled` in **userspace-networking** mode against our
+    own socket/state dir (so it needs no /dev/net/tun and no system service). The user signs in once
+    via a login URL we surface; tailscaled then persists that login + the funnel config across
+    reboots, giving a stable https://<machine>.<tailnet>.ts.net with a valid cert."""
     id = "tailscale"
     name = "Tailscale Funnel"
-    blurb = ("Free, no domain. Install Tailscale and sign in once on the VPS; you get a stable "
-             "HTTPS address (https://<machine>.<tailnet>.ts.net) with a valid cert that survives "
-             "reboots. The best set-and-forget option if you don't own a domain.")
+    blurb = ("Free, no domain. ABM installs Tailscale for you (no root) and runs it in userspace; you "
+             "sign in once via a link, then get a stable https://<machine>.<tailnet>.ts.net address "
+             "with a valid cert that survives reboots. The best set-and-forget option without a domain.")
     needs = []
+    installable = True
+    _PKGS = "https://pkgs.tailscale.com/stable/"
+    _STATE = os.path.join(_AQ_DIR, "ts-state")
+    _SOCK = os.path.join(_AQ_DIR, "tailscaled.sock")
+    _LOG = os.path.join(_AQ_DIR, "tailscaled.log")
 
     def __init__(self):
         self.lock = threading.Lock()
         self.enabled = False
         self.error = None
+        self.auth_url = None
+        self.port = None
+        self._mon = None
 
-    def _ts(self):
-        for c in ("/usr/bin/tailscale", "/usr/local/bin/tailscale"):
+    def _bin(self, name):
+        for c in ("/usr/bin/" + name, "/usr/local/bin/" + name):
             if os.path.exists(c):
                 return c
-        return shutil.which("tailscale")
+        w = shutil.which(name)
+        return w or os.path.join(_AQ_DIR, name)
 
-    def _self_dns(self, ts):
+    def installed(self):
+        return os.path.exists(self._bin("tailscale")) and os.path.exists(self._bin("tailscaled"))
+
+    def install(self, conf=None):
+        """Download the static tailscale + tailscaled binaries into ~/.aquarius (no root)."""
+        if self.installed():
+            return True
+        import tarfile, io
         try:
-            r = subprocess.run([ts, "status", "--json"], capture_output=True, text=True, timeout=10)
-            d = json.loads(r.stdout or "{}")
-            if d.get("BackendState") != "Running":
-                return None
-            dn = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
-            return dn or None
+            with urllib.request.urlopen(self._PKGS + "?mode=json", timeout=30) as r:
+                meta = json.load(r)
+            fname = (meta.get("Tarballs") or {}).get("amd64")
+            if not fname:
+                raise RuntimeError("could not resolve the latest Tailscale version")
+            with urllib.request.urlopen(self._PKGS + fname, timeout=300) as r:
+                data = r.read()
+            os.makedirs(_AQ_DIR, exist_ok=True)
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+                for want in ("tailscale", "tailscaled"):
+                    m = next((x for x in t.getmembers()
+                              if os.path.basename(x.name) == want and x.isfile()), None)
+                    if not m:
+                        raise RuntimeError(want + " not found in the Tailscale archive")
+                    dst = os.path.join(_AQ_DIR, want)
+                    with t.extractfile(m) as src, open(dst + ".dl", "wb") as f:
+                        shutil.copyfileobj(src, f)
+                    os.chmod(dst + ".dl", 0o755)
+                    os.replace(dst + ".dl", dst)
+            with self.lock:
+                self.error = None
+            return True
+        except Exception as e:
+            with self.lock:
+                self.error = ("Tailscale install failed: " + str(e))[:200]
+            return False
+
+    def _daemon_pid(self):
+        try:
+            r = subprocess.run(["pgrep", "-f", "tailscaled .*" + re.escape(self._SOCK)],
+                               capture_output=True, text=True, timeout=8)
+            pids = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+            return pids[0] if pids else None
         except Exception:
             return None
 
-    def _funnel_on(self, ts, dn):
+    def _ensure_daemon(self):
+        if not self.installed():
+            return False
+        if self._daemon_pid():
+            return True
+        os.makedirs(self._STATE, exist_ok=True)
+        logf = open(self._LOG, "ab")
         try:
-            r = subprocess.run([ts, "funnel", "status"], capture_output=True, text=True, timeout=10)
-            out = (r.stdout or "") + (r.stderr or "")
-            return dn in out and "off" not in out.lower().split(dn)[0][-12:]
+            subprocess.Popen([self._bin("tailscaled"), "--tun=userspace-networking",
+                              "--statedir=" + self._STATE, "--socket=" + self._SOCK],
+                             stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        finally:
+            logf.close()
+        for _ in range(24):                     # wait briefly for the control socket
+            if os.path.exists(self._SOCK):
+                break
+            time.sleep(0.25)
+        return True
+
+    def _ts_args(self, *a):
+        return [self._bin("tailscale"), "--socket=" + self._SOCK] + list(a)
+
+    def _status_json(self):
+        try:
+            r = subprocess.run(self._ts_args("status", "--json"), capture_output=True, text=True, timeout=10)
+            return json.loads(r.stdout or "{}")
+        except Exception:
+            return {}
+
+    def _funnel_on(self, dn):
+        try:
+            r = subprocess.run(self._ts_args("funnel", "status"), capture_output=True, text=True, timeout=10)
+            return bool(dn) and dn in ((r.stdout or "") + (r.stderr or ""))
         except Exception:
             return False
 
     def status(self, conf):
-        ts = self._ts()
-        if not ts:
-            return {"enabled": self.enabled, "running": False, "url": None,
-                    "error": "Tailscale isn't installed. Install it (tailscale.com/download) on the VPS."}
-        dn = self._self_dns(ts)
-        if not dn:
-            return {"enabled": self.enabled, "running": False, "url": None,
-                    "error": "Tailscale isn't signed in. Run 'sudo tailscale up' on the VPS, then enable here."}
-        url = "https://" + dn
-        on = self._funnel_on(ts, dn)        # operational truth; _ShareManager ANDs with the settings flag
-        return {"enabled": self.enabled, "running": bool(on),
-                "url": url if on else None, "error": self.error}
+        if not self.installed():
+            return {"enabled": self.enabled, "running": False, "url": None, "installed": False,
+                    "error": self.error or "Not set up yet — choose Set up to install Tailscale."}
+        if not self._daemon_pid():
+            return {"enabled": self.enabled, "running": False, "url": None, "installed": True,
+                    "error": self.error}
+        d = self._status_json()
+        state = d.get("BackendState")
+        if state in (None, "NoState", "NeedsLogin"):
+            return {"enabled": self.enabled, "running": False, "url": None, "installed": True,
+                    "needs_login": True, "auth_url": self.auth_url,
+                    "error": self.error or "Sign in to Tailscale to finish (open the link below)."}
+        dn = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
+        url = ("https://" + dn) if dn else None
+        on = self._funnel_on(dn)                # operational truth; _ShareManager ANDs with settings.enabled
+        return {"enabled": self.enabled, "running": bool(on), "url": url if on else None,
+                "installed": True, "error": self.error}
 
     def start(self, port, conf):
         with self.lock:
             self.enabled = True
             self.error = None
-        ts = self._ts()
-        if not ts:
-            with self.lock:
-                self.error = "Tailscale isn't installed on the VPS."
+            self.port = port
+        if not self.installed() and not self.install():
             return self.status(conf)
-        if not self._self_dns(ts):
-            with self.lock:
-                self.error = "Tailscale isn't signed in. Run 'sudo tailscale up' on the VPS first."
+        self._ensure_daemon()
+        d = self._status_json()
+        if d.get("BackendState") in (None, "NoState", "NeedsLogin"):
+            # kick off login and capture the auth URL for the UI (returns after the timeout)
+            try:
+                r = subprocess.run(self._ts_args("up", "--hostname=aquarius-bots", "--timeout=8s"),
+                                   capture_output=True, text=True, timeout=20)
+                out = (r.stderr or "") + (r.stdout or "")
+                mu = re.search(r"https://login\.tailscale\.com/\S+", out)
+                if mu:
+                    with self.lock:
+                        self.auth_url = mu.group(0)
+            except Exception:
+                pass
+            self._start_monitor()
             return self.status(conf)
+        self._funnel_up(port)
+        self._start_monitor()
+        return self.status(conf)
+
+    def _funnel_up(self, port):
         try:
-            r = subprocess.run([ts, "funnel", "--bg", str(port)],
+            r = subprocess.run(self._ts_args("funnel", "--bg", str(port)),
                                capture_output=True, text=True, timeout=25)
             if r.returncode != 0:
                 with self.lock:
                     self.error = (r.stderr or r.stdout or "tailscale funnel failed").strip()[:200]
+            else:
+                with self.lock:
+                    self.error = None
         except Exception as e:
             with self.lock:
                 self.error = str(e)[:200]
-        return self.status(conf)
+
+    def _start_monitor(self):
+        with self.lock:
+            if self._mon is not None and self._mon.is_alive():
+                return
+            self._mon = threading.Thread(target=self._monitor, daemon=True)
+            self._mon.start()
+
+    def _monitor(self):
+        """While enabled, once the user has signed in, bring the funnel up automatically."""
+        while True:
+            with self.lock:
+                enabled, port = self.enabled, self.port
+            if not enabled:
+                return
+            d = self._status_json()
+            if d.get("BackendState") == "Running":
+                dn = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
+                if dn and not self._funnel_on(dn):
+                    self._funnel_up(port)
+            time.sleep(4)
 
     def stop(self):
         with self.lock:
             self.enabled = False
-        ts = self._ts()
-        if ts:
+        if self.installed() and self._daemon_pid():
             try:
-                subprocess.run([ts, "funnel", "--bg", "off"], capture_output=True, timeout=15)
+                subprocess.run(self._ts_args("funnel", "--bg", "off"), capture_output=True, timeout=15)
             except Exception:
                 try:
-                    subprocess.run([ts, "funnel", "reset"], capture_output=True, timeout=15)
+                    subprocess.run(self._ts_args("funnel", "reset"), capture_output=True, timeout=15)
                 except Exception:
                     pass
         return {"enabled": False, "running": False, "url": None, "error": None}
@@ -2860,9 +3237,13 @@ class CustomUrl:
          "placeholder": "https://bots.example.com",
          "help": "The HTTPS address this dashboard is reachable at from outside — no trailing path."},
     ]
+    installable = False              # nothing to install — you bring the URL
 
     def __init__(self):
         self.enabled = False
+
+    def installed(self):
+        return True
 
     def _url(self, conf):
         return (conf.get("url") or "").strip().rstrip("/")
@@ -2926,8 +3307,14 @@ class _ShareManager:
         out = []
         for pid in self.order:
             p = self.providers[pid]
+            try:
+                inst = p.installed()
+            except Exception:
+                inst = True
             out.append({"id": pid, "name": p.name, "blurb": p.blurb,
                         "needs": [dict(n) for n in getattr(p, "needs", [])],
+                        "installable": bool(getattr(p, "installable", True)),
+                        "installed": bool(inst),
                         "config": self._public_conf(p, self.conf_for(cfg, pid))})
         return out
 
@@ -4272,6 +4659,20 @@ class Handler(BaseHTTPRequestHandler):
                     return {"type": "guest", "grant_id": g["id"],
                             "scope": {"targets": g.get("targets", []), "all": bool(g.get("all")),
                                       "capability": g.get("capability", "view")}}
+                if sess.get("principal") == "user":
+                    # re-resolve the account from cfg every request: role/scope edits, disable, delete,
+                    # and password changes (pwgen) all take effect immediately for a live session.
+                    u = find_user_by_id(cfg, sess.get("uid"))
+                    if (not u or u.get("disabled")
+                            or int(u.get("pwgen", 0)) != int(sess.get("pwgen", 0))):
+                        _SESSIONS.pop(tok, None)
+                        return None
+                    role = u.get("role", "view")
+                    return {"type": "user", "uid": u["id"], "username": u.get("username", ""),
+                            "role": role,
+                            "scope": {"targets": u.get("targets", []),
+                                      "all": bool(u.get("all")) or role == "admin",
+                                      "capability": role_capability(role)}}
                 return {"type": "owner", "scope": None}   # sessions without a principal key = owner
         # legacy basic-auth fallback (e.g. behind a tunnel without a set password) — owner
         if ABM_USER and ABM_PASS:
@@ -5332,6 +5733,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "Set a dashboard password first — public sharing would "
                                                 "otherwise expose full control to anyone with the URL."}, 400)
                 ps["enabled"] = enable
+            elif action == "install":
+                # download / set up the chosen provider's helper now (so picking it is one-and-done).
+                # No settings change and no reconcile — just fetch the binary and report back.
+                pid = p.get("provider")
+                prov = SHARE.providers.get(pid)
+                if not prov:
+                    return self._json({"error": "unknown provider"}, 400)
+                if not getattr(prov, "installable", True):
+                    return self._json({"error": "nothing to install for this provider"}, 400)
+                ok = prov.install(SHARE.conf_for(cfg, pid))
+                st = SHARE.status(cfg)
+                st["password_set"] = auth_configured(cfg)
+                st["providers"] = SHARE.catalog(cfg)
+                if not ok:
+                    st["install_error"] = getattr(prov, "error", None) or "install failed"
+                return self._json(st)
             else:
                 return self._json({"error": "bad request"}, 400)
             save_config(cfg)
@@ -7038,18 +7455,13 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 .shrow{display:flex;align-items:center;gap:.6rem;border:1px solid var(--line);border-radius:8px;padding:.4rem .55rem}
 .rrow{display:flex;flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400}
 .shurl{border:1px solid var(--acc);border-radius:8px;padding:.5rem .6rem;background:color-mix(in srgb,var(--acc) 8%,transparent)}
-/* public-sharing provider picker */
-.provpick{display:flex;flex-direction:column;gap:.4rem}
-.provopt{display:flex;gap:.6rem;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:.55rem .65rem;cursor:pointer;background:var(--panel-2)}
-.provopt:hover{border-color:var(--acc-dim)}
-.provopt.on{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 8%,transparent)}
-.provopt input{width:auto;margin-top:.2rem;flex:none}
-.provopt .pinfo{min-width:0}
-.provopt .pname{font-weight:700;font-size:.88rem}
-.provopt .pblurb{color:var(--dim);font-size:.76rem;line-height:1.35;margin-top:.1rem}
-.provcfg{display:flex;flex-direction:column;gap:.4rem;margin-top:.6rem;padding:.6rem .65rem;border:1px dashed var(--line);border-radius:10px}
-.provcfg .pf{display:flex;flex-direction:column;gap:.25rem;color:var(--dim);font-size:.8rem}
-.provcfg .pf input{font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem}
+/* public-sharing provider menu (dropdown + one card for the chosen provider) */
+.pf{display:flex;flex-direction:column;gap:.25rem;color:var(--dim);font-size:.8rem}
+.pf input,.pf select{font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem}
+.provcard{margin-top:.5rem;padding:.7rem .75rem;border:1px solid var(--line);border-radius:12px;background:var(--panel-2);display:flex;flex-direction:column;gap:.45rem}
+.provcard .pblurb{color:var(--dim);font-size:.78rem;line-height:1.4}
+.setuprow{display:flex;gap:.6rem;align-items:center;padding:.5rem .6rem;border:1px dashed var(--acc-dim);border-radius:10px;background:color-mix(in srgb,var(--acc) 6%,transparent)}
+.provcfg{display:flex;flex-direction:column;gap:.4rem;padding:.6rem .65rem;border:1px dashed var(--line);border-radius:10px}
 </style>
 </head>
 <body>
@@ -10144,18 +10556,18 @@ async function loadTunnel(){
   let d; try{ d=await tunGet(); }catch(e){ $('shTunBody').innerHTML='<div class="hint">Could not load sharing state.</div>'; return; }
   renderTunnel(d);
 }
-function renderTunnel(d){
-  const body=$('shTunBody');
-  if(!d.password_set){ if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;} body.innerHTML='<div class="hint" style="color:var(--warn)">Set a dashboard password first (Settings → Account) — public sharing needs a login in front of it.</div>'; return; }
+/* the card shown below the dropdown for the chosen provider */
+function provCard(d){
   const provs=d.providers||[], active=d.provider;
-  let h='<div class="provpick">';
-  for(const p of provs){
-    const on=p.id===active;
-    h+='<label class="provopt'+(on?' on':'')+'"><input type="radio" name="shprov" value="'+esc(p.id)+'"'+(on?' checked':'')+' onchange="selectProvider(this.value)"><div class="pinfo"><div class="pname">'+esc(p.name)+'</div><div class="pblurb">'+esc(p.blurb)+'</div></div></label>';
+  const ap=provs.find(p=>p.id===active)||{};
+  const needsSetup = ap.installable && !ap.installed;
+  const canEnable = (!ap.installable) || ap.installed;
+  let h='<div class="provcard">';
+  h+='<div class="pblurb">'+esc(ap.blurb||'')+'</div>';
+  if(needsSetup){
+    h+='<div class="setuprow"><span class="msg" id="shSetupMsg" style="flex:1;color:var(--dim)">ABM will install this for you — no extra steps, no root.</span><button id="shSetupBtn" onclick="installProvider(\''+esc(active)+'\',this)">⬇ Set up '+esc(ap.name)+'</button></div>';
   }
-  h+='</div>';
-  const ap=provs.find(p=>p.id===active);
-  if(ap && ap.needs && ap.needs.length){
+  if(ap.needs && ap.needs.length){
     const cur=ap.config||{};
     h+='<div class="provcfg">';
     for(const n of ap.needs){
@@ -10169,37 +10581,66 @@ function renderTunnel(d){
     }
     h+='<div class="mbar"><span class="msg" id="shProvMsg" style="flex:1;color:var(--dim)"></span><button onclick="saveProvider(\''+esc(active)+'\',this)">Save settings</button></div></div>';
   }
-  h+='<div class="mbar" style="align-items:center;margin-top:.5rem"><span class="msg" id="shTunStatus" style="flex:1;color:var(--dim)"></span><button id="shTunBtn" onclick="toggleTunnel(this)"></button></div>';
+  h+='<div id="shTunLogin" style="display:none"></div>';
+  h+='<div class="mbar" style="align-items:center;margin-top:.5rem"><span class="msg" id="shTunStatus" style="flex:1;color:var(--dim)"></span><button id="shTunBtn" onclick="toggleTunnel(this)"'+(canEnable?'':' style="display:none"')+'></button></div>';
   h+='<div id="shTunUrl" style="display:none"></div>';
+  h+='</div>';
+  return h;
+}
+function renderTunnel(d){
+  const body=$('shTunBody');
+  if(!d.password_set){ if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;} body.innerHTML='<div class="hint" style="color:var(--warn)">Set a dashboard password first (Settings → Account) — public sharing needs a login in front of it.</div>'; return; }
+  const provs=d.providers||[], active=d.provider;
+  let h='<label class="pf" style="margin-bottom:.3rem">Method<select id="shProvSel" onchange="selectProvider(this.value)">';
+  for(const p of provs) h+='<option value="'+esc(p.id)+'"'+(p.id===active?' selected':'')+'>'+esc(p.name)+'</option>';
+  h+='</select></label>';
+  h+=provCard(d);
   body.innerHTML=h;
   paintTunStatus(d);
 }
-/* repaint just the status line + enable button (used by the poller, so it won't wipe config inputs) */
+/* repaint just the status line + login link + enable button (poller-safe — won't wipe config inputs) */
 function paintTunStatus(d){
-  const st=$('shTunStatus'), btn=$('shTunBtn'), urlb=$('shTunUrl');
-  if(!st||!btn) return;
-  btn.disabled=false;
+  const st=$('shTunStatus'), btn=$('shTunBtn'), urlb=$('shTunUrl'), login=$('shTunLogin');
+  if(!st) return;
+  if(btn) btn.disabled=false;
+  if(login){
+    if(d.needs_login && d.auth_url){
+      login.style.display='block';
+      login.innerHTML='<div class="shurl" style="margin:.4rem 0"><b>One step left</b> — sign in to Tailscale: <a href="'+esc(d.auth_url)+'" target="_blank" rel="noopener">open the sign-in link</a>. It goes live automatically once you\'re signed in.</div>';
+    } else login.style.display='none';
+  }
   if(d.enabled && d.running && d.url){
     st.innerHTML='<span style="color:var(--acc)">● Public</span> — links use this address:';
-    btn.textContent='Turn off'; urlb.style.display='block';
+    if(btn){ btn.style.display=''; btn.textContent='Turn off'; } urlb.style.display='block';
     urlb.innerHTML='<div style="display:flex;gap:.4rem;margin-top:.2rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="navigator.clipboard&&navigator.clipboard.writeText(\''+jsq(d.url)+'\')">Copy</button></div>';
     if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
   } else if(d.enabled && !d.running){
-    st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting… (a few seconds)';
-    btn.textContent='Turn off'; urlb.style.display='none';
-    if(!d.error && !_tunPoll) _tunPoll=setInterval(pollTunStatus,1800);
-    if(d.error && _tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+    if(d.needs_login) st.innerHTML='<span class="spin"></span> waiting for Tailscale sign-in…';
+    else st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting… (a few seconds)';
+    if(btn){ btn.style.display=''; btn.textContent='Turn off'; } urlb.style.display='none';
+    if((!d.error || d.needs_login)){ if(!_tunPoll) _tunPoll=setInterval(pollTunStatus,1800); }
+    else if(_tunPoll){ clearInterval(_tunPoll); _tunPoll=null; }
   } else {
     st.textContent='Off — links only work on your own (tunnel/localhost) connection.';
-    btn.textContent='Enable public sharing'; urlb.style.display='none';
+    if(btn) btn.textContent='Enable public sharing'; urlb.style.display='none';
     if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
   }
 }
 async function pollTunStatus(){ try{ paintTunStatus(await tunGet()); }catch(e){} }
+async function installProvider(pid,btn){
+  const m=$('shSetupMsg'); if(btn){ btn.disabled=true; btn.textContent='Setting up…'; }
+  if(m) m.innerHTML='<span class="spin"></span> downloading &amp; setting up… (this can take up to a minute)';
+  let d; try{ d=await tunPost({action:'install',provider:pid}); }catch(e){ d={_ok:false}; }
+  if(!d._ok || d.install_error){ if(m) m.innerHTML='<span style="color:var(--danger)">'+esc(d.install_error||d.error||'setup failed')+'</span>'; if(btn){ btn.disabled=false; btn.textContent='Retry set up'; } return; }
+  renderTunnel(d);
+}
 async function selectProvider(pid){
   const d=await tunPost({action:'select',provider:pid});
   if(!d._ok){ $('shTunStatus')&&($('shTunStatus').innerHTML='<span style="color:var(--danger)">'+esc(d.error||'failed')+'</span>'); return; }
   renderTunnel(d);
+  // the user deliberately chose this provider — set it up now if it needs installing
+  const ap=(d.providers||[]).find(p=>p.id===pid);
+  if(ap && ap.installable && !ap.installed) installProvider(pid, $('shSetupBtn'));
 }
 async function saveProvider(pid,btn){
   const prov=(await tunGet()).providers.find(p=>p.id===pid);
