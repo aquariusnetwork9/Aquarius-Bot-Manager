@@ -34,6 +34,20 @@
            : ('/api/instances/' + encodeURIComponent(INST));
   var LIVE = window.LIVE = { style:STYLE, inst:INST, base:BASE, connected:false, state:null, modState:{} };
 
+  /* capability gating (shared-access guests): owner = full; else view < operate < config */
+  var CAP_RANK = { view:0, operate:1, config:2 };
+  LIVE.cap = null;   // null = owner / no gating
+  function capOk(level){ return LIVE.cap == null || CAP_RANK[LIVE.cap] >= CAP_RANK[level]; }
+  function fetchPrincipal(){
+    return fetch('/api/authstatus', {cache:'no-store'})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if(d && d.principal === 'guest'){ LIVE.cap = d.capability || 'view';
+          document.body.classList.add('lguest','lguest-'+LIVE.cap); }
+      })
+      .catch(function(){});
+  }
+
   /* raw config-class name (what /control/state returns) → model module id */
   var RAW2ID = {};
   MODULES.forEach(function(m){ if(m.raw) RAW2ID[m.raw.toLowerCase()] = m.id; });
@@ -175,6 +189,10 @@
   function wireActions(){
     var m=MAP[cur]; if(!m) return;
     var bar = $(LO.acts); if(!bar) return;
+    if(!capOk('operate')){   // guest below operate tier: actions are read-only
+      [].forEach.call(bar.querySelectorAll('button'), function(b){ b.disabled=true; b.style.opacity='.5'; b.style.cursor='not-allowed'; });
+      return;
+    }
     [].forEach.call(bar.querySelectorAll('button'), function(btn){
       if(btn.dataset.lw) return; btn.dataset.lw='1';
       var label=(btn.textContent||'').trim();
@@ -195,7 +213,9 @@
     box.style.cssText='display:inline-flex;align-items:center;gap:.4rem;margin-left:.5rem;font-family:var(--mono,monospace);font-size:.62rem;color:var(--dim,#7b8a98)';
     box.innerHTML='module <span class="tgl '+(m.enabled?'on':'')+'" style="position:relative;display:inline-block;width:34px;height:18px;border-radius:18px;cursor:pointer;vertical-align:middle"></span>';
     head.insertAdjacentElement('afterend', box);
-    box.querySelector('.tgl').addEventListener('click', function(){
+    var tg=box.querySelector('.tgl');
+    if(!capOk('operate')){ tg.style.pointerEvents='none'; tg.style.opacity='.5'; return; }
+    tg.addEventListener('click', function(){
       var on=!this.classList.contains('on'); this.classList.toggle('on',on); setEnabled(cur,on);
     });
   }
@@ -337,6 +357,7 @@
         'background:rgba(10,14,18,.85);backdrop-filter:blur(8px);border:1px solid var(--line,#1d2730);border-radius:12px;padding:.35rem .5rem;box-shadow:0 8px 24px #0007';
       bar.appendChild(v); bar.appendChild(cr); bar.appendChild(sw); document.body.appendChild(bar);
     }
+    if(!capOk('operate')) cr.style.display='none';   // guest below operate tier: no command runner
     var inp=$('#cmdInput');
     function go(){ var c=(inp.value||'').trim(); if(!c) return; runCommand(c).then(function(){ inp.value=''; }); }
     $('#cmdGo').onclick=go;
@@ -404,6 +425,13 @@
         '<div class="lcNote">Edits apply on the bot immediately and persist to its config.</div>'+cfgNodeHtml(sub, root, 0);
     }
     cont.insertBefore(panel, cont.firstChild);
+    if(!capOk('config')){
+      // guest below config tier: show values read-only
+      [].forEach.call(panel.querySelectorAll('.lcInp'), function(e){ e.setAttribute('disabled','disabled'); e.style.opacity='.6'; });
+      [].forEach.call(panel.querySelectorAll('.lcTgl'), function(e){ e.style.pointerEvents='none'; e.style.opacity='.6'; });
+      var n=panel.querySelector('.lcNote'); if(n) n.textContent='Read-only — your shared access doesn’t include configuration.';
+      return;
+    }
     [].forEach.call(panel.querySelectorAll('.lcTgl'), function(tg){
       tg.addEventListener('click', function(){ var on=!this.classList.contains('on'); this.classList.toggle('on',on); setConfig(this.dataset.path, on, this); });
     });
@@ -476,10 +504,13 @@
     // label the Live Map with the real bot + drop the mockup's fake pins
     if(typeof ABMMap!=='undefined' && ABMMap.bot){ ABMMap.bot.name = INST || ABMMap.bot.name; ABMMap.pins=[]; }
     injectLiveConfigCss();
-    injectTopbar();
-    // default the surface to the Live Map (the headline) on first load
-    if(typeof cur!=='undefined' && MAP['livemap']){ try{ cur='livemap'; render(); }catch(e){} }
-    else { try{ render(); }catch(e){} }
+    // learn our capability (shared-access guests) before first render so gating applies immediately
+    fetchPrincipal().then(function(){
+      injectTopbar();
+      // default the surface to the Live Map (the headline) on first load
+      if(typeof cur!=='undefined' && MAP['livemap']){ try{ cur='livemap'; render(); }catch(e){} }
+      else { try{ render(); }catch(e){} }
+    });
     pollState(); setInterval(pollState, 3000);
     // pull the live config once (then re-render so the settings panel populates), refresh occasionally
     fetchConfig().then(function(){ try{ render(); }catch(e){} });
