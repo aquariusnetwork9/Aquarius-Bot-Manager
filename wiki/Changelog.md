@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.7.1 — *latest*
+## v3.8.0 — *latest*
+
+- **ZenithProxy bots get the full live dashboard, via a plugin.** AquariusProxy bots already get the live map, POV viewer, inventory/vitals, module toggles, command runner, and live config editing built in. Now ZenithProxy bots can get the *same* surface by dropping in the new **[`zenith-abm-bridge`](https://github.com/aquariusnetwork9/zenith-abm-bridge)** plugin — no fork switch required. Install the jar, run `abmBridge on` (and `abmBridge control on` to allow command/config writes), and the bot's Live Map / control surface light up in ABM exactly like an AquariusProxy bot. The bridge is **loopback-bound, disabled by default, and write-gated**; ABM relays it over its own authenticated tunnel.
+- **Auto-detect the bridge port.** ABM now resolves a bot's viewer port from the bridge's `plugins/config/abm-bridge.json` too (AquariusProxy uses `server.viewer.port`); both default to `2998`, so a freshly-installed bridge is found with zero config. The viewer's "offline" hint now tells you how to enable it for *either* fork.
+
+## v3.7.1
 
 - **Fix: Tailscale Funnel guidance (no more "command timed-out").** Tailscale Funnel needs a **one-time tailnet enablement** beyond signing in — ABM wasn't surfacing that step and instead showed a confusing *command timed-out*. The Funnel attempt now runs detached (so a slow first HTTPS-cert provisioning never blocks or leaves stuck processes), and when the tailnet hasn't enabled Funnel the Share panel shows a direct **"Enable Funnel"** link. Click it once (in your Tailscale admin) and the address goes live automatically. *(The Cloudflare Quick Tunnel remains the zero-setup option if you just want a public link now.)*
 - **Fix: invite links warn when they're private.** Like share links, the one-time invite link now warns if it points at a `localhost`/private address — turn on **Public sharing** first so the invitee can actually open it.

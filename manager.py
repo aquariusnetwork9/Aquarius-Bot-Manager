@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.7.1"
+__version__ = "3.8.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -311,24 +311,47 @@ def viewer_port_for(inst):
                 return p
         except (ValueError, TypeError):
             pass
-    path = os.path.join(inst.get("dir") or "", inst.get("config_file") or "config.json")
+    directory = inst.get("dir") or ""
+    path = os.path.join(directory, inst.get("config_file") or "config.json")
+    # ZenithProxy bots serve the viewer feed via the zenith-abm-bridge plugin, which keeps its
+    # port in plugins/config/abm-bridge.json — check that too so bridge bots auto-detect (an
+    # AquariusProxy bot has the native server.viewer.port instead). Both default to 2998.
+    bridge = os.path.join(directory, "plugins", "config", "abm-bridge.json")
     try:
-        mtime = os.path.getmtime(path)
+        cfg_m = os.path.getmtime(path)
     except OSError:
+        cfg_m = None
+    try:
+        br_m = os.path.getmtime(bridge)
+    except OSError:
+        br_m = None
+    if cfg_m is None and br_m is None:
         return 2998
     cached = _VIEWER_PORT_CACHE.get(path)
-    if cached and cached[0] == mtime:
+    if cached and cached[0] == (cfg_m, br_m):
         return cached[1]
     port = 2998
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        p = int(((data.get("server") or {}).get("viewer") or {}).get("port", 2998))
-        if 1024 <= p <= 65535:
-            port = p
-    except (OSError, ValueError, TypeError, AttributeError):
-        port = 2998
-    _VIEWER_PORT_CACHE[path] = (mtime, port)
+    if cfg_m is not None:                       # AquariusProxy native: server.viewer.port
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            sv = (data.get("server") or {}).get("viewer")
+            if isinstance(sv, dict):
+                p = int(sv.get("port", 2998))
+                if 1024 <= p <= 65535:
+                    port = p
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    if port == 2998 and br_m is not None:       # ZenithProxy bridge plugin: abm-bridge.json -> port
+        try:
+            with open(bridge) as f:
+                bdata = json.load(f)
+            p = int(bdata.get("port", 2998))
+            if 1024 <= p <= 65535:
+                port = p
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    _VIEWER_PORT_CACHE[path] = ((cfg_m, br_m), port)
     return port
 
 
@@ -8696,7 +8719,7 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     </div>
     <div id="vwWrap" style="position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:grab;touch-action:none">
       <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
-      <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>Enable <code>server.viewer.enabled</code><br>on the bot (port auto-detected).</div>
+      <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>AquariusProxy: enable <code>server.viewer.enabled</code>.<br>ZenithProxy: install the <code>zenith-abm-bridge</code> plugin, then <code>abmBridge on</code>.<br>(port auto-detected)</div>
       <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
     </div>
     <div id="vwControlWrap" class="vw-ctl" style="display:none">
