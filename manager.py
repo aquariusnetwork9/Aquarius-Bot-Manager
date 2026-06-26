@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -85,6 +85,8 @@ def load_config(path):
     theme.setdefault("accent", "")          # "" = use the preset's accent
     theme.setdefault("font", "aquarius")    # font pairing (see FONT_PRESETS)
     s.setdefault("system_actions_enabled", False)
+    s.setdefault("shares", [])               # shareable-link guest grants
+    s.setdefault("shares_epoch", 0)          # revoke-all generation for shares
     return {"raw": data, "instances": insts, "by_name": by_name, "path": path}
 
 
@@ -2265,9 +2267,15 @@ def verify_password(cfg, username, password):
     return hmac.compare_digest(calc, a["hash"])
 
 
-def _new_session(gen=0):
+def _new_session(gen=0, scope=None):
+    """Mint a session token. Owner sessions pass scope=None. Guest sessions (from a share link)
+    pass scope={grant_id, targets, all, capability, shares_epoch} and are tagged principal=guest."""
     tok = secrets.token_urlsafe(32)
-    _SESSIONS[tok] = {"exp": time.time() + SESSION_TTL, "gen": gen}
+    s = {"exp": time.time() + SESSION_TTL, "gen": gen}
+    if scope is not None:
+        s["scope"] = scope
+        s["principal"] = "guest"
+    _SESSIONS[tok] = s
     return tok
 
 
@@ -2291,6 +2299,122 @@ def _rate_limited(ip):
 
 def _record_fail(ip):
     _LOGIN_FAILS.setdefault(ip, []).append(time.time())
+
+
+# ---------------------------------------------------------------------------
+# shareable-link guest access: share grants
+# ---------------------------------------------------------------------------
+# A "share" is a URL that grants a guest scoped access to specific bots at a
+# capability tier. Stored in settings.shares; only the sha256 of the token is
+# persisted (the plaintext is revealed once at creation). Capability tiers are
+# ordered view < operate < config. shares_epoch is the revoke-all generation.
+
+CAP_RANK = {"view": 0, "operate": 1, "config": 2}
+
+
+def _share_token_hash(token):
+    # 256-bit tokens => unsalted sha256 is sufficient and fast on the redemption path
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _shares(cfg):
+    return cfg["raw"].setdefault("settings", {}).setdefault("shares", [])
+
+
+def shares_epoch(cfg):
+    return int(cfg["raw"].get("settings", {}).get("shares_epoch", 0))
+
+
+def bump_shares_epoch(cfg):
+    """Revoke-all: bumping the epoch invalidates every existing share grant + guest session."""
+    s = cfg["raw"].setdefault("settings", {})
+    s["shares_epoch"] = shares_epoch(cfg) + 1
+    save_config(cfg)
+    return s["shares_epoch"]
+
+
+def new_share(cfg, label, targets, all_local, capability, ttl_days):
+    if capability not in CAP_RANK:
+        raise ValueError("invalid capability")
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    grant = {
+        "id": secrets.token_hex(4),
+        "token_hash": _share_token_hash(token),
+        "label": (label or "").strip()[:80] or "Shared link",
+        "targets": targets or [],          # [{"node": <name|null>, "name": <bot>}]
+        "all": bool(all_local),            # all current+future LOCAL bots (targets ignored)
+        "capability": capability,
+        "created": now,
+        "expires": (now + float(ttl_days) * 86400) if ttl_days else None,
+        "revoked": False,
+        "epoch": shares_epoch(cfg),
+    }
+    _shares(cfg).append(grant)
+    save_config(cfg)
+    return grant, token
+
+
+def _share_active(cfg, g):
+    if g.get("revoked"):
+        return False
+    if g.get("epoch", 0) != shares_epoch(cfg):
+        return False
+    exp = g.get("expires")
+    if exp is not None and time.time() > exp:
+        return False
+    return True
+
+
+def find_share_by_token(cfg, token):
+    """Constant-time-ish scan: compare the token hash against every grant, accept an active match."""
+    th = _share_token_hash(token)
+    match = None
+    for g in _shares(cfg):
+        if hmac.compare_digest(g.get("token_hash", ""), th) and _share_active(cfg, g):
+            match = g
+    return match
+
+
+def find_share_by_id(cfg, sid):
+    for g in _shares(cfg):
+        if g.get("id") == sid:
+            return g
+    return None
+
+
+def revoke_share(cfg, sid):
+    g = find_share_by_id(cfg, sid)
+    if not g:
+        return False
+    g["revoked"] = True
+    save_config(cfg)
+    return True
+
+
+def share_status(cfg, g):
+    if g.get("revoked") or g.get("epoch", 0) != shares_epoch(cfg):
+        return "revoked"
+    exp = g.get("expires")
+    if exp is not None and time.time() > exp:
+        return "expired"
+    return "active"
+
+
+def share_public_view(cfg, g):
+    """Owner-facing view of a grant — never includes the token hash."""
+    v = {k: g.get(k) for k in ("id", "label", "targets", "all", "capability", "created", "expires")}
+    v["status"] = share_status(cfg, g)
+    return v
+
+
+_GUEST_AUDIT = []        # in-memory ring buffer of recent guest mutations (best-effort)
+
+
+def audit_guest(entry):
+    _GUEST_AUDIT.append(entry)
+    if len(_GUEST_AUDIT) > 500:
+        del _GUEST_AUDIT[:len(_GUEST_AUDIT) - 500]
 
 
 # ---------------------------------------------------------------------------
@@ -3571,34 +3695,211 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return not bool(cfg["raw"].get("settings", {}).get("setup_skipped"))
 
-    def _auth_ok(self, cfg):
+    def _principal(self, cfg):
+        """Resolve the requester to {"type": "owner"|"guest", "scope": ...}, or None if unauthenticated.
+        Guest grants are re-validated from cfg on every request, so revoke / expiry / scope edits take
+        effect immediately (a now-stale guest session is dropped and returns None)."""
         if not self._auth_required(cfg):
-            return True
+            return {"type": "owner", "scope": None}
         tok = self._cookie_token()
-        if tok and _session_valid(tok, session_epoch(cfg)):
-            return True
-        # legacy basic-auth fallback (e.g. behind a tunnel without a set password)
+        if tok:
+            sess = _SESSIONS.get(tok)
+            if sess and _session_valid(tok, session_epoch(cfg)):
+                if sess.get("principal") == "guest":
+                    scope = sess.get("scope") or {}
+                    g = find_share_by_id(cfg, scope.get("grant_id"))
+                    if not g or not _share_active(cfg, g):
+                        _SESSIONS.pop(tok, None)
+                        return None
+                    return {"type": "guest", "grant_id": g["id"],
+                            "scope": {"targets": g.get("targets", []), "all": bool(g.get("all")),
+                                      "capability": g.get("capability", "view")}}
+                return {"type": "owner", "scope": None}   # sessions without a principal key = owner
+        # legacy basic-auth fallback (e.g. behind a tunnel without a set password) — owner
         if ABM_USER and ABM_PASS:
             h = self.headers.get("Authorization", "")
             if h.startswith("Basic "):
                 try:
                     u, p = base64.b64decode(h[6:]).decode().split(":", 1)
                     if u == ABM_USER and p == ABM_PASS:
-                        return True
+                        return {"type": "owner", "scope": None}
                 except Exception:
                     pass
+        return None
+
+    def _auth_ok(self, cfg):
+        return self._principal(cfg) is not None
+
+    # ---- authorization guards (owner vs scoped guest) ----
+    def _is_owner(self, princ):
+        return princ is not None and princ.get("type") == "owner"
+
+    def _cap_ok(self, princ, level):
+        if princ is None:
+            return False
+        if princ["type"] == "owner":
+            return True
+        return CAP_RANK.get(princ["scope"].get("capability"), -1) >= CAP_RANK.get(level, 99)
+
+    def _guest_target(self, princ, name):
+        """For a guest, is `name` in scope and on which node? Returns (in_scope, node|None)."""
+        sc = princ["scope"]
+        for t in sc.get("targets", []):
+            if t.get("name") == name:
+                return True, (t.get("node") or None)
+        if sc.get("all"):
+            return True, None        # `all` covers local bots only
+        return False, None
+
+    def _guard_owner(self, princ):
+        if self._is_owner(princ):
+            return True
+        self._json({"error": "forbidden"}, 403)
         return False
+
+    def _guard_cap(self, princ, level):
+        if self._cap_ok(princ, level):
+            return True
+        self._json({"error": "forbidden"}, 403)
+        return False
+
+    def _guard_target(self, princ, name):
+        """Owner: always ok (node from cookie). Guest: must be in scope, else 404 (enumeration-resistant).
+        Returns (ok, node) — node is the box the bot is on for guests (None=local); None for owners."""
+        if self._is_owner(princ):
+            return True, None
+        ok, node = self._guest_target(princ, name)
+        if not ok:
+            self._json({"error": "no such instance"}, 404)
+            return False, None
+        return True, node
+
+    # ---- guest route classification (default-deny: anything not listed is owner-only) ----
+    _INST_RE = re.compile(r"^/api/instances/([^/]+)/(.+)$")
+
+    @staticmethod
+    def _inst_tier(rest, method):
+        """Capability tier required for an instance sub-route, or None = owner-only/unknown."""
+        if rest.startswith("viewer/"):
+            return "view"
+        if rest.startswith("control/"):
+            sub = rest[len("control/"):]
+            if sub in ("state", "commands"):
+                return "view"
+            if sub == "config":
+                return "config" if method == "POST" else "view"
+            if sub == "command":
+                return "operate"
+            return None
+        if method == "GET":
+            return "view" if rest in ("logs", "config") else None
+        if rest in ("start", "stop", "restart", "command"):
+            return "operate"
+        if rest in ("config", "proxy", "limits", "autostart"):
+            return "config"
+        return None     # delete / rename / anything else => owner-only
+
+    def _classify_guest(self, path, method, q):
+        """Classify a guest request: ('open',) allowed non-instance; ('inst', name, tier) instance-scoped;
+        None = deny (owner-only / unknown). Default-deny is the safe posture."""
+        if path in ("/", "/index.html", "/logout", "/api/authstatus", "/api/instances"):
+            return ("open",)
+        if path in ("/control", "/control/"):
+            name = (q.get("inst", [""])[0] or "").strip()
+            return ("inst", name, "view") if name else None
+        if path.startswith("/control/"):        # static js/html asset, no bot data
+            return ("open",)
+        m = self._INST_RE.match(path)
+        if m:
+            tier = self._inst_tier(m.group(2), method)
+            return ("inst", m.group(1), tier) if tier else None
+        return None
+
+    def _guest_gate(self, princ, path, method, q):
+        """Enforce a guest's scope for this request. Returns (allow, node): allow=False means a response
+        was already sent; node is the box to route instance requests to (None=local). Owners pass through."""
+        if not princ or princ["type"] != "guest":
+            return True, self._selected_node()      # owner: cookie-driven node as today
+        cls = self._classify_guest(path, method, q)
+        if cls is None:
+            self._json({"error": "forbidden"}, 403)
+            return False, None
+        if cls[0] == "inst":
+            _, name, tier = cls
+            ok, gnode = self._guard_target(princ, name)
+            if not ok:
+                return False, None                  # 404 sent
+            if not self._guard_cap(princ, tier):
+                return False, None                  # 403 sent
+            if method == "POST":                     # audit guest mutations (best-effort)
+                audit_guest({"ts": time.time(), "grant_id": princ.get("grant_id"),
+                             "ip": self._client_ip(), "path": path, "target": name, "tier": tier})
+            return True, gnode                       # route to the bot's box (None=local)
+        return True, None                            # 'open' → handled locally
+
+    # ---- /s/<token> share-link redemption ----
+    _SHARE_RE = re.compile(r"^/s/([A-Za-z0-9_-]+)$")
+
+    def _redeem_share(self, cfg, token):
+        ip = self._client_ip()
+        if _rate_limited(ip):
+            return self._json({"error": "too many attempts"}, 429)
+        grant = find_share_by_token(cfg, token)
+        if not grant:
+            _record_fail(ip)
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            body = (b"<!doctype html><meta charset=utf-8><title>Link unavailable</title>"
+                    b"<div style='max-width:460px;margin:14vh auto;font:400 15px/1.6 system-ui,sans-serif;"
+                    b"color:#cdd9e2;background:#0d141b;border:1px solid #1c2a36;border-radius:12px;padding:1.4rem'>"
+                    b"<h2 style='margin:.2rem 0 .6rem'>This link is invalid or has expired</h2>"
+                    b"<p style='opacity:.8'>Ask the owner for a new share link.</p></div>")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
+        # mint a scoped guest session; Lax cookie so the link works clicked from elsewhere
+        scope = {"grant_id": grant["id"], "targets": grant.get("targets", []),
+                 "all": bool(grant.get("all")), "capability": grant.get("capability", "view"),
+                 "shares_epoch": shares_epoch(cfg)}
+        tok = _new_session(session_epoch(cfg), scope=scope)
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self._set_session_cookie(tok, samesite="Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _authstatus(self, cfg):
+        princ = self._principal(cfg)
+        out = {"required": self._auth_required(cfg),
+               "authed": princ is not None,
+               "needs_setup": self._needs_setup(cfg)}
+        if princ is None:
+            out["principal"] = "anon"
+        elif princ["type"] == "owner":
+            out["principal"] = "owner"
+        else:
+            sc = princ["scope"]
+            out["principal"] = "guest"
+            out["capability"] = sc.get("capability")
+            out["targets"] = sc.get("targets", [])
+            out["all"] = sc.get("all", False)
+        return self._json(out)
 
     def _client_ip(self):
         return self.client_address[0] if self.client_address else "?"
 
-    def _set_session_cookie(self, token, clear=False):
+    def _set_session_cookie(self, token, clear=False, samesite="Strict"):
+        # SameSite=Lax is used only on the /s/<token> redemption hop so a link clicked from
+        # Discord/email keeps the cookie; owner login stays Strict. Lax still blocks CSRF on the
+        # mutating POSTs (none are top-level navigations).
         if clear:
             self.send_header("Set-Cookie",
-                             "abm_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+                             f"abm_session=; Path=/; HttpOnly; SameSite={samesite}; Max-Age=0")
         else:
             self.send_header("Set-Cookie",
-                             f"abm_session={token}; Path=/; HttpOnly; SameSite=Strict; "
+                             f"abm_session={token}; Path=/; HttpOnly; SameSite={samesite}; "
                              f"Max-Age={SESSION_TTL}")
 
     # ---- helpers ----
@@ -3683,7 +3984,8 @@ class Handler(BaseHTTPRequestHandler):
         return (path in ("/logout", "/api/authstatus", "/api/transfer", "/api/box/roots")
                 or path.startswith("/api/node/")     # /api/node/select
                 or path.startswith("/api/nodes")     # /api/nodes, .../remove, .../do*
-                or path.startswith("/api/fleet/"))
+                or path.startswith("/api/fleet/")
+                or path.startswith("/api/shares"))   # share grants live on the controller
 
     def _inject_switcher_str(self, text, current, label=""):
         if "<body>" not in text or "abmNodeBar" in text:
@@ -3993,9 +4295,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # whether auth is on, expose it so the login page can decide what to show
         if path == "/api/authstatus":
-            return self._json({"required": self._auth_required(cfg),
-                               "authed": self._auth_ok(cfg),
-                               "needs_setup": self._needs_setup(cfg)})
+            return self._authstatus(cfg)
+
+        # share-link redemption: mints a scoped guest session (before the auth gate)
+        msh = self._SHARE_RE.match(path)
+        if msh:
+            return self._redeem_share(cfg, msh.group(1))
 
         # First run: the setup wizard owns the UI until a login is created
         # (or the user explicitly skips to run open on localhost).
@@ -4004,14 +4309,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(SETUP_PAGE)
             return self._json({"error": "setup required"}, 401)
 
-        if not self._auth_ok(cfg):
+        princ = self._principal(cfg)
+        if princ is None:
             # unauthenticated: only the login page and its check are reachable
             if path in ("/", "/index.html", "/login"):
                 return self._html(LOGIN_PAGE)
             return self._json({"error": "unauthorized"}, 401)
 
-        # controller: a selected node proxies the whole UI through its SSH tunnel
-        node = self._selected_node()
+        # controller: a selected node proxies the whole UI through its SSH tunnel.
+        # Guests never drive box-switching — _guest_gate enforces scope/capability and
+        # resolves the node from the grant's target instead of the abm_node cookie.
+        allow, node = self._guest_gate(princ, path, "GET", q)
+        if not allow:
+            return
         # The viewer SSE feed must stream, so it bypasses the buffering node-proxy: handle it here and
         # let _viewer_stream pick its upstream (the selected box's manager, else the local bot).
         if path.startswith("/api/instances/") and path.endswith("/viewer/stream"):
@@ -4211,8 +4521,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/instances":
             cfg = self._cfg()
-            out = []
-            for i in cfg["instances"]:
+
+            def _row(i):
                 st = instance_status(i)
                 row = {
                     "name": i["name"],
@@ -4229,8 +4539,45 @@ class Handler(BaseHTTPRequestHandler):
                         row["stats"] = instance_stats(i)
                     except Exception:
                         row["stats"] = None
-                out.append(row)
-            return self._json({"instances": out})
+                return row
+
+            insts = cfg["instances"]
+            if princ and princ["type"] == "guest":
+                # guests see only their granted bots — local filtered here, remote fetched per-node
+                sc = princ["scope"]
+                local_names = {t["name"] for t in sc.get("targets", []) if not t.get("node")}
+                local = cfg["instances"] if sc.get("all") else [i for i in insts if i["name"] in local_names]
+                out = [_row(i) for i in local]
+                remote = {}
+                for t in sc.get("targets", []):
+                    if t.get("node"):
+                        remote.setdefault(t["node"], set()).add(t["name"])
+                for nodename, names in remote.items():
+                    nd = find_node(load_nodes(), nodename)
+                    if not nd:
+                        continue
+                    try:
+                        data = node_request(nd, "GET", "/api/instances", timeout=8)
+                        for row in (data or {}).get("instances", []):
+                            if row.get("name") in names:
+                                row["node"] = nodename
+                                out.append(row)
+                    except Exception:
+                        pass
+                return self._json({"instances": out})
+
+            return self._json({"instances": [_row(i) for i in insts]})
+
+        if path == "/api/shares":
+            if not self._guard_owner(princ):
+                return
+            cfg = self._cfg()
+            return self._json({"shares": [share_public_view(cfg, g) for g in _shares(cfg)]})
+
+        if path == "/api/shares/audit":
+            if not self._guard_owner(princ):
+                return
+            return self._json({"audit": list(reversed(_GUEST_AUDIT[-60:]))})
 
         m = re.match(r"^/api/instances/([^/]+)/logs$", path)
         if m:
@@ -4301,17 +4648,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "invalid credentials"}, 401)
             return self._json({"ok": True}, cookie=_new_session(session_epoch(cfg)))
 
-        if not self._auth_ok(cfg):
+        princ = self._principal(cfg)
+        if princ is None:
             return self._json({"error": "unauthorized"}, 401)
 
-        # controller: proxy mutating requests to the selected node too (skip switcher controls)
-        node = self._selected_node()
+        # controller: proxy mutating requests to the selected node too (skip switcher controls).
+        # Guests are scoped by grant (no box-switch cookie); _guest_gate may route to a remote node.
+        pq = parse_qs(urlparse(self.path).query)
+        allow, node = self._guest_gate(princ, path, "POST", pq)
+        if not allow:
+            return
         if node is not None and not self._is_switcher_path(path):
             return self._proxy_to_node(node)
 
         # live control plane: POST a command to a bot, or write a config field (forwarded to its loopback /control/*)
         if path.startswith("/api/instances/") and (path.endswith("/control/command") or path.endswith("/control/config")):
-            return self._control_relay(path, parse_qs(urlparse(self.path).query))
+            return self._control_relay(path, pq)
 
         # controller: set/clear which box this browser is viewing (abm_node cookie)
         if path == "/api/node/select":
@@ -4334,6 +4686,42 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+
+        # share links (owner-only; controller-local)
+        if path == "/api/shares":
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            try:
+                grant, token = new_share(cfg, p.get("label"), p.get("targets") or [],
+                                         bool(p.get("all")), p.get("capability", "view"),
+                                         p.get("ttl_days"))
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, 400)
+            proto = self.headers.get("X-Forwarded-Proto") or "http"
+            host = self.headers.get("Host") or "this-host"
+            url = f"{proto}://{host}/s/{token}"
+            return self._json({"ok": True, "share": share_public_view(cfg, grant), "url": url})
+
+        if path == "/api/shares/revoke":
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            return self._json({"ok": revoke_share(cfg, (p.get("id") or "").strip())})
+
+        if path == "/api/shares/revoke_all":
+            if not self._guard_owner(princ):
+                return
+            cfg = self._cfg()
+            return self._json({"ok": True, "epoch": bump_shares_epoch(cfg)})
 
         # bulk actions
         m = re.match(r"^/api/(start|stop|restart)_all$", path)
@@ -6012,6 +6400,19 @@ table.tbl tr:hover td{background:#ffffff05}
 .palitem .pk{font-family:var(--mono);font-size:.6rem;color:var(--dim);border:1px solid var(--line);border-radius:5px;padding:.05rem .35rem;white-space:nowrap}
 .palhint{padding:.45rem .85rem;font-family:var(--mono);font-size:.62rem;color:#586675;border-top:1px solid var(--line);display:flex;gap:1rem}
 </style>
+<style>
+/* guest access */
+.guest-badge{display:inline-flex;align-items:center;gap:.3rem;font-size:.72rem;font-weight:700;color:var(--acc);
+  border:1px solid var(--acc);border-radius:8px;padding:.2rem .5rem;background:color-mix(in srgb,var(--acc) 12%,transparent)}
+body.guest .owner-only{display:none!important}
+/* hide per-card controls above the guest's tier (server enforces regardless) */
+body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap-config{display:none!important}
+.shbots{display:flex;flex-wrap:wrap;gap:.3rem .8rem;max-height:150px;overflow:auto}
+.shbot{display:flex;align-items:center;gap:.35rem;color:var(--txt);font-weight:400;font-size:.82rem}
+.shrow{display:flex;align-items:center;gap:.6rem;border:1px solid var(--line);border-radius:8px;padding:.4rem .55rem}
+.rrow{display:flex;flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400}
+.shurl{border:1px solid var(--acc);border-radius:8px;padding:.5rem .6rem;background:color-mix(in srgb,var(--acc) 8%,transparent)}
+</style>
 </head>
 <body>
 <div class="app" id="app"><aside class="side" id="sidebar" style="display:none"></aside><div class="content" id="content">
@@ -6019,16 +6420,18 @@ table.tbl tr:hover td{background:#ffffff05}
   <div class="brand"><span class="dot"></span>Aquarius Bot Manager <small class="ver">v__ABM_VERSION__</small> <small id="clock"></small></div>
   <div class="bulk">
     <button onclick="manualRefresh(this)" title="Refresh now">🔄 Refresh</button>
-    <button onclick="openSettings()">⚙ Settings</button>
-    <button onclick="openConnection()">🔗 Connect</button>
-    <button onclick="openBoxes()">🖥 Boxes</button>
-    <button onclick="openFiles()">📁 Files</button>
-    <button onclick="openProxies()">🌐 Proxies</button>
-    <button onclick="openScan()">⟲ Scan existing</button>
-    <button class="go" onclick="openDeploy()">➕ Add Bot</button>
-    <button class="go" onclick="bulk('start')">▶ Start all</button>
-    <button class="warn" onclick="bulk('restart')">⟳ Restart all</button>
-    <button class="danger" onclick="bulk('stop')">■ Stop all</button>
+    <span id="guestBadge" class="guest-badge" style="display:none"></span>
+    <button class="owner-only" onclick="openSettings()">⚙ Settings</button>
+    <button class="owner-only" onclick="openConnection()">🔗 Connect</button>
+    <button class="owner-only" onclick="openBoxes()">🖥 Boxes</button>
+    <button class="owner-only" onclick="openFiles()">📁 Files</button>
+    <button class="owner-only" onclick="openProxies()">🌐 Proxies</button>
+    <button class="owner-only" onclick="openShares()">👥 Share</button>
+    <button class="owner-only" onclick="openScan()">⟲ Scan existing</button>
+    <button class="go owner-only" onclick="openDeploy()">➕ Add Bot</button>
+    <button class="go owner-only" onclick="bulk('start')">▶ Start all</button>
+    <button class="warn owner-only" onclick="bulk('restart')">⟳ Restart all</button>
+    <button class="danger owner-only" onclick="bulk('stop')">■ Stop all</button>
     <button class="danger" onclick="location.href='/logout'">⎋ Log out</button>
   </div>
 </header>
@@ -6046,6 +6449,45 @@ table.tbl tr:hover td{background:#ffffff05}
 </main>
 </div></div>
 
+<div class="scrim" id="shareScrim" onclick="closeShares(event)">
+  <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">👥 Share access</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Create a link that lets someone operate only the bots you choose, at a capability tier. <b>The link is the credential</b> — anyone with it has access until it expires or you revoke it. Prefer an HTTPS access mode before sharing externally.</div>
+    <div class="modcard open">
+      <div class="mhd"><span class="mtitle">New link</span></div>
+      <div class="mbody" style="gap:.6rem">
+        <label style="color:var(--dim)">Label <input id="shLabel" placeholder="Friend's bots" maxlength="80"></label>
+        <label class="rrow"><input type="checkbox" id="shAll" style="width:auto" onchange="shToggleAll()"> All my local bots (current + future)</label>
+        <div id="shBotsWrap"><div style="color:var(--dim);font-size:.8rem;margin-bottom:.25rem">Bots</div><div id="shBots" class="shbots"><span class="hint">loading…</span></div></div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.82rem">
+          <span class="hint">Capability</span>
+          <label class="rrow"><input type="radio" name="shcap" value="view" checked style="width:auto"> View</label>
+          <label class="rrow"><input type="radio" name="shcap" value="operate" style="width:auto"> Operate</label>
+          <label class="rrow"><input type="radio" name="shcap" value="config" style="width:auto"> Config</label>
+          <span class="hint" style="flex-basis:100%;margin:.1rem 0 0">View = read-only · Operate = + start/stop/commands · Config = + edit settings. Delete/rename/deploy stay owner-only.</span>
+        </div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.82rem">
+          <span class="hint">Expires</span>
+          <select id="shTtl" style="width:auto"><option value="1">1 day</option><option value="7" selected>7 days</option><option value="30">30 days</option><option value="">Never</option></select>
+        </div>
+        <div class="mbar"><span class="msg" id="shMsg" style="color:var(--dim);flex:1"></span>
+          <button class="go" onclick="createShare(this)">Create link</button></div>
+        <div id="shResult" style="display:none"></div>
+      </div>
+    </div>
+    <div class="modcard open" style="margin-top:.4rem">
+      <div class="mhd"><span class="mtitle">Existing links</span></div>
+      <div class="mbody">
+        <div id="shList" style="display:flex;flex-direction:column;gap:.3rem;font-size:.82rem"><span class="hint">No links yet.</span></div>
+        <div class="mbar"><span style="flex:1"></span><button class="danger" onclick="revokeAllShares(this)">Revoke all links</button></div>
+      </div>
+    </div>
+    <div class="modcard" id="shAuditCard" style="margin-top:.4rem">
+      <div class="mhd" onclick="document.getElementById('shAuditCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Recent guest activity</span></div>
+      <div class="mbody"><div id="shAudit" style="display:flex;flex-direction:column;gap:.2rem;font-size:.76rem;font-family:var(--mono);max-height:200px;overflow:auto"><span class="hint">No guest actions recorded.</span></div></div>
+    </div>
+  </div>
+</div>
 <div class="scrim" id="connScrim" onclick="closeConnection(event)">
   <div class="modal" style="width:min(560px,94vw)" onclick="event.stopPropagation()">
     <div class="mhead">Connect / Reconnect</div>
@@ -6768,7 +7210,7 @@ async function refresh(){
       <div class="top">
         <div class="name">${esc(i.name)}</div>
         <div style="display:flex;align-items:center;gap:.4rem">
-          <span class="star ${i.autostart?'on':''}" title="${i.autostart?'Autostart on — launches on boot':'Autostart off'}" onclick="toggleAuto('${jsq(i.name)}',${!i.autostart})">${i.autostart?'★':'☆'}</span>
+          <span class="star cap-config ${i.autostart?'on':''}" title="${i.autostart?'Autostart on — launches on boot':'Autostart off'}" onclick="toggleAuto('${jsq(i.name)}',${!i.autostart})">${i.autostart?'★':'☆'}</span>
           ${badge(i.status)}
         </div>
       </div>
@@ -6776,13 +7218,13 @@ async function refresh(){
       <div class="cstate s-${i.conn?i.conn.state:'offline'}">${connLabel(i.conn)}</div>
       ${i.status==='running'&&i.stats?statBars(i.stats,i.limits):''}
       <div class="row">
-        <button class="go" onclick="act('${jsq(i.name)}','start',this)"><i class="ic">▶</i><span class="lbl">Start</span></button>
-        <button class="warn" onclick="act('${jsq(i.name)}','restart',this)"><i class="ic">⟳</i><span class="lbl">Restart</span></button>
-        <button class="danger" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i><span class="lbl">Stop</span></button>
+        <button class="go cap-operate" onclick="act('${jsq(i.name)}','start',this)"><i class="ic">▶</i><span class="lbl">Start</span></button>
+        <button class="warn cap-operate" onclick="act('${jsq(i.name)}','restart',this)"><i class="ic">⟳</i><span class="lbl">Restart</span></button>
+        <button class="danger cap-operate" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i><span class="lbl">Stop</span></button>
         <button class="mini" title="More" onclick="openDrawer('${jsq(i.name)}')">⋯</button>
         <button class="mini" title="Live viewer" onclick="openViewer('${jsq(i.name)}')">👁</button>
-        <button class="mini" title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
-        <button class="mini danger" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
+        <button class="mini owner-only" title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
+        <button class="mini danger owner-only" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
       </div>
     </div>`).join('');
   updateSidebarLive();
@@ -9041,7 +9483,74 @@ function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>'
 function jsq(s){return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
 function tick(){$('clock').textContent=new Date().toLocaleTimeString();syncAgo();}
 setInterval(tick,1000);tick();
+
+/* ---- share access (owner) ---- */
+function openShares(){ $('shareScrim').classList.add('open'); $('shResult').style.display='none'; $('shMsg').textContent=''; shToggleAll(); loadShareBots(); loadShares(); loadAudit(); }
+async function loadAudit(){
+  try{ const d=await (await fetch('/api/shares/audit')).json(); const a=d.audit||[];
+    $('shAudit').innerHTML=a.length?a.map(e=>'<div>'+new Date(e.ts*1000).toLocaleString()+' · <b>'+esc(e.target||'')+'</b> · '+esc((e.path||'').replace('/api/instances/'+(e.target||''),''))+' <span class="hint">['+esc(e.tier||'')+']</span></div>').join(''):'<span class="hint">No guest actions recorded.</span>';
+  }catch(e){ $('shAudit').innerHTML='<span class="hint">Could not load.</span>'; }
+}
+function closeShares(e){ if(!e||e.target.id==='shareScrim') $('shareScrim').classList.remove('open'); }
+function shToggleAll(){ const on=$('shAll').checked; $('shBotsWrap').style.opacity=on?.4:1; $('shBotsWrap').style.pointerEvents=on?'none':'auto'; }
+async function loadShareBots(){
+  const w=$('shBots');
+  try{ const d=await (await fetch('/api/instances')).json();
+    w.innerHTML=(d.instances||[]).map(i=>'<label class="shbot"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto"> '+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</label>').join('')||'<span class="hint">No bots.</span>';
+  }catch(e){ w.innerHTML='<span class="hint">Could not load bots.</span>'; }
+}
+async function createShare(btn){
+  const all=$('shAll').checked;
+  const targets=[...$('shBots').querySelectorAll('input:checked')].map(c=>({node:c.dataset.node||null,name:c.value}));
+  if(!all && !targets.length){ $('shMsg').textContent='Pick at least one bot, or “All”.'; return; }
+  const cap=document.querySelector('input[name=shcap]:checked').value;
+  const ttl=$('shTtl').value;
+  btn.disabled=true; $('shMsg').textContent='Creating…';
+  try{
+    const r=await fetch('/api/shares',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({label:$('shLabel').value,all:all,targets:targets,capability:cap,ttl_days:ttl?Number(ttl):null})});
+    const d=await r.json();
+    if(!r.ok||!d.ok){ $('shMsg').textContent=d.error||'failed'; return; }
+    $('shMsg').textContent='';
+    $('shResult').style.display='block';
+    $('shResult').innerHTML='<div class="shurl"><div style="color:var(--acc);font-size:.78rem;font-weight:600">Link created — copy it now, it won’t be shown again:</div>'+
+      '<div style="display:flex;gap:.4rem;margin-top:.35rem"><input id="shUrl" readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.76rem"><button onclick="shCopy()">Copy</button></div></div>';
+    $('shLabel').value=''; loadShares();
+  }catch(e){ $('shMsg').textContent='error'; }
+  finally{ btn.disabled=false; }
+}
+function shCopy(){ const i=$('shUrl'); if(!i)return; i.select(); try{ navigator.clipboard.writeText(i.value); }catch(e){ try{document.execCommand('copy');}catch(_){} } }
+async function loadShares(){
+  try{ const d=await (await fetch('/api/shares')).json(); const list=d.shares||[];
+    $('shList').innerHTML=list.length?list.map(s=>{
+      const scope=s.all?'all local bots':((s.targets||[]).map(t=>t.name+(t.node?'@'+t.node:'')).join(', ')||'—');
+      const exp=s.expires?new Date(s.expires*1000).toLocaleDateString():'never';
+      const stc=({active:'var(--acc)',expired:'var(--warn)',revoked:'var(--danger)'})[s.status]||'var(--dim)';
+      return '<div class="shrow"><div style="flex:1;min-width:0"><b>'+esc(s.label)+'</b> <span class="badge" style="border-color:'+stc+';color:'+stc+'">'+s.status+'</span>'+
+        '<div class="hint">'+esc(scope)+' · '+esc(s.capability)+' · expires '+exp+'</div></div>'+
+        (s.status==='active'?'<button class="danger" onclick="revokeShare(\''+esc(s.id)+'\',this)">Revoke</button>':'')+'</div>';
+    }).join(''):'<span class="hint">No links yet.</span>';
+  }catch(e){ $('shList').innerHTML='<span class="hint">Could not load.</span>'; }
+}
+async function revokeShare(id,btn){ btn.disabled=true; try{ await fetch('/api/shares/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }catch(e){} loadShares(); }
+async function revokeAllShares(btn){ if(!confirm('Revoke ALL share links? Anyone using one loses access immediately.'))return; btn.disabled=true; try{ await fetch('/api/shares/revoke_all',{method:'POST'}); }catch(e){} btn.disabled=false; loadShares(); }
+
+/* ---- principal gating (owner vs scoped guest) ---- */
+async function applyPrincipal(){
+  let d; try{ d=await (await fetch('/api/authstatus')).json(); }catch(e){ return; }
+  const p=d.principal||'owner';
+  if(p==='guest'){
+    document.body.classList.add('guest','guest-'+(d.capability||'view'));
+    const b=$('guestBadge'); if(b){ b.style.display='inline-flex'; b.textContent='Guest · '+(d.capability||'view'); }
+    // belt-and-suspenders: hide any owner-only control the layout built without the class
+    document.querySelectorAll('button[onclick]').forEach(el=>{
+      if(/open(Settings|Connection|Boxes|Files|Proxies|Scan|Deploy|Shares)\(|bulk\(/.test(el.getAttribute('onclick')||'')) el.classList.add('owner-only');
+    });
+  }
+}
+
 loadSettings();
+applyPrincipal();
 refresh();
 setInterval(refresh,3000);
 // refresh the instant the tab becomes visible / regains focus, so you never
