@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.6.0 — *latest*
+## v3.7.0 — *latest*
+
+- **One-click "Migrate to AquariusProxy".** Any bot detected as **ZenithProxy** now shows an **⇪ Aquarius** button on its card (owner/admin). It converts the bot to AquariusProxy **in place, keeping its `config.json` and Minecraft account** (`mc_auth_cache.json`): it stops the bot, **backs up** `config.json` / `mc_auth_cache.json` / `launch_config.json` / `launch` / the jar to a `premigrate-…` folder, repoints the launcher to `aquariusnetwork9/AquariusProxy` (keeping the valid version), **swaps the `launch` binary** for the Aquarius launcher (the step that actually makes it stick), and restarts. A dialog shows the steps + a live log and warns that external plugin jars won't load on AquariusProxy (many have baked-in equivalents). A **Roll back** button restores the backup if anything looks off. Works on remote-box bots too.
+
+## v3.6.0
 
 - **Fine-grained per-user permissions — owners decide exactly what each user can do.** On top of the role tiers, open **👤 Users → Permissions** on any operate/config user to control, per user:
   - **Which modules** they can **use** (see + toggle on/off) and **configure** (the ⚙ live-config panel) — a per-module matrix grouped by category, or "all modules".

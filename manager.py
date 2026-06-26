@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1904,6 +1904,163 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
 
     DEPLOY_JOB.start(name, target)
     return {"ok": True, "name": name, "dir": directory, "repo": repo}
+
+
+# ---------------------------------------------------------------------------
+# in-place fork migration  (ZenithProxy bot -> AquariusProxy, keep config + account)
+# ---------------------------------------------------------------------------
+# Reuses the deploy launcher-download. The validated recipe (see the migration memo):
+# stop -> back up -> repoint launch_config.json (rfresh2/ZenithProxy ->
+# aquariusnetwork9/AquariusProxy, keep the valid version) -> SWAP the launch binary for the
+# Aquarius launcher (the key gotcha — repointing alone makes rfresh's launcher fall back to the
+# old jar) -> start. config.json + mc_auth_cache.json (the account) are kept untouched.
+MIGRATE_JOB = DeployJob()      # background run + polled log, same machinery as Deploy
+
+
+def _premigrate_backups(directory):
+    """Existing pre-migration backup subdirs in a bot dir, oldest..newest."""
+    try:
+        ds = [d for d in os.listdir(directory)
+              if d.startswith("premigrate-") and os.path.isdir(os.path.join(directory, d))]
+    except OSError:
+        return []
+    return sorted(ds)
+
+
+def _find_launch_binary(root):
+    """Locate the `launch` executable inside an extracted launcher-v3 tree."""
+    for base, _dirs, files in os.walk(root):
+        if "launch" in files:
+            return os.path.join(base, "launch")
+    return None
+
+
+def migrate_to_aquarius(cfg_path, name):
+    """Migrate a ZenithProxy bot to AquariusProxy IN PLACE, keeping config.json + the account
+    (mc_auth_cache.json). Background job; poll MIGRATE_JOB."""
+    cfg = load_config(cfg_path)
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError("no such bot")
+    directory = inst["dir"]
+    info = proxy_info(directory) or {}
+    if info.get("fork") == "AquariusProxy":
+        raise ValueError("this bot is already AquariusProxy")
+    if not os.path.isfile(os.path.join(directory, "launch_config.json")):
+        raise ValueError("no launch_config.json in the bot dir — can't migrate a hand-rolled launch")
+
+    def target(log):
+        import urllib.request, zipfile, tempfile
+        lc_path = os.path.join(directory, "launch_config.json")
+        log(f"migrating '{name}'  ({info.get('fork') or 'unknown'} {info.get('version') or ''}) -> AquariusProxy")
+        log(f"dir: {directory}")
+        pdir = os.path.join(directory, "plugins")
+        if os.path.isdir(pdir):
+            jars = [f for f in os.listdir(pdir) if f.endswith(".jar")]
+            if jars:
+                log(f"[warn] {len(jars)} external plugin jar(s) will NOT load on AquariusProxy "
+                    f"(package rename): {', '.join(jars)}. Several have baked-in Aquarius equivalents.")
+        # 1) stop
+        log("stopping bot…")
+        stop(inst)
+        for _ in range(30):
+            if instance_status(inst) != "running":
+                break
+            time.sleep(0.5)
+        # 2) back up what migration changes (+ config/account for safety)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bak = os.path.join(directory, "premigrate-" + ts)
+        os.makedirs(bak, exist_ok=True)
+        backed = []
+        for fn in ("config.json", "mc_auth_cache.json", "launch_config.json", "launch"):
+            src = os.path.join(directory, fn)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(bak, fn)); backed.append(fn)
+        for fn in os.listdir(directory):                       # the existing ZenithProxy.jar
+            if fn.lower().endswith(".jar") and os.path.isfile(os.path.join(directory, fn)):
+                shutil.copy2(os.path.join(directory, fn), os.path.join(bak, fn)); backed.append(fn)
+        log(f"backed up -> {os.path.basename(bak)}  ({', '.join(backed)})")
+        # 3) repoint launch_config.json (keep the valid version; let the launcher pull the jar)
+        with open(lc_path) as f:
+            lc = json.load(f)
+        lc["repo_owner"] = "aquariusnetwork9"
+        lc["repo_name"] = "AquariusProxy"
+        lc["auto_update_launcher"] = False     # we manage the launcher binary ourselves
+        lc["auto_update"] = True
+        with open(lc_path, "w") as f:
+            json.dump(lc, f, indent=2)
+        log("repointed launch_config.json -> aquariusnetwork9/AquariusProxy (kept version)")
+        # 4) swap the launcher binary — the key step (repointing alone falls back to the old jar)
+        osname, arch = _detect_platform()
+        asset, url = _launcher_asset("aquariusnetwork9/AquariusProxy", osname, arch, log)
+        tmp = tempfile.mkdtemp(prefix="aqmig-")
+        try:
+            zp = os.path.join(tmp, asset)
+            log(f"downloading Aquarius launcher: {asset} …")
+            req = urllib.request.Request(url, headers={"User-Agent": "aquarius-bot-manager"})
+            with urllib.request.urlopen(req, timeout=300) as r, open(zp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            with zipfile.ZipFile(zp) as z:
+                z.extractall(tmp)
+            newlaunch = _find_launch_binary(tmp)
+            if not newlaunch:
+                raise ValueError("the Aquarius launcher zip has no 'launch' binary")
+            shutil.copy2(newlaunch, os.path.join(directory, "launch"))
+            os.chmod(os.path.join(directory, "launch"), 0o755)
+            log("swapped the launch binary -> Aquarius launcher")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        # 5) start
+        log("starting bot…")
+        start(inst)
+        log("✓ migration done — the Aquarius launcher removes ZenithProxy.jar and pulls AquariusProxy.")
+        log("  Watch the console for 'config.json loaded.' then 'AquariusProxy started!', then run `connect` to log in.")
+        log("  Same account + settings are kept. If anything's off, use Roll back (restores "
+            + os.path.basename(bak) + ").")
+
+    MIGRATE_JOB.start(name, target)
+    return {"ok": True, "name": name, "dir": directory}
+
+
+def rollback_migration(cfg_path, name):
+    """Restore the most recent pre-migration backup (launcher + configs + the ZenithProxy jar) and
+    restart on the old fork. Background job; poll MIGRATE_JOB."""
+    cfg = load_config(cfg_path)
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError("no such bot")
+    directory = inst["dir"]
+    baks = _premigrate_backups(directory)
+    if not baks:
+        raise ValueError("no pre-migration backup found for this bot")
+    bak = os.path.join(directory, baks[-1])
+
+    def target(log):
+        log(f"rolling '{name}' back from {os.path.basename(bak)}")
+        log("stopping bot…")
+        stop(inst)
+        for _ in range(30):
+            if instance_status(inst) != "running":
+                break
+            time.sleep(0.5)
+        for fn in os.listdir(directory):       # drop the AquariusProxy jar the new launcher pulled
+            if fn.lower().endswith(".jar") and "aquarius" in fn.lower():
+                try:
+                    os.remove(os.path.join(directory, fn)); log(f"removed {fn}")
+                except OSError:
+                    pass
+        for fn in os.listdir(bak):
+            shutil.copy2(os.path.join(bak, fn), os.path.join(directory, fn))
+        lpath = os.path.join(directory, "launch")
+        if os.path.exists(lpath):
+            os.chmod(lpath, 0o755)
+        log(f"restored {', '.join(sorted(os.listdir(bak)))}")
+        log("starting bot…")
+        start(inst)
+        log("✓ rolled back — the original launcher + jar are restored; watch the console.")
+
+    MIGRATE_JOB.start(name, target)
+    return {"ok": True, "name": name, "restored_from": os.path.basename(bak)}
 
 
 # ---------------------------------------------------------------------------
@@ -5742,6 +5899,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/deploy/job":
             return self._json(DEPLOY_JOB.snapshot())
 
+        if path == "/api/migrate/job":
+            return self._json(MIGRATE_JOB.snapshot())
+
         if path == "/api/instances":
             cfg = self._cfg()
 
@@ -6474,6 +6634,20 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 code = 404 if str(e).startswith("no such") else 400
                 return self._json({"error": str(e)}, code)
+
+        # in-place ZenithProxy -> AquariusProxy migration (owner-only; background job) + rollback
+        m = re.match(r"^/api/instances/([^/]+)/migrate$", path)
+        if m:
+            try:
+                return self._json(migrate_to_aquarius(self.cfg_path, urllib.parse.unquote(m.group(1))))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+        m = re.match(r"^/api/instances/([^/]+)/migrate/rollback$", path)
+        if m:
+            try:
+                return self._json(rollback_migration(self.cfg_path, urllib.parse.unquote(m.group(1))))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
 
         # per-instance action
         m = re.match(r"^/api/instances/([^/]+)/(start|stop|restart)$", path)
@@ -8326,6 +8500,24 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
   </div>
 </div>
 
+<div class="scrim" id="migrateScrim" onclick="closeMigrate(event)">
+  <div class="modal" style="width:min(620px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">⇪ Migrate to AquariusProxy</div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Convert <b id="migName">this bot</b> from ZenithProxy to <b>AquariusProxy</b> in place — <b>keeps its config and Minecraft account</b>. The bot is stopped, its files backed up, the launcher swapped, and it's restarted on AquariusProxy.</div>
+    <ul class="hint" style="margin:.2rem 0 .5rem;padding-left:1.1rem;line-height:1.6">
+      <li>Stops the bot, then backs up <span style="font-family:var(--mono);font-size:.9em">config.json · mc_auth_cache.json · launch_config.json · launch · the jar</span> to a <span style="font-family:var(--mono);font-size:.9em">premigrate-…</span> folder.</li>
+      <li>Repoints the launcher to AquariusProxy and swaps the <span style="font-family:var(--mono);font-size:.9em">launch</span> binary, then starts it again.</li>
+      <li><b>External plugin jars won't load</b> on AquariusProxy (many have baked-in equivalents). Your account &amp; settings carry over.</li>
+      <li>If anything looks off afterward, hit <b>Roll back</b> to restore the backup.</li>
+    </ul>
+    <pre class="log" id="migLog" style="display:none;min-height:120px;max-height:34vh">…</pre>
+    <div class="mbar"><span class="msg" id="migMsg" style="flex:1;color:var(--dim)"></span>
+      <button onclick="closeMigrate()">Close</button>
+      <button class="warn" id="migRollBtn" style="display:none" onclick="rollbackMigrate()">Roll back</button>
+      <button class="go" id="migBtn" onclick="startMigrate()">Migrate</button></div>
+  </div>
+</div>
+
 <div class="scrim" id="filesScrim" onclick="closeFiles(event)">
   <div class="modal" style="width:min(840px,96vw)" onclick="event.stopPropagation()">
     <div class="mhead">Files</div>
@@ -8797,6 +8989,7 @@ async function refresh(){
         <button class="danger cap-operate" onclick="act('${jsq(i.name)}','stop',this)"><i class="ic">■</i><span class="lbl">Stop</span></button>
         <button class="mini" title="More" onclick="openDrawer('${jsq(i.name)}')">⋯</button>
         <button class="mini" title="Live viewer" onclick="openViewer('${jsq(i.name)}')">👁</button>
+        ${i.proxy&&i.proxy.fork==='ZenithProxy'?`<button class="mini owner-only" title="Migrate to AquariusProxy (keeps config + account)" onclick="openMigrate('${jsq(i.name)}')">⇪ Aquarius</button>`:''}
         <button class="mini owner-only" title="Rename bot" onclick="renameBot('${jsq(i.name)}')">✎</button>
         <button class="mini danger owner-only" title="Delete instance" onclick="del('${jsq(i.name)}','${i.status}')">🗑</button>
       </div>
@@ -10710,6 +10903,44 @@ async function pollDeploy(){
     clearInterval(depTimer); depTimer=null; $('depBtn').disabled=false;
     $('depMsg').style.color=j.status==='done'?'var(--dim)':'var(--crash)';
     $('depMsg').textContent=j.status==='done'?'✓ bot added — start it from the dashboard':'✗ could not add bot';
+    refresh();
+  }
+}
+/* ---- migrate ZenithProxy -> AquariusProxy (owner) ---- */
+let migName=null, migTimer=null;
+function openMigrate(name){
+  migName=name; $('migName').textContent=name;
+  $('migLog').style.display='none'; $('migLog').textContent='';
+  $('migMsg').textContent=''; $('migBtn').disabled=false; $('migBtn').style.display='';
+  $('migRollBtn').style.display='none';
+  $('migrateScrim').classList.add('open');
+}
+function closeMigrate(e){ if(e&&e.target!==$('migrateScrim'))return; if(migTimer){clearInterval(migTimer);migTimer=null;} $('migrateScrim').classList.remove('open'); }
+async function startMigrate(){
+  if(!migName)return;
+  $('migMsg').style.color='var(--dim)'; $('migMsg').textContent='starting…'; $('migBtn').disabled=true; $('migRollBtn').style.display='none';
+  const d=await api('/api/instances/'+encodeURIComponent(migName)+'/migrate','POST',{});
+  if(d.error){ $('migMsg').style.color='var(--crash)'; $('migMsg').textContent='✗ '+d.error; $('migBtn').disabled=false; return; }
+  $('migLog').style.display=''; $('migMsg').textContent='migrating…';
+  if(migTimer)clearInterval(migTimer); migTimer=setInterval(pollMigrate,700); pollMigrate();
+}
+async function rollbackMigrate(){
+  if(!migName)return; if(!confirm('Roll back '+migName+' to ZenithProxy from the latest backup?'))return;
+  $('migMsg').style.color='var(--dim)'; $('migMsg').textContent='rolling back…'; $('migRollBtn').disabled=true; $('migBtn').disabled=true;
+  const d=await api('/api/instances/'+encodeURIComponent(migName)+'/migrate/rollback','POST',{});
+  if(d.error){ $('migMsg').style.color='var(--crash)'; $('migMsg').textContent='✗ '+d.error; $('migRollBtn').disabled=false; return; }
+  $('migLog').style.display=''; $('migMsg').textContent='rolling back…';
+  if(migTimer)clearInterval(migTimer); migTimer=setInterval(pollMigrate,700); pollMigrate();
+}
+async function pollMigrate(){
+  const j=await api('/api/migrate/job');
+  $('migLog').textContent=j.output||'…';
+  $('migLog').scrollTop=$('migLog').scrollHeight;
+  if(j.status==='done'||j.status==='error'){
+    clearInterval(migTimer); migTimer=null; $('migBtn').disabled=false; $('migRollBtn').disabled=false;
+    $('migMsg').style.color=j.status==='done'?'var(--dim)':'var(--crash)';
+    $('migMsg').textContent=j.status==='done'?'✓ done — watch the bot console':'✗ failed — see the log';
+    $('migBtn').style.display='none'; $('migRollBtn').style.display='';   // offer rollback after any run
     refresh();
   }
 }
