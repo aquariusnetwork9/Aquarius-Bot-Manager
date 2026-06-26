@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2449,6 +2449,134 @@ def role_capability(role):
     return "config" if role == "admin" else role
 
 
+# ---------------------------------------------------------------------------
+# Fine-grained permissions — what modules/actions a named user may use
+# ---------------------------------------------------------------------------
+# Control surface module registry (id, friendly name, raw config-class key, category),
+# ported from control/abm-control-data.js (the single source of truth). Used to map a
+# /control/command toggle (`<rawlower> on|off`) and a /control/config path
+# (client.extra.<lcfirst(raw)>.…) back to a module id so the manager can authorize per module.
+CONTROL_MODULES = [
+    ("livemap", "Live Map", "LiveViewer", "control"),
+    ("elytra", "Elytra Autopilot", "ElytraPilot", "control"),
+    ("trader", "Villager Trading", "VillagerTrader", "control"),
+    ("pearl", "Pearl Stasis", "PearlManager", "control"),
+    ("stash", "Stash Manager", "StashScanner", "control"),
+    ("miner", "Auto Miner", "AquariusMiner", "control"),
+    ("enchanter", "Auto Enchanter", "Enchanter", "control"),
+    ("kitmaker", "Kit Builder", "KitMaker", "control"),
+    ("sniffer", "Packet Sniffer", "AquariusSniffer", "control"),
+    ("highway", "Highway Builder", "HighwayBuilder", "control"),
+    ("schematic", "Schematic Builder", "Litematica", "control"),
+    ("boat", "Boat Autopilot", "Boat", "control"),
+    ("regear", "Auto Regear", "Regear", "control"),
+    ("orderfiller", "Order Filler", "OrderFiller", "control"),
+    ("pearldrop", "Pearl Drop", "PearlDrop", "control"),
+    ("flightgear", "Flight Gear", "FlightGear", "control"),
+    ("killaura", "Combat Assist", "KillAura", "combat"),
+    ("autobow", "Auto Bow", "AutoBow", "combat"),
+    ("autoarmor", "Auto Armor", "AutoArmor", "combat"),
+    ("autoeat", "Auto Eat", "AutoEat", "survival"),
+    ("autototem", "Auto Totem", "AutoTotem", "survival"),
+    ("autorespawn", "Auto Respawn", "AutoRespawn", "survival"),
+    ("automend", "Auto Mend", "AutoMend", "survival"),
+    ("autodisconnect", "Auto Disconnect", "AutoDisconnect", "survival"),
+    ("account", "Account & Login", "Authentication", "connection"),
+    ("autoreconnect", "Auto Reconnect", "AutoReconnect", "connection"),
+    ("antikick", "Anti-Kick", "AntiKick", "connection"),
+    ("antiafk", "Anti-AFK", "AntiAFK", "connection"),
+    ("actionlimiter", "Action Limiter", "ActionLimiter", "connection"),
+    ("requeue", "Auto Re-queue", "Requeue", "connection"),
+    ("queuewarn", "Queue Alert", "QueueWarning", "connection"),
+    ("activehours", "Active Hours", "ActiveHours", "connection"),
+    ("sessionlimit", "Session Time Limit", "SessionTimeLimit", "connection"),
+    ("coordprivacy", "Coordinate Privacy", "CoordObfuscation", "privacy"),
+    ("antileak", "Anti-Leak", "AntiLeak", "privacy"),
+    ("visualrange", "Visual Range Alerts", "VisualRange", "privacy"),
+    ("whispercontrol", "Whisper Control", "WhisperControl", "privacy"),
+    ("bridge", "Proxy Bridge", "Bridge", "privacy"),
+    ("autofish", "Auto Fish", "AutoFish", "automation"),
+    ("autodrop", "Auto Drop", "AutoDrop", "automation"),
+    ("spammer", "Chat Broadcaster", "Spammer", "automation"),
+    ("autoreply", "Auto Reply", "AutoReply", "automation"),
+    ("autoportal", "Auto Portal", "AutoPortal", "automation"),
+    ("autoomen", "Bad Omen", "AutoOmen", "automation"),
+    ("chat", "Chat", "Chat", "automation"),
+    ("replaymod", "Replay Recorder", "ReplayMod", "diagnostics"),
+    ("spawnpatrol", "Spawn Patrol", "SpawnPatrol", "diagnostics"),
+    ("discord", "Discord Notifications", "Discord", "diagnostics"),
+]
+_MOD_BY_ID = {m[0]: {"id": m[0], "name": m[1], "raw": m[2], "cat": m[3]} for m in CONTROL_MODULES}
+# raw config key (lowercased) -> module id, used to identify the target of a command/config path
+_RAW2MOD = {m[2].lower(): m[0] for m in CONTROL_MODULES}
+_RAW2MOD.update({"liveviewer": "livemap", "pearlmanager": "pearl"})   # live-name aliases (control-live.js)
+_TOGGLE_RE = re.compile(r"^([A-Za-z0-9_]+)\s+(on|off)$", re.I)
+
+
+def module_catalog():
+    """[{id,name,cat}] for the permissions editor UI."""
+    return [{"id": m[0], "name": m[1], "cat": m[3]} for m in CONTROL_MODULES]
+
+
+def resolve_perms(role, perms):
+    """Resolve a user's effective control permissions from their role tier + optional perms override.
+    Perms only RESTRICT within the tier. Absent perms = full-within-tier (no regression). Returns
+    {use_all, config_all, modules:{id:{use,config}}, console, lifecycle, can_use(id), can_config(id)}."""
+    p = perms or {}
+    has = perms is not None
+    tier = role_capability(role)
+    rank = CAP_RANK.get(tier, 0)
+    op = rank >= CAP_RANK["operate"]
+    cf = rank >= CAP_RANK["config"]
+    use_all = (not has) or bool(p.get("use_all"))
+    config_all = ((not has) or bool(p.get("config_all")))
+    mods = p.get("modules") or {}
+    console = op and ((not has) or bool(p.get("console", True)))
+    lifecycle = op and ((not has) or bool(p.get("lifecycle", True)))
+
+    def can_use(mid):
+        if not op:
+            return False
+        if use_all or config_all:
+            return True
+        e = mods.get(mid) or {}
+        return bool(e.get("use") or e.get("config"))
+
+    def can_config(mid):
+        if not cf:
+            return False
+        if config_all:
+            return True
+        e = mods.get(mid) or {}
+        return bool(e.get("config"))
+
+    return {"use_all": use_all and op, "config_all": config_all and cf,
+            "modules": mods, "console": console, "lifecycle": lifecycle,
+            "can_use": can_use, "can_config": can_config}
+
+
+def perms_public(role, perms):
+    """JSON-safe effective perms for the browser (control-live.js + the editor): per-module use/config
+    booleans + console/lifecycle, with the function fields dropped."""
+    r = resolve_perms(role, perms)
+    return {"use_all": r["use_all"], "config_all": r["config_all"], "console": r["console"],
+            "lifecycle": r["lifecycle"],
+            "modules": {m[0]: {"use": r["can_use"](m[0]), "config": r["can_config"](m[0])}
+                        for m in CONTROL_MODULES}}
+
+
+def sanitize_perms(p):
+    """Coerce an incoming perms object from the UI into the stored shape (or None to clear)."""
+    if not isinstance(p, dict):
+        return None
+    mods = {}
+    for mid, e in (p.get("modules") or {}).items():
+        if mid in _MOD_BY_ID and isinstance(e, dict):
+            mods[mid] = {"use": bool(e.get("use")), "config": bool(e.get("config"))}
+    return {"use_all": bool(p.get("use_all")), "config_all": bool(p.get("config_all")),
+            "modules": mods, "console": bool(p.get("console")), "lifecycle": bool(p.get("lifecycle"))}
+
+
 def _users(cfg):
     return cfg["raw"].setdefault("settings", {}).setdefault("users", [])
 
@@ -2535,7 +2663,7 @@ def set_user_password(cfg, uid, password):
     return True
 
 
-def update_user(cfg, uid, role=None, all_=None, targets=None, disabled=None):
+def update_user(cfg, uid, role=None, all_=None, targets=None, disabled=None, perms="__keep__"):
     u = find_user_by_id(cfg, uid)
     if not u:
         return None
@@ -2552,6 +2680,11 @@ def update_user(cfg, uid, role=None, all_=None, targets=None, disabled=None):
         u["targets"] = targets
     if disabled is not None:
         u["disabled"] = bool(disabled)
+    if perms != "__keep__":
+        if perms is None:
+            u.pop("perms", None)                 # clear -> full-within-tier
+        else:
+            u["perms"] = sanitize_perms(perms)
     save_config(cfg)
     return u
 
@@ -2572,9 +2705,13 @@ def touch_user_login(cfg, uid):
 
 
 def user_public_view(cfg, u):
-    """Owner-facing view of a user — never includes the salt/hash."""
-    return {k: u.get(k) for k in
-            ("id", "username", "role", "all", "targets", "disabled", "created", "last_login")}
+    """Owner-facing view of a user — never includes the salt/hash. Includes the stored perms (may be
+    None = full-within-tier) plus the resolved effective perms for the editor."""
+    v = {k: u.get(k) for k in
+         ("id", "username", "role", "all", "targets", "disabled", "created", "last_login")}
+    v["perms"] = u.get("perms")
+    v["effective"] = perms_public(u.get("role", "view"), u.get("perms"))
+    return v
 
 
 def new_invite(cfg, label, role, all_, targets, username, ttl_days):
@@ -4700,7 +4837,7 @@ class Handler(BaseHTTPRequestHandler):
                         return None
                     role = u.get("role", "view")
                     return {"type": "user", "uid": u["id"], "username": u.get("username", ""),
-                            "role": role,
+                            "role": role, "perms": resolve_perms(role, u.get("perms")),
                             "scope": {"targets": u.get("targets", []),
                                       "all": bool(u.get("all")) or role == "admin",
                                       "capability": role_capability(role)}}
@@ -4830,6 +4967,12 @@ class Handler(BaseHTTPRequestHandler):
                 return False, None                  # 404 sent
             if not self._guard_cap(princ, tier):
                 return False, None                  # 403 sent
+            # fine-grained: a named user without the lifecycle grant can't start/stop/restart bots
+            if princ.get("type") == "user":
+                action = path.rsplit("/", 1)[-1]
+                if action in ("start", "stop", "restart") and not (princ.get("perms") or {}).get("lifecycle"):
+                    self._json({"error": "forbidden"}, 403)
+                    return False, None
             if method == "POST":                     # audit scoped mutations (best-effort)
                 audit_guest({"ts": time.time(), "grant_id": princ.get("grant_id") or princ.get("uid"),
                              "user": princ.get("username"),
@@ -4915,6 +5058,9 @@ class Handler(BaseHTTPRequestHandler):
             out["capability"] = sc.get("capability")
             out["targets"] = sc.get("targets", [])
             out["all"] = sc.get("all", False)
+            # effective control permissions (control-live.js hides what isn't granted; server enforces)
+            _u = find_user_by_id(cfg, princ.get("uid"))
+            out["perms"] = perms_public(princ.get("role"), _u.get("perms") if _u else None)
         else:
             sc = princ["scope"]
             out["principal"] = "guest"
@@ -5217,6 +5363,33 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _control_post_allowed(self, princ, sub, data):
+        """Fine-grained authorization for a named user's control POST (toggles / free-form commands /
+        config writes). Owners/admins resolve to all-true perms so they pass. Guests never reach here as
+        'user'. Deny-by-default: a non-console user may only send an exact `<allowed-module> on|off`."""
+        perms = princ.get("perms") or {}
+        can_use = perms.get("can_use") or (lambda _i: False)
+        can_config = perms.get("can_config") or (lambda _i: False)
+        try:
+            body = json.loads(data or b"{}")
+        except (ValueError, TypeError):
+            return False
+        if sub == "command":
+            if perms.get("console"):
+                return True
+            m = _TOGGLE_RE.match((body.get("command") or "").strip())
+            if not m:
+                return False
+            mid = _RAW2MOD.get(m.group(1).lower())
+            return bool(mid and can_use(mid))
+        if sub == "config":
+            parts = (body.get("path") or "").split(".")
+            if len(parts) >= 3 and parts[0] == "client" and parts[1] == "extra":
+                mid = _RAW2MOD.get(parts[2].lower())
+                return bool(mid and can_config(mid))
+            return False                          # non-module roots (auth/discord/db/server) = owner-only
+        return True
+
     def _control_relay(self, path, q):
         """Relay a bot's loopback /control/* endpoints. GET state|commands; POST command (forwards the JSON body).
         Same per-bot port resolution + cross-box behaviour as the viewer relay. The bot 403s `command` unless its
@@ -5238,9 +5411,14 @@ class Handler(BaseHTTPRequestHandler):
         url = f"http://127.0.0.1:{port}/control/{sub}"
         # command is always a POST; config mirrors the incoming method (GET read / POST field write)
         is_post = sub == "command" or (sub == "config" and self.command == "POST")
+        # read the POST body ONCE up front so we can both authorize it (per-module/console) and relay it
+        data = self._read_body() if (is_post and self.command == "POST") else b"{}"
+        if is_post and self.command == "POST":
+            princ = self._principal(self._cfg())
+            if princ and princ.get("type") == "user" and not self._control_post_allowed(princ, sub, data):
+                return self._json({"error": "forbidden"}, 403)
         try:
             if is_post:
-                data = self._read_body() if self.command == "POST" else b"{}"
                 req = urllib.request.Request(url, data=data or b"{}", method="POST",
                                             headers={"Content-Type": "application/json"})
                 resp = urllib.request.urlopen(req, timeout=20)   # a command may take a while
@@ -5632,6 +5810,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"users": [user_public_view(cfg, u) for u in _users(cfg)],
                                "invites": [invite_public_view(i) for i in _invites(cfg)
                                            if invite_status(i) == "pending"],
+                               "modules": module_catalog(),
                                "owner": _owner_username(cfg)})
 
         if path == "/api/share/tunnel":
@@ -5858,7 +6037,8 @@ class Handler(BaseHTTPRequestHandler):
             cfg = self._cfg()
             try:
                 u = update_user(cfg, mu.group(1), role=p.get("role"), all_=p.get("all"),
-                                targets=p.get("targets"), disabled=p.get("disabled"))
+                                targets=p.get("targets"), disabled=p.get("disabled"),
+                                perms=(p["perms"] if "perms" in p else "__keep__"))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
             if not u:
@@ -5901,7 +6081,7 @@ class Handler(BaseHTTPRequestHandler):
             ps.setdefault("providers", {})
             ps.setdefault("provider", "cloudflare-quick")
             action = p.get("action") or ("enable" if "enable" in p else None)
-            restart = False
+            restart_active = False     # NB: don't name this `restart` — that shadows the module-level restart()
             if action == "config":
                 pid = p.get("provider")
                 prov = SHARE.providers.get(pid)
@@ -5920,7 +6100,7 @@ class Handler(BaseHTTPRequestHandler):
                             store.pop(n["key"], None)           # blank-on-purpose clears it (handled by UI flag)
                     else:
                         store[n["key"]] = val
-                restart = True                                  # new domain/token must actually take effect
+                restart_active = True                           # new domain/token must actually take effect
             elif action == "select":
                 pid = p.get("provider")
                 if pid not in SHARE.providers:
@@ -5956,7 +6136,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self._json({"error": "bad request"}, 400)
             save_config(cfg)
-            SHARE.reconcile(cfg, self.bind_port, restart_active=restart)
+            SHARE.reconcile(cfg, self.bind_port, restart_active=restart_active)
             st = SHARE.status(cfg)
             st["password_set"] = auth_configured(cfg)
             st["providers"] = SHARE.catalog(cfg)
@@ -7743,6 +7923,12 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 .provcard .pblurb{color:var(--dim);font-size:.78rem;line-height:1.4}
 .setuprow{display:flex;gap:.6rem;align-items:center;padding:.5rem .6rem;border:1px dashed var(--acc-dim);border-radius:10px;background:color-mix(in srgb,var(--acc) 6%,transparent)}
 .provcfg{display:flex;flex-direction:column;gap:.4rem;padding:.6rem .65rem;border:1px dashed var(--line);border-radius:10px}
+/* per-user permissions matrix */
+.lcSub2{font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.08em;color:var(--acc);font-weight:700;margin-bottom:.2rem}
+.permhdr{display:flex;gap:.5rem;align-items:center;font-family:var(--mono);font-size:.58rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);padding:.1rem 0}
+.permrow{display:flex;gap:.5rem;align-items:center;padding:.18rem .1rem;font-size:.82rem;border-bottom:1px solid #ffffff08}
+.permcol{width:48px;text-align:center;flex:none}
+.permcol input{width:auto}
 </style>
 </head>
 <body>
@@ -7864,6 +8050,16 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
       <div class="mhd" onclick="document.getElementById('invListCard').classList.toggle('open')"><span class="caret">▶</span><span class="mtitle">Pending invites</span></div>
       <div class="mbody"><div id="invList" style="display:flex;flex-direction:column;gap:.3rem;font-size:.8rem"><span class="hint">None.</span></div></div>
     </div>
+  </div>
+</div>
+<div class="scrim" id="permsScrim" onclick="closePerms(event)">
+  <div class="modal" style="width:min(620px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead" id="permsTitle">Permissions</div>
+    <div class="hint" id="permsNote" style="margin:-.3rem 0 .6rem"></div>
+    <div id="permsBody"></div>
+    <div class="mbar" style="margin-top:.6rem"><span class="msg" id="permsMsg" style="flex:1;color:var(--dim)"></span>
+      <button onclick="resetPerms()">Reset to role default</button>
+      <button class="go" onclick="savePerms()">Save permissions</button></div>
   </div>
 </div>
 <div class="scrim" id="connScrim" onclick="closeConnection(event)">
@@ -11106,16 +11302,21 @@ async function createInvite(btn){
   loadUsers();
 }
 function scopeSummary(u){ return u.all?'all bots':((u.targets||[]).map(t=>t.name).join(', ')||'no bots'); }
+let _usersData={users:[],modules:[]};
 async function loadUsers(){
   let d; try{ d=await (await fetch('/api/users')).json(); }catch(e){ return; }
+  _usersData=d;
   const us=d.users||[];
   $('usrList').innerHTML = us.length? us.map(u=>{
     const opts=ROLES.map(r=>'<option value="'+r[0]+'"'+(u.role===r[0]?' selected':'')+'>'+r[1]+'</option>').join('');
     const last=u.last_login?('last in '+new Date(u.last_login*1000).toLocaleDateString()):'never signed in';
     const dis=u.disabled?'<span style="color:var(--crash)">disabled</span> · ':'';
+    const restricted=(u.role!=='admin' && u.perms)?' · <span style="color:var(--acc)">custom perms</span>':'';
+    const permsBtn=(u.role==='operate'||u.role==='config')?'<button onclick="openPerms(\''+u.id+'\')">Permissions</button>':'';
     return '<div class="shrow" style="flex-wrap:wrap;gap:.4rem"><b style="min-width:6rem">'+esc(u.username)+'</b>'+
       '<select onchange="changeRole(\''+u.id+'\',this.value)" style="width:auto">'+opts+'</select>'+
-      '<span class="hint" style="flex:1;min-width:8rem">'+esc(scopeSummary(u))+' · '+dis+last+'</span>'+
+      '<span class="hint" style="flex:1;min-width:8rem">'+esc(scopeSummary(u))+' · '+dis+last+restricted+'</span>'+
+      permsBtn+
       '<button onclick="resetPw(\''+u.id+'\',\''+jsq(u.username)+'\')">Reset pw</button>'+
       '<button onclick="toggleDisable(\''+u.id+'\','+(u.disabled?'false':'true')+')">'+(u.disabled?'Enable':'Disable')+'</button>'+
       '<button class="danger" onclick="delUser(\''+u.id+'\',\''+jsq(u.username)+'\')">Delete</button></div>';
@@ -11131,6 +11332,75 @@ async function toggleDisable(id,dis){ const d=await api('/api/users/'+id,'POST',
 async function delUser(id,name){ if(!confirm('Delete user "'+name+'"? They lose access immediately.'))return; const d=await api('/api/users/'+id+'/delete','POST',{}); if(d&&d.error)alert(d.error); loadUsers(); }
 async function resetPw(id,name){ const pw=prompt('New password for "'+name+'" (min 6 chars):'); if(!pw)return; const d=await api('/api/users/'+id+'/password','POST',{password:pw}); if(d&&d.error)alert(d.error); else alert('Password reset — their other sessions were signed out.'); }
 async function revokeInvite(id){ const d=await api('/api/invites/'+id+'/revoke','POST',{}); if(d&&d.error)alert(d.error); loadUsers(); }
+
+/* ---- per-user permissions editor ---- */
+const CAT_LABELS={control:'Control & automation',combat:'Combat',survival:'Survival',connection:'Connection & queue',privacy:'Privacy & safety',automation:'Automation',diagnostics:'Diagnostics'};
+let _permsUid=null;
+function openPerms(uid){
+  const u=(_usersData.users||[]).find(x=>x.id===uid); if(!u) return;
+  _permsUid=uid;
+  const mods=_usersData.modules||[]; const eff=u.effective||{modules:{}};
+  const cfgTier=(u.role==='config');
+  $('permsTitle').textContent='Permissions — '+u.username+' ('+u.role+')';
+  $('permsNote').innerHTML='Tick exactly what this user can do. Unticked = blocked (enforced on the server, not just hidden). '+
+    (cfgTier?'':'<b>Config editing needs the Config role</b> — promote them to grant it.');
+  $('permsMsg').textContent='';
+  let h='';
+  // global grants
+  h+='<div class="provcfg" style="gap:.5rem"><div class="lcSub2">Access</div>'+
+     pToggle('pConsole','Free-form console (type any command)', eff.console)+
+     pToggle('pLifecycle','Start / stop / restart bots', eff.lifecycle)+
+     '<label class="rrow" style="margin-top:.2rem"><input type="checkbox" id="pUseAll" style="width:auto" onchange="permMasterSync()"> Use ALL modules (incl. ones added later)</label>'+
+     '<label class="rrow"><input type="checkbox" id="pCfgAll"'+(cfgTier?'':' disabled')+' style="width:auto" onchange="permMasterSync()"> Configure ALL modules</label>'+
+     '</div>';
+  // per-module matrix grouped by category
+  const cats={}; mods.forEach(m=>{ (cats[m.cat]=cats[m.cat]||[]).push(m); });
+  h+='<div id="pModWrap" style="margin-top:.5rem;max-height:46vh;overflow:auto">';
+  Object.keys(cats).forEach(cat=>{
+    h+='<div class="lcSub2" style="margin-top:.5rem">'+esc(CAT_LABELS[cat]||cat)+'</div>';
+    h+='<div style="display:flex;flex-direction:column;gap:.15rem">';
+    h+='<div class="permhdr"><span style="flex:1"></span><span class="permcol">use</span><span class="permcol">config</span></div>';
+    cats[cat].forEach(m=>{
+      const e=eff.modules[m.id]||{};
+      h+='<div class="permrow"><span style="flex:1">'+esc(m.name)+'</span>'+
+         '<span class="permcol"><input type="checkbox" class="pUse" data-id="'+m.id+'"'+(e.use?' checked':'')+'></span>'+
+         '<span class="permcol"><input type="checkbox" class="pCfg" data-id="'+m.id+'"'+(e.config?' checked':'')+(cfgTier?'':' disabled')+'></span></div>';
+    });
+    h+='</div>';
+  });
+  h+='</div>';
+  $('permsBody').innerHTML=h;
+  // initialise master checkboxes from effective use_all/config_all then sync disabled state
+  $('pUseAll').checked=!!eff.use_all; $('pCfgAll').checked=!!eff.config_all;
+  permMasterSync();
+  $('permsScrim').classList.add('open');
+}
+function pToggle(id,label,on){ return '<label class="rrow"><input type="checkbox" id="'+id+'"'+(on?' checked':'')+' style="width:auto"> '+esc(label)+'</label>'; }
+function permMasterSync(){
+  const ua=$('pUseAll').checked, ca=$('pCfgAll').checked;
+  [].forEach.call(document.querySelectorAll('.pUse'),function(c){ c.disabled=ua||ca; if(ua||ca)c.checked=true; });
+  [].forEach.call(document.querySelectorAll('.pCfg'),function(c){ if(c.dataset.lock)return; c.disabled=ca|| $('pCfgAll').disabled; if(ca)c.checked=true; });
+}
+function closePerms(e){ if(!e||e.target.id==='permsScrim') $('permsScrim').classList.remove('open'); }
+function gatherPerms(){
+  const modules={};
+  [].forEach.call(document.querySelectorAll('.pUse'),function(c){ modules[c.dataset.id]=modules[c.dataset.id]||{}; modules[c.dataset.id].use=c.checked; });
+  [].forEach.call(document.querySelectorAll('.pCfg'),function(c){ modules[c.dataset.id]=modules[c.dataset.id]||{}; modules[c.dataset.id].config=c.checked; });
+  return {use_all:$('pUseAll').checked, config_all:$('pCfgAll').checked,
+          console:$('pConsole').checked, lifecycle:$('pLifecycle').checked, modules};
+}
+async function savePerms(){
+  if(!_permsUid)return; $('permsMsg').textContent='Saving…';
+  const d=await api('/api/users/'+_permsUid,'POST',{perms:gatherPerms()});
+  if(d&&d.error){ $('permsMsg').innerHTML='<span style="color:var(--crash)">'+esc(d.error)+'</span>'; return; }
+  $('permsScrim').classList.remove('open'); loadUsers();
+}
+async function resetPerms(){
+  if(!_permsUid)return; if(!confirm('Reset to the role default (full access within the role)?'))return;
+  const d=await api('/api/users/'+_permsUid,'POST',{perms:null});
+  if(d&&d.error){ alert(d.error); return; }
+  $('permsScrim').classList.remove('open'); loadUsers();
+}
 
 /* ---- principal gating (owner vs scoped guest) ---- */
 async function applyPrincipal(){

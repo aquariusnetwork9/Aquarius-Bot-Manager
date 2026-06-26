@@ -2,7 +2,16 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.5.0 — *latest*
+## v3.6.0 — *latest*
+
+- **Fine-grained per-user permissions — owners decide exactly what each user can do.** On top of the role tiers, open **👤 Users → Permissions** on any operate/config user to control, per user:
+  - **Which modules** they can **use** (see + toggle on/off) and **configure** (the ⚙ live-config panel) — a per-module matrix grouped by category, or "all modules".
+  - Whether they get the **free-form console** (typing arbitrary bot commands) at all.
+  - Whether they can **start / stop / restart** bots.
+  - It's **enforced on the server**, not just hidden: a user without the console grant can only send exact module on/off toggles for modules they're allowed to use (anything richer is refused); config writes are checked per module; lifecycle and out-of-scope actions are blocked. The control surface also hides what a user can't touch. Permissions only *restrict* within a user's role; clearing them returns to the role default. Changes apply live (no re-login). Admins and the owner are unaffected.
+- **Fix (important): bot Start / Stop / Restart was broken.** A variable introduced in v3.4.0 shadowed the internal `restart` action, so the per-bot and "all" start/stop/restart buttons threw a 500 (your bots were unaffected — only the buttons failed). Fixed.
+
+## v3.5.0
 
 - **Named user accounts with roles (multi-user RBAC).** Beyond the single owner login and anonymous share links, you can now give people their **own username + password** with a role and a set of bots — open **👤 Users** (owner/admin only). Roles: **View** (read-only) · **Operate** (+ start/stop/restart, console commands, module toggles) · **Config** (+ edit settings / live config) · **Admin** (full control — a second owner who can also manage users). Each non-admin user is **scoped to the bots you pick** (or fleet-wide), enforced on every request exactly like share links — out-of-scope bots return 404, owner-only actions return 403.
   - **Two ways to add people:** create a user directly (set their password), or generate a **one-time invite link** with a preset role + bots — they open it, choose their own password, and they're in (no password handoff). Invites can carry a preset username and an expiry.

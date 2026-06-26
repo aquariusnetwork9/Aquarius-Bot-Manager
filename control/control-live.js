@@ -36,16 +36,32 @@
 
   /* capability gating (shared-access guests): owner = full; else view < operate < config */
   var CAP_RANK = { view:0, operate:1, config:2 };
-  LIVE.cap = null;   // null = owner / no gating
+  LIVE.cap = null;     // null = owner / no gating
+  LIVE.perms = null;   // set for named users: {modules:{id:{use,config}}, console, lifecycle, ...}
   function capOk(level){ return LIVE.cap == null || CAP_RANK[LIVE.cap] >= CAP_RANK[level]; }
+  /* fine-grained checks: named users go by their perms; guests/owner fall back to the cap tier */
+  function moduleUse(id){ if(LIVE.perms){ var e=LIVE.perms.modules[id]; return !!(e && (e.use||e.config)); } return capOk('operate'); }
+  function moduleConfig(id){ if(LIVE.perms){ var e=LIVE.perms.modules[id]; return !!(e && e.config); } return capOk('config'); }
+  function consoleOk(){ return LIVE.perms ? !!LIVE.perms.console : capOk('operate'); }
   function fetchPrincipal(){
     return fetch('/api/authstatus', {cache:'no-store'})
       .then(function(r){ return r.ok ? r.json() : null; })
       .then(function(d){
-        if(d && d.principal === 'guest'){ LIVE.cap = d.capability || 'view';
+        if(!d) return;
+        if(d.principal === 'guest'){ LIVE.cap = d.capability || 'view';
           document.body.classList.add('lguest','lguest-'+LIVE.cap); }
+        else if(d.principal === 'user' && !d.is_admin){ LIVE.cap = d.capability || 'view'; LIVE.perms = d.perms || null;
+          document.body.classList.add('lguest','lguest-'+LIVE.cap); }
+        // owner / admin: no gating
       })
       .catch(function(){});
+  }
+  /* hide module nav rows the user isn't allowed to use (server still enforces every action) */
+  function filterNav(){
+    if(!LIVE.perms) return;
+    [].forEach.call(document.querySelectorAll(LO.nav), function(row){
+      var id=row.dataset.id; if(id && !moduleUse(id)) row.style.display='none';
+    });
   }
 
   /* raw config-class name (what /control/state returns) → model module id */
@@ -189,7 +205,7 @@
   function wireActions(){
     var m=MAP[cur]; if(!m) return;
     var bar = $(LO.acts); if(!bar) return;
-    if(!capOk('operate')){   // guest below operate tier: actions are read-only
+    if(!moduleUse(cur)){   // user can't use this module: actions are read-only
       [].forEach.call(bar.querySelectorAll('button'), function(b){ b.disabled=true; b.style.opacity='.5'; b.style.cursor='not-allowed'; });
       return;
     }
@@ -214,7 +230,7 @@
     box.innerHTML='module <span class="tgl '+(m.enabled?'on':'')+'" style="position:relative;display:inline-block;width:34px;height:18px;border-radius:18px;cursor:pointer;vertical-align:middle"></span>';
     head.insertAdjacentElement('afterend', box);
     var tg=box.querySelector('.tgl');
-    if(!capOk('operate')){ tg.style.pointerEvents='none'; tg.style.opacity='.5'; return; }
+    if(!moduleUse(cur)){ tg.style.pointerEvents='none'; tg.style.opacity='.5'; return; }
     tg.addEventListener('click', function(){
       var on=!this.classList.contains('on'); this.classList.toggle('on',on); setEnabled(cur,on);
     });
@@ -252,8 +268,8 @@
       var c=$('.amCanvas'); if(!c){ clearInterval(mapTimer); mapTimer=null; return; }
       c.style.backgroundImage = "url('"+api('/viewer/map.png')+"?t="+Date.now()+"')";
     }, 2000);
-    // make click-to-destination actually send to Elytra
-    cv.onclick = function(ev){ onMapClick(ev, cv, span); };
+    // make click-to-destination actually send to Elytra (parameterized command = console grant)
+    if(consoleOk()) cv.onclick = function(ev){ onMapClick(ev, cv, span); };
   }
   function refreshMapOverlay(){
     var cv=$('.amCanvas'); if(!cv) return;
@@ -357,7 +373,7 @@
         'background:rgba(10,14,18,.85);backdrop-filter:blur(8px);border:1px solid var(--line,#1d2730);border-radius:12px;padding:.35rem .5rem;box-shadow:0 8px 24px #0007';
       bar.appendChild(v); bar.appendChild(cr); bar.appendChild(sw); document.body.appendChild(bar);
     }
-    if(!capOk('operate')) cr.style.display='none';   // guest below operate tier: no command runner
+    if(!consoleOk()) cr.style.display='none';   // no free-form console without the console grant
     var inp=$('#cmdInput');
     function go(){ var c=(inp.value||'').trim(); if(!c) return; runCommand(c).then(function(){ inp.value=''; }); }
     $('#cmdGo').onclick=go;
@@ -425,11 +441,11 @@
         '<div class="lcNote">Edits apply on the bot immediately and persist to its config.</div>'+cfgNodeHtml(sub, root, 0);
     }
     cont.insertBefore(panel, cont.firstChild);
-    if(!capOk('config')){
-      // guest below config tier: show values read-only
+    if(!moduleConfig(cur)){
+      // no config grant for this module: show values read-only
       [].forEach.call(panel.querySelectorAll('.lcInp'), function(e){ e.setAttribute('disabled','disabled'); e.style.opacity='.6'; });
       [].forEach.call(panel.querySelectorAll('.lcTgl'), function(e){ e.style.pointerEvents='none'; e.style.opacity='.6'; });
-      var n=panel.querySelector('.lcNote'); if(n) n.textContent='Read-only — your shared access doesn’t include configuration.';
+      var n=panel.querySelector('.lcNote'); if(n) n.textContent='Read-only — your access doesn’t include editing this module’s configuration.';
       return;
     }
     [].forEach.call(panel.querySelectorAll('.lcTgl'), function(tg){
@@ -483,6 +499,7 @@
 
   /* ---------------- render hook ---------------- */
   function afterRender(){
+    filterNav();
     injectEnableToggle();
     wireActions();
     lockConfig();
