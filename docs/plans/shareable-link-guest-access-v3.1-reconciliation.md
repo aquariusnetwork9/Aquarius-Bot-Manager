@@ -100,6 +100,11 @@ commands).
 
 Default if unspecified: **(a)**.
 
+> **DECIDED (owner, 2026-06-25): option (a)** — `operate` grants full console command execution on
+> granted bots. The free-form command runner + module toggles + flight all stay at operate tier;
+> only config-file / `/control/config` edits, and fleet management, require higher tiers. No
+> command allow-list. Implement §4e as written with command-send = operate.
+
 ## F. Audit (extend §6)
 
 Include the v3.1 surfaces in the guest audit ring buffer: log `POST /control/config`
