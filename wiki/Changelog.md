@@ -2,9 +2,19 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.3.1 — *latest*
+## v3.4.0 — *latest*
 
-- **Public sharing: the tunnel URL now stays stable.** The Cloudflare quick tunnel runs detached and ABM **adopts** the running tunnel across manager updates/restarts instead of respawning it — so the public address (and therefore your share links) only changes on an actual VPS reboot or crash, not every time the manager restarts. Teardown is also more reliable. *(No domain needed — this is the no-account, no-domain option. For a URL that survives even reboots without a domain, a Tailscale-Funnel mode can be added.)*
+- **Public sharing is now a menu of providers — pick whatever fits.** The Share panel's **Public sharing** card lets you choose *how* your dashboard gets a public HTTPS address, so a guest link works for anyone:
+  - **Cloudflare Quick Tunnel** — no account, no domain, one click (the v3.3 default). URL re-rolls on reboot.
+  - **Tailscale Funnel** — free, sign in once on the VPS; a **stable** `https://<machine>.<tailnet>.ts.net` with a valid cert that **survives reboots**. The best set-and-forget option if you don't own a domain.
+  - **ngrok** — free account + authtoken; reserve one free static `*.ngrok-free.app` domain and the address stays put across restarts.
+  - **Cloudflare Tunnel (your domain)** — paste a Zero-Trust tunnel token + your public hostname for a **stable custom domain**.
+  - **My own domain / reverse proxy** — already serving the dashboard behind Caddy/nginx? Just tell ABM the URL; it runs nothing and builds links from it.
+  - Secrets (tokens/authtokens) are obfuscated at rest, never returned to the browser, and only re-sent when you type a new one. Still refuses to expose a no-login dashboard. Switching providers cleanly tears the old one down; managed tunnels are still **adopted across manager restarts** so the URL only changes on the provider's own terms (e.g. a quick-tunnel reboot). See **[Security → Public sharing](Security#public-sharing)**.
+
+## v3.3.1
+
+- **Public sharing: the tunnel URL now stays stable.** The Cloudflare quick tunnel runs detached and ABM **adopts** the running tunnel across manager updates/restarts instead of respawning it — so the public address (and therefore your share links) only changes on an actual VPS reboot or crash, not every time the manager restarts. Teardown is also more reliable. *(No domain needed — this is the no-account, no-domain option. For a URL that survives even reboots without a domain, use the new Tailscale-Funnel provider in v3.4.0.)*
 
 ## v3.3.0
 

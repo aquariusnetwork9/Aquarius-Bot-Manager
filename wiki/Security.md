@@ -60,6 +60,30 @@ Beyond the single owner login, you can hand out **scoped guest links** (owner he
 
 ---
 
+## Public sharing
+
+A guest link is only useful if the recipient can actually **reach** your dashboard. On the default setup that's loopback-only (SSH tunnel) — so a link points at `localhost` and is useless to anyone else. The Share panel's **Public sharing** card (v3.4.0) lets you give the dashboard a real public HTTPS address, and offers a **menu of providers** so you can pick whichever you trust / already have:
+
+| Provider | Account / domain | URL stability | Notes |
+|----------|------------------|---------------|-------|
+| **Cloudflare Quick Tunnel** | none | re-rolls on reboot | One click. Downloads `cloudflared`, opens a `*.trycloudflare.com` tunnel to your loopback port. No account, no domain, no cert. |
+| **Tailscale Funnel** | free Tailscale login (once, on the VPS) | **stable, survives reboots** | Install Tailscale + `sudo tailscale up`, then enable here. Stable `https://<machine>.<tailnet>.ts.net` with a valid cert. Best no-domain option. |
+| **ngrok** | free ngrok account + authtoken | stable (reserve a domain) | Downloads `ngrok`; reserve a free static `*.ngrok-free.app` domain so the address doesn't change. |
+| **Cloudflare Tunnel (your domain)** | a domain on Cloudflare + a tunnel token | **stable custom hostname** | Create a tunnel in Zero Trust, route a Public Hostname to `http://127.0.0.1:<port>`, paste the token + hostname. |
+| **My own domain / reverse proxy** | your own HTTPS setup | whatever you run | You already expose the dashboard (Caddy/nginx/domain). ABM runs nothing — it just builds links from the URL you give it. |
+
+**What turning this on means — read this.** Public sharing makes your dashboard **reachable from the internet**. That's the point (so a link works), but it raises the stakes:
+
+- **A password is mandatory.** ABM refuses to enable any provider unless a dashboard login is set — an exposed *open* dashboard would hand full control to anyone with the URL. (See §1: dashboard access = a shell on the box.)
+- The dashboard is now only as private as your **login + your share-link discipline**. Anyone who guesses/obtains a guest link (or the owner password) can reach it from anywhere. Use expiries, revoke liberally, and **Revoke all** if a link leaks.
+- **Provider secrets** (ngrok authtoken, Cloudflare tunnel token) are stored **base64-obfuscated** in `instances.json` (same as the Webshare token — *obfuscation, not encryption*; see §4) and are never sent back to the browser. Anyone who can read that file can recover them — rotate them in the provider's dashboard if the box is compromised.
+- Cloudflare/Tailscale/ngrok each **terminate TLS and proxy your traffic** through their network. You're trusting that provider with the transport. All four give a valid HTTPS cert end-to-end to the visitor.
+- Managed tunnels (Cloudflare/ngrok) run **detached and are adopted across manager restarts**, so the URL stays put through self-updates; it only changes on the provider's own terms (e.g. a quick-tunnel reboot). Switching providers cleanly stops the previous one.
+
+> Public sharing is **`manager.py`-only**. It changes *how the dashboard is reached*, not what the bots do.
+
+---
+
 ## 4. What's stored on disk (`instances.json`)
 
 This single file holds, in one place:

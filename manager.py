@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.3.1"
+__version__ = "3.4.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -87,7 +87,10 @@ def load_config(path):
     s.setdefault("system_actions_enabled", False)
     s.setdefault("shares", [])               # shareable-link guest grants
     s.setdefault("shares_epoch", 0)          # revoke-all generation for shares
-    s.setdefault("public_share", {"enabled": False})   # cloudflare quick-tunnel for guest links
+    ps = s.setdefault("public_share", {})    # public-exposure provider for guest links (multi-provider menu)
+    ps.setdefault("enabled", False)
+    ps.setdefault("provider", "cloudflare-quick")
+    ps.setdefault("providers", {})           # per-provider config (secrets b64-obfuscated)
     return {"raw": data, "instances": insts, "by_name": by_name, "path": path}
 
 
@@ -2419,88 +2422,123 @@ def audit_guest(entry):
 
 
 # ---------------------------------------------------------------------------
-# One-click public sharing — a managed Cloudflare *Quick* Tunnel
+# Public sharing — a pluggable menu of exposure providers
 # ---------------------------------------------------------------------------
-# Gives the dashboard a public HTTPS URL (https://<random>.trycloudflare.com) with
-# zero account / domain / cert — just the `cloudflared` binary + one long-running
-# process tunnelling to our loopback port. So a guest link can be handed to someone
-# who's never touched the VPS and they just click it. The URL is ephemeral (it
-# changes whenever the tunnel restarts) — fine for the expiry/revoke share model.
+# A guest share link is only useful if the person can actually reach the
+# dashboard. By default the manager is loopback-only (SSH tunnel), so a link
+# points at localhost and is useless to anyone else. These providers each give
+# the dashboard a public HTTPS address that share_base_url() builds links from.
+# We offer a menu so users can pick whatever fits — no account, free account,
+# or their own domain:
+#
+#   cloudflare-quick  no account / no domain, one click; URL re-rolls on restart
+#   tailscale         free, sign in once, stable *.ts.net, survives reboots
+#   ngrok             free account + authtoken, one reserved *.ngrok-free.app
+#   cloudflare-named  your own domain via a Zero-Trust tunnel token; stable host
+#   custom            you already run a reverse proxy/domain — just name the URL
+#
+# Each provider implements start(port, conf)/stop()/status(conf) returning
+# {enabled, running, url, error}; _ShareManager picks the active one from
+# settings.public_share and feeds its URL to share_base_url(). Secrets in the
+# per-provider config are b64-obfuscated at rest (same as the Webshare token).
+_AQ_DIR = os.path.join(os.path.expanduser("~"), ".aquarius")
 _CF_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 _CF_DL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+_CF_BIN = ("/usr/local/bin/cloudflared", "/usr/bin/cloudflared")
 
 
-class _ShareTunnel:
+class _ProcTunnel:
+    """Base for providers that run a long-lived helper process we own. The process is spawned
+    detached (its own session) so it survives manager restarts; on the next start() we *adopt*
+    the running one (matched by pgrep) instead of respawning, keeping the public URL stable
+    across selfupdates. Output is captured to a per-provider logfile we parse for the URL."""
+    id = name = blurb = ""
+    needs = []                       # [{key,label,secret,placeholder,help}]
+    bin_names = ()                   # absolute system paths to prefer
+    bin_cache = ""                   # ~/.aquarius/<bin> fallback (auto-downloaded)
+    download_url = None              # raw binary URL; override ensure_binary for archives
+    url_re = None                    # regex to pull the public URL out of the logfile
+
     def __init__(self):
         self.lock = threading.Lock()
-        self.proc = None
         self.url = None
         self.enabled = False
         self.error = None
         self.port = None
         self._mon = None
-        self.logfile = os.path.join(os.path.expanduser("~"), ".aquarius", "tunnel.log")
+        self.logfile = os.path.join(_AQ_DIR, self.id + ".log")
 
+    # ---- binary acquisition -------------------------------------------------
     def bin_path(self):
-        # prefer a system cloudflared; else our cached copy
-        for c in ("/usr/local/bin/cloudflared", "/usr/bin/cloudflared"):
+        for c in self.bin_names:
             if os.path.exists(c):
                 return c
-        cached = shutil.which("cloudflared")
-        if cached:
-            return cached
-        return os.path.join(os.path.expanduser("~"), ".aquarius", "cloudflared")
+        w = shutil.which(os.path.basename(self.bin_cache))
+        return w or self.bin_cache
 
     def ensure_binary(self):
         p = self.bin_path()
         if os.path.exists(p):
             return p
+        if not self.download_url:
+            raise RuntimeError(self.name + " isn't installed and can't be auto-downloaded.")
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = p + ".dl"
-        with urllib.request.urlopen(_CF_DL, timeout=120) as r, open(tmp, "wb") as f:
+        with urllib.request.urlopen(self.download_url, timeout=180) as r, open(tmp, "wb") as f:
             shutil.copyfileobj(r, f)
         os.chmod(tmp, 0o755)
         os.replace(tmp, p)
         return p
 
-    def _pid_for(self, port):
-        """PID of a running cloudflared quick tunnel for this port, or None. Used so the tunnel can be
-        *adopted* across manager restarts (it runs in its own session and outlives us) instead of respawned
-        — which keeps the same public URL through selfupdates; it only re-rolls on a reboot or crash."""
-        if not port:
+    # ---- subclass hooks -----------------------------------------------------
+    def argv(self, port, binp, conf):
+        raise NotImplementedError
+
+    def match_pat(self, port, conf):
+        """pgrep -f pattern that uniquely identifies *our* running process for adopt/liveness."""
+        raise NotImplementedError
+
+    def stop_pat(self):
+        """pkill -f pattern to tear our process(es) down. Must not match other providers."""
+        raise NotImplementedError
+
+    def preflight(self, binp, conf):
+        """Return an error string to abort start (e.g. missing token), or None to proceed."""
+        return None
+
+    def url_now(self, conf):
+        return self._url_from_log()
+
+    # ---- shared lifecycle ---------------------------------------------------
+    def _url_from_log(self):
+        if not self.url_re:
             return None
         try:
-            r = subprocess.run(["pgrep", "-f", f"cloudflared .*--url http://127.0.0.1:{port}"],
+            with open(self.logfile, "r", errors="replace") as f:
+                found = self.url_re.findall(f.read())
+            return found[-1] if found else None
+        except OSError:
+            return None
+
+    def _pid_for(self, port, conf):
+        try:
+            r = subprocess.run(["pgrep", "-f", self.match_pat(port, conf)],
                                capture_output=True, text=True, timeout=8)
             pids = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
             return pids[0] if pids else None
         except Exception:
             return None
 
-    def _url_from_log(self):
-        try:
-            with open(self.logfile, "r", errors="replace") as f:
-                found = _CF_URL_RE.findall(f.read())
-            return found[-1] if found else None
-        except OSError:
-            return None
-
-    def _spawn(self, port, binp):
+    def _spawn(self, port, binp, conf):
         os.makedirs(os.path.dirname(self.logfile), exist_ok=True)
-        logf = open(self.logfile, "wb")          # truncate — only the current tunnel's URL lives here
+        logf = open(self.logfile, "wb")          # truncate — only the current run's output lives here
         try:
-            subprocess.Popen([binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
-                             stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            subprocess.Popen(self.argv(port, binp, conf), stdout=logf,
+                             stderr=subprocess.STDOUT, start_new_session=True)
         finally:
             logf.close()
 
-    def status(self):
-        with self.lock:
-            port, enabled, url, err = self.port, self.enabled, self.url, self.error
-        running = bool(enabled and self._pid_for(port))
-        return {"enabled": enabled, "running": running, "url": url, "error": err}
-
-    def start(self, port):
+    def start(self, port, conf):
         with self.lock:
             self.enabled = True
             self.port = port
@@ -2509,76 +2547,432 @@ class _ShareTunnel:
             binp = self.ensure_binary()
         except Exception as e:
             with self.lock:
-                self.error = "cloudflared download failed: " + str(e)[:160]
-            return self.status()
-        # adopt an already-running tunnel (survived a manager restart) instead of respawning it
-        if self._pid_for(port) is None:
+                self.error = str(e)[:200]
+            return self.status(conf)
+        err = self.preflight(binp, conf)
+        if err:
+            with self.lock:
+                self.error = err[:200]
+            return self.status(conf)
+        # adopt an already-running process (survived a manager restart) instead of respawning
+        if self._pid_for(port, conf) is None:
             try:
-                self._spawn(port, binp)
+                self._spawn(port, binp, conf)
             except Exception as e:
                 with self.lock:
-                    self.error = str(e)[:160]
-                return self.status()
+                    self.error = str(e)[:200]
+                return self.status(conf)
         with self.lock:
-            self.url = self._url_from_log()
+            self.url = self.url_now(conf)
             if self._mon is None or not self._mon.is_alive():
-                self._mon = threading.Thread(target=self._monitor, daemon=True)
+                self._mon = threading.Thread(target=self._monitor, args=(conf,), daemon=True)
                 self._mon.start()
-        return self.status()
+        return self.status(conf)
 
     def stop(self):
         with self.lock:
             self.enabled = False
             self.url = None
-            self.proc = None
-        # port-agnostic: matches exactly how we spawn it, so cleanup never depends on self.port
-        # being set (e.g. a stop right after a manager restart, before any start())
         try:
-            subprocess.run(["pkill", "-f", "cloudflared tunnel --no-autoupdate --url"], timeout=8)
+            subprocess.run(["pkill", "-f", self.stop_pat()], timeout=8)
         except Exception:
             pass
         try:
             os.remove(self.logfile)
         except OSError:
             pass
-        return self.status()
+        return {"enabled": False, "running": False, "url": None, "error": None}
 
-    def _monitor(self):
-        """Keep self.url fresh from the tunnel log; relaunch (fresh URL) if it dies while still enabled."""
+    def status(self, conf):
+        with self.lock:
+            port, enabled, url, err = self.port, self.enabled, self.url, self.error
+        running = bool(enabled and self._pid_for(port, conf))
+        if running and not url:                  # lazily refresh (e.g. after adopt-on-restart)
+            url = self.url_now(conf)
+            if url:
+                with self.lock:
+                    self.url = url
+        return {"enabled": enabled, "running": running, "url": url, "error": err}
+
+    def _monitor(self, conf):
+        """Keep self.url fresh; relaunch if our process dies while still enabled."""
         while True:
             with self.lock:
                 enabled, port = self.enabled, self.port
             if not enabled:
                 return
-            u = self._url_from_log()
+            u = self.url_now(conf)
             if u:
                 with self.lock:
                     self.url = u
-            if self._pid_for(port) is None:       # died while enabled — relaunch (gets a new URL)
+            if self._pid_for(port, conf) is None:
                 with self.lock:
                     if not self.enabled:
                         return
                     self.url = None
                 try:
-                    self._spawn(port, self.bin_path())
+                    self._spawn(port, self.bin_path(), conf)
                 except Exception:
                     pass
                 time.sleep(3)
-            time.sleep(1.5)
+            time.sleep(2)
 
 
-SHARE_TUNNEL = _ShareTunnel()
+class CloudflareQuick(_ProcTunnel):
+    id = "cloudflare-quick"
+    name = "Cloudflare Quick Tunnel"
+    blurb = ("No account, no domain — one click. You get a random https://….trycloudflare.com "
+             "address. It changes whenever the tunnel restarts (e.g. after a reboot), so create "
+             "links fresh when you need them.")
+    needs = []
+    bin_names = _CF_BIN
+    bin_cache = os.path.join(_AQ_DIR, "cloudflared")
+    download_url = _CF_DL
+    url_re = _CF_URL_RE
+
+    def argv(self, port, binp, conf):
+        return [binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"]
+
+    def match_pat(self, port, conf):
+        return f"cloudflared .*--url http://127.0.0.1:{port}"
+
+    def stop_pat(self):
+        return "cloudflared tunnel --no-autoupdate --url"
+
+
+class CloudflareNamed(_ProcTunnel):
+    id = "cloudflare-named"
+    name = "Cloudflare Tunnel (your domain)"
+    blurb = ("Stable custom hostname on a domain you own. In the Cloudflare Zero Trust dashboard "
+             "create a tunnel, add a Public Hostname routing to http://127.0.0.1:<this port>, then "
+             "paste the tunnel token + that hostname here. Survives reboots; valid cert.")
+    needs = [
+        {"key": "token", "label": "Tunnel token", "secret": True,
+         "help": "Zero Trust → Networks → Tunnels → your tunnel → Configure → copy the token "
+                 "(the long string in the install command)."},
+        {"key": "hostname", "label": "Public hostname", "secret": False,
+         "placeholder": "bots.example.com",
+         "help": "The Public Hostname you routed this tunnel to (it must point at "
+                 "http://127.0.0.1:<this dashboard's port>)."},
+    ]
+    bin_names = _CF_BIN
+    bin_cache = os.path.join(_AQ_DIR, "cloudflared")
+    download_url = _CF_DL
+
+    def argv(self, port, binp, conf):
+        return [binp, "tunnel", "--no-autoupdate", "run", "--token", _b64dec(conf.get("token", ""))]
+
+    def match_pat(self, port, conf):
+        return "cloudflared tunnel .*run --token"
+
+    def stop_pat(self):
+        return "cloudflared tunnel .*run --token"
+
+    def url_now(self, conf):
+        h = (conf.get("hostname") or "").strip().replace("https://", "").replace("http://", "").strip("/")
+        return ("https://" + h) if h else None
+
+    def preflight(self, binp, conf):
+        if not _b64dec(conf.get("token", "")):
+            return "Paste your Cloudflare tunnel token first."
+        if not (conf.get("hostname") or "").strip():
+            return "Enter the public hostname you configured for this tunnel."
+        return None
+
+
+class Ngrok(_ProcTunnel):
+    id = "ngrok"
+    name = "ngrok"
+    blurb = ("Free account + authtoken. Reserve one free static domain (*.ngrok-free.app) in the "
+             "ngrok dashboard so the address stays the same across restarts. NA + EU regions.")
+    needs = [
+        {"key": "authtoken", "label": "ngrok authtoken", "secret": True,
+         "help": "ngrok dashboard → Your Authtoken."},
+        {"key": "domain", "label": "Static domain", "secret": False,
+         "placeholder": "your-name.ngrok-free.app",
+         "help": "Reserve a free static domain in the ngrok dashboard (Universal Gateway → Domains) "
+                 "and paste it here. Leave blank for a random URL that changes each restart."},
+    ]
+    bin_names = ("/usr/local/bin/ngrok", "/usr/bin/ngrok")
+    bin_cache = os.path.join(_AQ_DIR, "ngrok")
+    _DL = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz"
+
+    def ensure_binary(self):
+        p = self.bin_path()
+        if os.path.exists(p):
+            return p
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        import tarfile, io
+        with urllib.request.urlopen(self._DL, timeout=180) as r:
+            data = r.read()
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+            member = next((m for m in t.getmembers() if os.path.basename(m.name) == "ngrok"), None)
+            if member is None:
+                raise RuntimeError("ngrok binary not found in download archive")
+            with t.extractfile(member) as src, open(p + ".dl", "wb") as f:
+                shutil.copyfileobj(src, f)
+        os.chmod(p + ".dl", 0o755)
+        os.replace(p + ".dl", p)
+        return p
+
+    def argv(self, port, binp, conf):
+        a = [binp, "http", "--log", "stdout", "--log-format", "logfmt"]
+        dom = (conf.get("domain") or "").strip().replace("https://", "").replace("http://", "").strip("/")
+        if dom:
+            a += ["--url", "https://" + dom]
+        a += [str(port)]
+        return a
+
+    def match_pat(self, port, conf):
+        return f"ngrok http .* {port}$"
+
+    def stop_pat(self):
+        return "ngrok http "
+
+    def preflight(self, binp, conf):
+        tok = _b64dec(conf.get("authtoken", ""))
+        if not tok:
+            return "Paste your ngrok authtoken first."
+        try:
+            subprocess.run([binp, "config", "add-authtoken", tok], capture_output=True, timeout=20)
+        except Exception as e:
+            return "ngrok authtoken setup failed: " + str(e)[:120]
+        return None
+
+    def url_now(self, conf):
+        dom = (conf.get("domain") or "").strip().replace("https://", "").replace("http://", "").strip("/")
+        if dom:
+            return "https://" + dom
+        try:                                      # random URL — read it from ngrok's local API
+            with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=4) as r:
+                d = json.load(r)
+            for t in d.get("tunnels", []):
+                if (t.get("public_url") or "").startswith("https"):
+                    return t["public_url"]
+        except Exception:
+            pass
+        return None
+
+
+class Tailscale:
+    """Tailscale Funnel — not a process we own; tailscaled (a system daemon) holds the funnel
+    config and persists it across reboots, so there's nothing to adopt/monitor. We just toggle
+    funnel on/off for our port and read the stable *.ts.net hostname."""
+    id = "tailscale"
+    name = "Tailscale Funnel"
+    blurb = ("Free, no domain. Install Tailscale and sign in once on the VPS; you get a stable "
+             "HTTPS address (https://<machine>.<tailnet>.ts.net) with a valid cert that survives "
+             "reboots. The best set-and-forget option if you don't own a domain.")
+    needs = []
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.enabled = False
+        self.error = None
+
+    def _ts(self):
+        for c in ("/usr/bin/tailscale", "/usr/local/bin/tailscale"):
+            if os.path.exists(c):
+                return c
+        return shutil.which("tailscale")
+
+    def _self_dns(self, ts):
+        try:
+            r = subprocess.run([ts, "status", "--json"], capture_output=True, text=True, timeout=10)
+            d = json.loads(r.stdout or "{}")
+            if d.get("BackendState") != "Running":
+                return None
+            dn = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
+            return dn or None
+        except Exception:
+            return None
+
+    def _funnel_on(self, ts, dn):
+        try:
+            r = subprocess.run([ts, "funnel", "status"], capture_output=True, text=True, timeout=10)
+            out = (r.stdout or "") + (r.stderr or "")
+            return dn in out and "off" not in out.lower().split(dn)[0][-12:]
+        except Exception:
+            return False
+
+    def status(self, conf):
+        ts = self._ts()
+        if not ts:
+            return {"enabled": self.enabled, "running": False, "url": None,
+                    "error": "Tailscale isn't installed. Install it (tailscale.com/download) on the VPS."}
+        dn = self._self_dns(ts)
+        if not dn:
+            return {"enabled": self.enabled, "running": False, "url": None,
+                    "error": "Tailscale isn't signed in. Run 'sudo tailscale up' on the VPS, then enable here."}
+        url = "https://" + dn
+        on = self._funnel_on(ts, dn)        # operational truth; _ShareManager ANDs with the settings flag
+        return {"enabled": self.enabled, "running": bool(on),
+                "url": url if on else None, "error": self.error}
+
+    def start(self, port, conf):
+        with self.lock:
+            self.enabled = True
+            self.error = None
+        ts = self._ts()
+        if not ts:
+            with self.lock:
+                self.error = "Tailscale isn't installed on the VPS."
+            return self.status(conf)
+        if not self._self_dns(ts):
+            with self.lock:
+                self.error = "Tailscale isn't signed in. Run 'sudo tailscale up' on the VPS first."
+            return self.status(conf)
+        try:
+            r = subprocess.run([ts, "funnel", "--bg", str(port)],
+                               capture_output=True, text=True, timeout=25)
+            if r.returncode != 0:
+                with self.lock:
+                    self.error = (r.stderr or r.stdout or "tailscale funnel failed").strip()[:200]
+        except Exception as e:
+            with self.lock:
+                self.error = str(e)[:200]
+        return self.status(conf)
+
+    def stop(self):
+        with self.lock:
+            self.enabled = False
+        ts = self._ts()
+        if ts:
+            try:
+                subprocess.run([ts, "funnel", "--bg", "off"], capture_output=True, timeout=15)
+            except Exception:
+                try:
+                    subprocess.run([ts, "funnel", "reset"], capture_output=True, timeout=15)
+                except Exception:
+                    pass
+        return {"enabled": False, "running": False, "url": None, "error": None}
+
+
+class CustomUrl:
+    """Bring-your-own: the dashboard is already exposed at a public HTTPS address (Caddy, nginx,
+    a domain, …). We run nothing — just record the URL so share links build against it."""
+    id = "custom"
+    name = "My own domain / reverse proxy"
+    blurb = ("You already serve this dashboard at a public HTTPS address (Caddy, nginx, a domain). "
+             "Tell ABM that address and it builds share links from it. ABM runs nothing here.")
+    needs = [
+        {"key": "url", "label": "Public base URL", "secret": False,
+         "placeholder": "https://bots.example.com",
+         "help": "The HTTPS address this dashboard is reachable at from outside — no trailing path."},
+    ]
+
+    def __init__(self):
+        self.enabled = False
+
+    def _url(self, conf):
+        return (conf.get("url") or "").strip().rstrip("/")
+
+    def start(self, port, conf):
+        self.enabled = True
+        u = self._url(conf)
+        return {"enabled": True, "running": bool(u), "url": u or None,
+                "error": None if u else "Enter your public URL."}
+
+    def stop(self):
+        self.enabled = False
+        return {"enabled": False, "running": False, "url": None, "error": None}
+
+    def status(self, conf):
+        # report operational truth (a URL is configured); _ShareManager ANDs with the settings flag
+        u = self._url(conf)
+        return {"enabled": self.enabled, "running": bool(u), "url": u or None, "error": None}
+
+
+class _ShareManager:
+    """Owns the provider instances, tracks which one settings.public_share selects, and dispatches
+    start/stop/status. Feeds the active provider's public URL to share_base_url()."""
+    def __init__(self):
+        provs = (CloudflareQuick(), Tailscale(), Ngrok(), CloudflareNamed(), CustomUrl())
+        self.providers = {p.id: p for p in provs}
+        self.order = [p.id for p in provs]
+        self._last_active = None
+
+    def _ps(self, cfg):
+        return (cfg["raw"].get("settings", {}) or {}).get("public_share", {}) or {}
+
+    def active_id(self, cfg):
+        pid = self._ps(cfg).get("provider") or "cloudflare-quick"
+        return pid if pid in self.providers else "cloudflare-quick"
+
+    def conf_for(self, cfg, pid):
+        return ((self._ps(cfg).get("providers", {}) or {}).get(pid, {}) or {})
+
+    def enabled(self, cfg):
+        return bool(self._ps(cfg).get("enabled"))
+
+    def status(self, cfg):
+        pid = self.active_id(cfg)
+        st = self.providers[pid].status(self.conf_for(cfg, pid))
+        st["provider"] = pid
+        st["enabled"] = self.enabled(cfg)
+        st["running"] = bool(st.get("running") and self.enabled(cfg))
+        return st
+
+    def _public_conf(self, p, conf):
+        d = {}
+        for n in getattr(p, "needs", []):
+            if n.get("secret"):
+                d[n["key"] + "_set"] = bool(conf.get(n["key"]))
+            else:
+                d[n["key"]] = conf.get(n["key"]) or ""
+        return d
+
+    def catalog(self, cfg):
+        out = []
+        for pid in self.order:
+            p = self.providers[pid]
+            out.append({"id": pid, "name": p.name, "blurb": p.blurb,
+                        "needs": [dict(n) for n in getattr(p, "needs", [])],
+                        "config": self._public_conf(p, self.conf_for(cfg, pid))})
+        return out
+
+    def reconcile(self, cfg, port, restart_active=False):
+        """Bring reality in line with settings: stop the provider we switched away from, then
+        start/stop the active one per the enabled flag. restart_active forces a stop+start (used
+        after a config change so a new domain/token actually takes effect)."""
+        active = self.active_id(cfg)
+        if self._last_active and self._last_active != active:
+            try:
+                self.providers[self._last_active].stop()
+            except Exception:
+                pass
+        self._last_active = active
+        p = self.providers[active]
+        if not self.enabled(cfg):
+            return p.stop()
+        if restart_active:
+            try:
+                p.stop()
+            except Exception:
+                pass
+        return p.start(port, self.conf_for(cfg, active))
+
+    def base_url(self, cfg, fallback):
+        if not self.enabled(cfg):
+            return fallback
+        st = self.status(cfg)
+        return st["url"] if st.get("running") and st.get("url") else fallback
+
+
+SHARE = _ShareManager()
 
 
 def share_base_url(handler):
-    """Public base URL for share links: the live Cloudflare tunnel if up, else the
+    """Public base URL for share links: the active exposure provider's URL if it's up, else the
     owner's current scheme+host (works when they're already on a public access mode)."""
-    st = SHARE_TUNNEL.status()
-    if st["running"] and st["url"]:
-        return st["url"]
     proto = handler.headers.get("X-Forwarded-Proto") or "http"
     host = handler.headers.get("Host") or "this-host"
-    return f"{proto}://{host}"
+    fallback = f"{proto}://{host}"
+    try:
+        cfg = handler._cfg()
+    except Exception:
+        return fallback
+    return SHARE.base_url(cfg, fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -4746,8 +5140,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/share/tunnel":
             if not self._guard_owner(princ):
                 return
-            st = SHARE_TUNNEL.status()
-            st["password_set"] = auth_configured(self._cfg())
+            cfg = self._cfg()
+            st = SHARE.status(cfg)
+            st["password_set"] = auth_configured(cfg)
+            st["providers"] = SHARE.catalog(cfg)
             return self._json(st)
 
         m = re.match(r"^/api/instances/([^/]+)/logs$", path)
@@ -4900,14 +5296,49 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 return self._json({"error": "bad request"}, 400)
             cfg = self._cfg()
-            enable = bool(p.get("enable"))
-            # never put the dashboard on the public internet without a login in front of it
-            if enable and not auth_configured(cfg):
-                return self._json({"error": "Set a dashboard password first — public sharing would "
-                                            "otherwise expose full control to anyone with the URL."}, 400)
-            cfg["raw"].setdefault("settings", {}).setdefault("public_share", {})["enabled"] = enable
+            ps = cfg["raw"].setdefault("settings", {}).setdefault("public_share", {})
+            ps.setdefault("providers", {})
+            ps.setdefault("provider", "cloudflare-quick")
+            action = p.get("action") or ("enable" if "enable" in p else None)
+            restart = False
+            if action == "config":
+                pid = p.get("provider")
+                prov = SHARE.providers.get(pid)
+                if not prov:
+                    return self._json({"error": "unknown provider"}, 400)
+                store = ps["providers"].setdefault(pid, {})
+                incoming = p.get("config") or {}
+                for n in getattr(prov, "needs", []):
+                    if n["key"] not in incoming:
+                        continue
+                    val = (incoming.get(n["key"]) or "").strip()
+                    if n.get("secret"):
+                        if val:
+                            store[n["key"]] = _b64enc(val)      # only overwrite a secret if a new one was typed
+                        elif incoming.get(n["key"]) == "":
+                            store.pop(n["key"], None)           # blank-on-purpose clears it (handled by UI flag)
+                    else:
+                        store[n["key"]] = val
+                restart = True                                  # new domain/token must actually take effect
+            elif action == "select":
+                pid = p.get("provider")
+                if pid not in SHARE.providers:
+                    return self._json({"error": "unknown provider"}, 400)
+                ps["provider"] = pid
+            elif action == "enable":
+                enable = bool(p.get("enable"))
+                # never put the dashboard on the public internet without a login in front of it
+                if enable and not auth_configured(cfg):
+                    return self._json({"error": "Set a dashboard password first — public sharing would "
+                                                "otherwise expose full control to anyone with the URL."}, 400)
+                ps["enabled"] = enable
+            else:
+                return self._json({"error": "bad request"}, 400)
             save_config(cfg)
-            st = SHARE_TUNNEL.start(self.bind_port) if enable else SHARE_TUNNEL.stop()
+            SHARE.reconcile(cfg, self.bind_port, restart_active=restart)
+            st = SHARE.status(cfg)
+            st["password_set"] = auth_configured(cfg)
+            st["providers"] = SHARE.catalog(cfg)
             return self._json(st)
 
         # bulk actions
@@ -5505,10 +5936,10 @@ def serve(cfg_path, host, port):
     njobs = len((cfg["raw"].get("settings", {}).get("schedules") or {}).get("jobs", []))
     if njobs:
         print(f"scheduler: {njobs} job(s) loaded")
-    # resume public sharing (Cloudflare quick tunnel) if it was left on and a login is set
-    if cfg["raw"].get("settings", {}).get("public_share", {}).get("enabled") and auth_configured(cfg):
-        print("public sharing: starting Cloudflare quick tunnel…")
-        threading.Thread(target=lambda: SHARE_TUNNEL.start(port), daemon=True).start()
+    # resume public sharing (active exposure provider) if it was left on and a login is set
+    if SHARE.enabled(cfg) and auth_configured(cfg):
+        print(f"public sharing: resuming '{SHARE.active_id(cfg)}' provider…")
+        threading.Thread(target=lambda: SHARE.reconcile(cfg, port), daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -6607,6 +7038,18 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 .shrow{display:flex;align-items:center;gap:.6rem;border:1px solid var(--line);border-radius:8px;padding:.4rem .55rem}
 .rrow{display:flex;flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400}
 .shurl{border:1px solid var(--acc);border-radius:8px;padding:.5rem .6rem;background:color-mix(in srgb,var(--acc) 8%,transparent)}
+/* public-sharing provider picker */
+.provpick{display:flex;flex-direction:column;gap:.4rem}
+.provopt{display:flex;gap:.6rem;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:.55rem .65rem;cursor:pointer;background:var(--panel-2)}
+.provopt:hover{border-color:var(--acc-dim)}
+.provopt.on{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 8%,transparent)}
+.provopt input{width:auto;margin-top:.2rem;flex:none}
+.provopt .pinfo{min-width:0}
+.provopt .pname{font-weight:700;font-size:.88rem}
+.provopt .pblurb{color:var(--dim);font-size:.76rem;line-height:1.35;margin-top:.1rem}
+.provcfg{display:flex;flex-direction:column;gap:.4rem;margin-top:.6rem;padding:.6rem .65rem;border:1px dashed var(--line);border-radius:10px}
+.provcfg .pf{display:flex;flex-direction:column;gap:.25rem;color:var(--dim);font-size:.8rem}
+.provcfg .pf input{font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem}
 </style>
 </head>
 <body>
@@ -6651,12 +7094,8 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     <div class="modcard open" id="shTunCard">
       <div class="mhd"><span class="mtitle">Public sharing</span></div>
       <div class="mbody" style="gap:.5rem">
-        <div class="hint">Your dashboard is private (localhost / SSH-tunnel) by default, so a link only works for people who can already reach it. Turn this on for a public HTTPS address — via a Cloudflare quick tunnel, <b>no account or domain needed</b> — that anyone can open. The address changes if the tunnel restarts, so generate links fresh when you need them.</div>
-        <div class="mbar" style="align-items:center">
-          <span class="msg" id="shTunStatus" style="flex:1;color:var(--dim)">…</span>
-          <button id="shTunBtn" onclick="toggleTunnel(this)">Enable public sharing</button>
-        </div>
-        <div id="shTunUrl" style="display:none"></div>
+        <div class="hint">Your dashboard is private (localhost / SSH-tunnel) by default, so a link only works for people who can already reach it. Pick a way to give it a public HTTPS address that anyone can open — from a one-click Cloudflare quick tunnel (no account or domain) to your own domain.</div>
+        <div id="shTunBody"><div class="hint">…</div></div>
       </div>
     </div>
     <div class="modcard open">
@@ -9695,37 +10134,90 @@ setInterval(tick,1000);tick();
 /* ---- share access (owner) ---- */
 function openShares(){ $('shareScrim').classList.add('open'); $('shResult').style.display='none'; $('shMsg').textContent=''; shToggleAll(); loadShareBots(); loadShares(); loadAudit(); loadTunnel(); }
 let _tunPoll=null;
+async function tunGet(){ return await (await fetch('/api/share/tunnel')).json(); }
+async function tunPost(payload){
+  const r=await fetch('/api/share/tunnel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await r.json(); d._ok=r.ok; return d;
+}
+/* full render of the Public-sharing card from a GET payload */
 async function loadTunnel(){
-  try{
-    const d=await (await fetch('/api/share/tunnel')).json();
-    const st=$('shTunStatus'), btn=$('shTunBtn'), urlb=$('shTunUrl');
-    if(!d.password_set){ st.innerHTML='<span style="color:var(--warn)">Set a dashboard password first (Settings) — public sharing needs a login in front of it.</span>'; btn.disabled=true; urlb.style.display='none'; return; }
-    btn.disabled=false;
-    if(d.enabled && d.running && d.url){
-      st.innerHTML='<span style="color:var(--acc)">● Public</span> — links use this address:';
-      btn.textContent='Turn off';
-      urlb.style.display='block';
-      urlb.innerHTML='<div style="display:flex;gap:.4rem;margin-top:.2rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="navigator.clipboard&&navigator.clipboard.writeText(\''+jsq(d.url)+'\')">Copy</button></div>';
-      if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
-    } else if(d.enabled && !d.url){
-      st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting tunnel… (a few seconds)';
-      btn.textContent='Turn off'; urlb.style.display='none';
-      if(!_tunPoll) _tunPoll=setInterval(loadTunnel,1800);
-    } else {
-      st.textContent='Off — links will only work on your own (tunnel/localhost) connection.';
-      btn.textContent='Enable public sharing'; urlb.style.display='none';
-      if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+  let d; try{ d=await tunGet(); }catch(e){ $('shTunBody').innerHTML='<div class="hint">Could not load sharing state.</div>'; return; }
+  renderTunnel(d);
+}
+function renderTunnel(d){
+  const body=$('shTunBody');
+  if(!d.password_set){ if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;} body.innerHTML='<div class="hint" style="color:var(--warn)">Set a dashboard password first (Settings → Account) — public sharing needs a login in front of it.</div>'; return; }
+  const provs=d.providers||[], active=d.provider;
+  let h='<div class="provpick">';
+  for(const p of provs){
+    const on=p.id===active;
+    h+='<label class="provopt'+(on?' on':'')+'"><input type="radio" name="shprov" value="'+esc(p.id)+'"'+(on?' checked':'')+' onchange="selectProvider(this.value)"><div class="pinfo"><div class="pname">'+esc(p.name)+'</div><div class="pblurb">'+esc(p.blurb)+'</div></div></label>';
+  }
+  h+='</div>';
+  const ap=provs.find(p=>p.id===active);
+  if(ap && ap.needs && ap.needs.length){
+    const cur=ap.config||{};
+    h+='<div class="provcfg">';
+    for(const n of ap.needs){
+      if(n.secret){
+        const set=cur[n.key+'_set'];
+        h+='<label class="pf">'+esc(n.label)+(set?' <span class="hint">(saved — leave blank to keep)</span>':'')+'<input id="pf_'+esc(n.key)+'" type="password" autocomplete="off" placeholder="'+(set?'••••••••':esc(n.placeholder||''))+'"></label>';
+      }else{
+        h+='<label class="pf">'+esc(n.label)+'<input id="pf_'+esc(n.key)+'" value="'+esc(cur[n.key]||'')+'" placeholder="'+esc(n.placeholder||'')+'"></label>';
+      }
+      if(n.help) h+='<div class="hint" style="margin:-.2rem 0 .2rem">'+esc(n.help)+'</div>';
     }
-  }catch(e){ $('shTunStatus').textContent='Could not load tunnel state.'; }
+    h+='<div class="mbar"><span class="msg" id="shProvMsg" style="flex:1;color:var(--dim)"></span><button onclick="saveProvider(\''+esc(active)+'\',this)">Save settings</button></div></div>';
+  }
+  h+='<div class="mbar" style="align-items:center;margin-top:.5rem"><span class="msg" id="shTunStatus" style="flex:1;color:var(--dim)"></span><button id="shTunBtn" onclick="toggleTunnel(this)"></button></div>';
+  h+='<div id="shTunUrl" style="display:none"></div>';
+  body.innerHTML=h;
+  paintTunStatus(d);
+}
+/* repaint just the status line + enable button (used by the poller, so it won't wipe config inputs) */
+function paintTunStatus(d){
+  const st=$('shTunStatus'), btn=$('shTunBtn'), urlb=$('shTunUrl');
+  if(!st||!btn) return;
+  btn.disabled=false;
+  if(d.enabled && d.running && d.url){
+    st.innerHTML='<span style="color:var(--acc)">● Public</span> — links use this address:';
+    btn.textContent='Turn off'; urlb.style.display='block';
+    urlb.innerHTML='<div style="display:flex;gap:.4rem;margin-top:.2rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="navigator.clipboard&&navigator.clipboard.writeText(\''+jsq(d.url)+'\')">Copy</button></div>';
+    if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+  } else if(d.enabled && !d.running){
+    st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting… (a few seconds)';
+    btn.textContent='Turn off'; urlb.style.display='none';
+    if(!d.error && !_tunPoll) _tunPoll=setInterval(pollTunStatus,1800);
+    if(d.error && _tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+  } else {
+    st.textContent='Off — links only work on your own (tunnel/localhost) connection.';
+    btn.textContent='Enable public sharing'; urlb.style.display='none';
+    if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+  }
+}
+async function pollTunStatus(){ try{ paintTunStatus(await tunGet()); }catch(e){} }
+async function selectProvider(pid){
+  const d=await tunPost({action:'select',provider:pid});
+  if(!d._ok){ $('shTunStatus')&&($('shTunStatus').innerHTML='<span style="color:var(--danger)">'+esc(d.error||'failed')+'</span>'); return; }
+  renderTunnel(d);
+}
+async function saveProvider(pid,btn){
+  const prov=(await tunGet()).providers.find(p=>p.id===pid);
+  const cfg={};
+  (prov.needs||[]).forEach(n=>{ const el=$('pf_'+n.key); if(el) cfg[n.key]=el.value; });
+  btn.disabled=true; const m=$('shProvMsg'); if(m) m.innerHTML='<span class="spin"></span> saving…';
+  const d=await tunPost({action:'config',provider:pid,config:cfg});
+  btn.disabled=false;
+  if(!d._ok){ if(m) m.innerHTML='<span style="color:var(--danger)">'+esc(d.error||'failed')+'</span>'; return; }
+  if(m) m.textContent='Saved.';
+  renderTunnel(d);
 }
 async function toggleTunnel(btn){
   const on=btn.textContent.indexOf('off')>=0;
   btn.disabled=true; $('shTunStatus').innerHTML='<span class="spin"></span> '+(on?'stopping…':'starting…');
-  try{
-    const r=await fetch('/api/share/tunnel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable:!on})});
-    const d=await r.json(); if(!r.ok){ $('shTunStatus').innerHTML='<span style="color:var(--danger)">'+esc(d.error||'failed')+'</span>'; btn.disabled=false; return; }
-  }catch(e){}
-  btn.disabled=false; loadTunnel();
+  const d=await tunPost({action:'enable',enable:!on});
+  if(!d._ok){ $('shTunStatus').innerHTML='<span style="color:var(--danger)">'+esc(d.error||'failed')+'</span>'; btn.disabled=false; return; }
+  renderTunnel(d);
 }
 async function loadAudit(){
   try{ const d=await (await fetch('/api/shares/audit')).json(); const a=d.audit||[];
