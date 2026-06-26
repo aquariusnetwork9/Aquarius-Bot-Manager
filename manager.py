@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.2.3"
+__version__ = "3.3.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -87,6 +87,7 @@ def load_config(path):
     s.setdefault("system_actions_enabled", False)
     s.setdefault("shares", [])               # shareable-link guest grants
     s.setdefault("shares_epoch", 0)          # revoke-all generation for shares
+    s.setdefault("public_share", {"enabled": False})   # cloudflare quick-tunnel for guest links
     return {"raw": data, "instances": insts, "by_name": by_name, "path": path}
 
 
@@ -2418,6 +2419,145 @@ def audit_guest(entry):
 
 
 # ---------------------------------------------------------------------------
+# One-click public sharing — a managed Cloudflare *Quick* Tunnel
+# ---------------------------------------------------------------------------
+# Gives the dashboard a public HTTPS URL (https://<random>.trycloudflare.com) with
+# zero account / domain / cert — just the `cloudflared` binary + one long-running
+# process tunnelling to our loopback port. So a guest link can be handed to someone
+# who's never touched the VPS and they just click it. The URL is ephemeral (it
+# changes whenever the tunnel restarts) — fine for the expiry/revoke share model.
+_CF_URL_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
+_CF_DL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+
+
+class _ShareTunnel:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.url = None
+        self.enabled = False
+        self.error = None
+        self.port = None
+        self._mon = None
+
+    def bin_path(self):
+        # prefer a system cloudflared; else our cached copy
+        for c in ("/usr/local/bin/cloudflared", "/usr/bin/cloudflared"):
+            if os.path.exists(c):
+                return c
+        cached = shutil.which("cloudflared")
+        if cached:
+            return cached
+        return os.path.join(os.path.expanduser("~"), ".aquarius", "cloudflared")
+
+    def ensure_binary(self):
+        p = self.bin_path()
+        if os.path.exists(p):
+            return p
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".dl"
+        with urllib.request.urlopen(_CF_DL, timeout=120) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, p)
+        return p
+
+    def status(self):
+        with self.lock:
+            running = bool(self.proc and self.proc.poll() is None)
+            return {"enabled": self.enabled, "running": running, "url": self.url, "error": self.error}
+
+    def start(self, port):
+        with self.lock:
+            self.enabled = True
+            self.port = port
+            self.error = None
+        try:
+            binp = self.ensure_binary()
+        except Exception as e:
+            with self.lock:
+                self.error = "cloudflared download failed: " + str(e)[:160]
+            return self.status()
+        # clean up any orphaned tunnel for this port (manager uses KillMode=process,
+        # so a prior child can outlive a manager restart)
+        try:
+            subprocess.run(["pkill", "-f", f"cloudflared .*--url http://127.0.0.1:{port}"],
+                           timeout=8)
+        except Exception:
+            pass
+        time.sleep(0.4)
+        with self.lock:
+            self.url = None
+            self.proc = subprocess.Popen(
+                [binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+            if self._mon is None or not self._mon.is_alive():
+                self._mon = threading.Thread(target=self._monitor, daemon=True)
+                self._mon.start()
+        return self.status()
+
+    def stop(self):
+        with self.lock:
+            self.enabled = False
+            self.url = None
+            p, self.proc = self.proc, None
+            port = self.port
+        if p:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        try:
+            if port:
+                subprocess.run(["pkill", "-f", f"cloudflared .*--url http://127.0.0.1:{port}"],
+                               timeout=8)
+        except Exception:
+            pass
+        return self.status()
+
+    def _monitor(self):
+        """Read cloudflared output for the assigned URL; restart it if it dies while enabled."""
+        while True:
+            with self.lock:
+                p, enabled, port = self.proc, self.enabled, self.port
+            if not enabled:
+                return
+            if p is None:
+                time.sleep(1)
+                continue
+            line = p.stdout.readline() if p.stdout else b""
+            if line:
+                m = _CF_URL_RE.search(line)
+                if m:
+                    with self.lock:
+                        self.url = m.group(0).decode()
+                continue
+            # readline returned empty: process likely exited
+            if p.poll() is not None:
+                with self.lock:
+                    still = self.enabled
+                if not still:
+                    return
+                time.sleep(2)              # crashed/ended while enabled — relaunch with a fresh URL
+                self.start(port)
+                return
+
+
+SHARE_TUNNEL = _ShareTunnel()
+
+
+def share_base_url(handler):
+    """Public base URL for share links: the live Cloudflare tunnel if up, else the
+    owner's current scheme+host (works when they're already on a public access mode)."""
+    st = SHARE_TUNNEL.status()
+    if st["running"] and st["url"]:
+        return st["url"]
+    proto = handler.headers.get("X-Forwarded-Proto") or "http"
+    host = handler.headers.get("Host") or "this-host"
+    return f"{proto}://{host}"
+
+
+# ---------------------------------------------------------------------------
 # Connection info  (for the dashboard's reconnect panel + tunnel shortcut)
 # ---------------------------------------------------------------------------
 
@@ -4579,6 +4719,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._json({"audit": list(reversed(_GUEST_AUDIT[-60:]))})
 
+        if path == "/api/share/tunnel":
+            if not self._guard_owner(princ):
+                return
+            st = SHARE_TUNNEL.status()
+            st["password_set"] = auth_configured(self._cfg())
+            return self._json(st)
+
         m = re.match(r"^/api/instances/([^/]+)/logs$", path)
         if m:
             cfg = self._cfg()
@@ -4702,9 +4849,7 @@ class Handler(BaseHTTPRequestHandler):
                                          p.get("ttl_days"))
             except (ValueError, TypeError) as e:
                 return self._json({"error": str(e)}, 400)
-            proto = self.headers.get("X-Forwarded-Proto") or "http"
-            host = self.headers.get("Host") or "this-host"
-            url = f"{proto}://{host}/s/{token}"
+            url = f"{share_base_url(self)}/s/{token}"
             return self._json({"ok": True, "share": share_public_view(cfg, grant), "url": url})
 
         if path == "/api/shares/revoke":
@@ -4722,6 +4867,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             cfg = self._cfg()
             return self._json({"ok": True, "epoch": bump_shares_epoch(cfg)})
+
+        if path == "/api/share/tunnel":
+            if not self._guard_owner(princ):
+                return
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            cfg = self._cfg()
+            enable = bool(p.get("enable"))
+            # never put the dashboard on the public internet without a login in front of it
+            if enable and not auth_configured(cfg):
+                return self._json({"error": "Set a dashboard password first — public sharing would "
+                                            "otherwise expose full control to anyone with the URL."}, 400)
+            cfg["raw"].setdefault("settings", {}).setdefault("public_share", {})["enabled"] = enable
+            save_config(cfg)
+            st = SHARE_TUNNEL.start(self.bind_port) if enable else SHARE_TUNNEL.stop()
+            return self._json(st)
 
         # bulk actions
         m = re.match(r"^/api/(start|stop|restart)_all$", path)
@@ -5318,6 +5481,10 @@ def serve(cfg_path, host, port):
     njobs = len((cfg["raw"].get("settings", {}).get("schedules") or {}).get("jobs", []))
     if njobs:
         print(f"scheduler: {njobs} job(s) loaded")
+    # resume public sharing (Cloudflare quick tunnel) if it was left on and a login is set
+    if cfg["raw"].get("settings", {}).get("public_share", {}).get("enabled") and auth_configured(cfg):
+        print("public sharing: starting Cloudflare quick tunnel…")
+        threading.Thread(target=lambda: SHARE_TUNNEL.start(port), daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -6456,7 +6623,18 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 <div class="scrim" id="shareScrim" onclick="closeShares(event)">
   <div class="modal" style="width:min(640px,94vw)" onclick="event.stopPropagation()">
     <div class="mhead">👥 Share access</div>
-    <div class="hint" style="margin:-.3rem 0 .6rem">Create a link that lets someone operate only the bots you choose, at a capability tier. <b>The link is the credential</b> — anyone with it has access until it expires or you revoke it. Prefer an HTTPS access mode before sharing externally.</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Create a link that lets someone operate only the bots you choose, at a capability tier. <b>The link is the credential</b> — anyone with it has access until it expires or you revoke it.</div>
+    <div class="modcard open" id="shTunCard">
+      <div class="mhd"><span class="mtitle">Public sharing</span></div>
+      <div class="mbody" style="gap:.5rem">
+        <div class="hint">Your dashboard is private (localhost / SSH-tunnel) by default, so a link only works for people who can already reach it. Turn this on for a public HTTPS address — via a Cloudflare quick tunnel, <b>no account or domain needed</b> — that anyone can open. The address changes if the tunnel restarts, so generate links fresh when you need them.</div>
+        <div class="mbar" style="align-items:center">
+          <span class="msg" id="shTunStatus" style="flex:1;color:var(--dim)">…</span>
+          <button id="shTunBtn" onclick="toggleTunnel(this)">Enable public sharing</button>
+        </div>
+        <div id="shTunUrl" style="display:none"></div>
+      </div>
+    </div>
     <div class="modcard open">
       <div class="mhd"><span class="mtitle">New link</span></div>
       <div class="mbody" style="gap:.6rem">
@@ -9491,7 +9669,40 @@ function tick(){$('clock').textContent=new Date().toLocaleTimeString();syncAgo()
 setInterval(tick,1000);tick();
 
 /* ---- share access (owner) ---- */
-function openShares(){ $('shareScrim').classList.add('open'); $('shResult').style.display='none'; $('shMsg').textContent=''; shToggleAll(); loadShareBots(); loadShares(); loadAudit(); }
+function openShares(){ $('shareScrim').classList.add('open'); $('shResult').style.display='none'; $('shMsg').textContent=''; shToggleAll(); loadShareBots(); loadShares(); loadAudit(); loadTunnel(); }
+let _tunPoll=null;
+async function loadTunnel(){
+  try{
+    const d=await (await fetch('/api/share/tunnel')).json();
+    const st=$('shTunStatus'), btn=$('shTunBtn'), urlb=$('shTunUrl');
+    if(!d.password_set){ st.innerHTML='<span style="color:var(--warn)">Set a dashboard password first (Settings) — public sharing needs a login in front of it.</span>'; btn.disabled=true; urlb.style.display='none'; return; }
+    btn.disabled=false;
+    if(d.enabled && d.running && d.url){
+      st.innerHTML='<span style="color:var(--acc)">● Public</span> — links use this address:';
+      btn.textContent='Turn off';
+      urlb.style.display='block';
+      urlb.innerHTML='<div style="display:flex;gap:.4rem;margin-top:.2rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="navigator.clipboard&&navigator.clipboard.writeText(\''+jsq(d.url)+'\')">Copy</button></div>';
+      if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+    } else if(d.enabled && !d.url){
+      st.innerHTML=d.error?('<span style="color:var(--danger)">'+esc(d.error)+'</span>'):'<span class="spin"></span> starting tunnel… (a few seconds)';
+      btn.textContent='Turn off'; urlb.style.display='none';
+      if(!_tunPoll) _tunPoll=setInterval(loadTunnel,1800);
+    } else {
+      st.textContent='Off — links will only work on your own (tunnel/localhost) connection.';
+      btn.textContent='Enable public sharing'; urlb.style.display='none';
+      if(_tunPoll){clearInterval(_tunPoll);_tunPoll=null;}
+    }
+  }catch(e){ $('shTunStatus').textContent='Could not load tunnel state.'; }
+}
+async function toggleTunnel(btn){
+  const on=btn.textContent.indexOf('off')>=0;
+  btn.disabled=true; $('shTunStatus').innerHTML='<span class="spin"></span> '+(on?'stopping…':'starting…');
+  try{
+    const r=await fetch('/api/share/tunnel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable:!on})});
+    const d=await r.json(); if(!r.ok){ $('shTunStatus').innerHTML='<span style="color:var(--danger)">'+esc(d.error||'failed')+'</span>'; btn.disabled=false; return; }
+  }catch(e){}
+  btn.disabled=false; loadTunnel();
+}
 async function loadAudit(){
   try{ const d=await (await fetch('/api/shares/audit')).json(); const a=d.audit||[];
     $('shAudit').innerHTML=a.length?a.map(e=>'<div>'+new Date(e.ts*1000).toLocaleString()+' · <b>'+esc(e.target||'')+'</b> · '+esc((e.path||'').replace('/api/instances/'+(e.target||''),''))+' <span class="hint">['+esc(e.tier||'')+']</span></div>').join(''):'<span class="hint">No guest actions recorded.</span>';
@@ -9519,8 +9730,10 @@ async function createShare(btn){
     if(!r.ok||!d.ok){ $('shMsg').textContent=d.error||'failed'; return; }
     $('shMsg').textContent='';
     $('shResult').style.display='block';
+    const priv=/\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:|\/)/.test(d.url||'');
+    const warn=priv?'<div class="hint" style="color:var(--warn);margin-top:.3rem">⚠ This link points at your private address, so only you can open it. Enable <b>Public sharing</b> above, then create the link again.</div>':'';
     $('shResult').innerHTML='<div class="shurl"><div style="color:var(--acc);font-size:.78rem;font-weight:600">Link created — copy it now, it won’t be shown again:</div>'+
-      '<div style="display:flex;gap:.4rem;margin-top:.35rem"><input id="shUrl" readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.76rem"><button onclick="shCopy()">Copy</button></div></div>';
+      '<div style="display:flex;gap:.4rem;margin-top:.35rem"><input id="shUrl" readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.76rem"><button onclick="shCopy()">Copy</button></div>'+warn+'</div>';
     $('shLabel').value=''; loadShares();
   }catch(e){ $('shMsg').textContent='error'; }
   finally{ btn.disabled=false; }

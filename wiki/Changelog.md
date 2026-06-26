@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.2.3 — *latest*
+## v3.3.0 — *latest*
+
+- **One-click public sharing for guest links.** Guest links only work for people who can reach the dashboard — which, on the default SSH-tunnel setup, is just you. The Share panel now has a **Public sharing** toggle: flip it on and ABM spins up a **Cloudflare quick tunnel** (downloads `cloudflared`, runs it, no account/domain/cert) to give the dashboard a public HTTPS address. Every link you create then uses that address, so someone who's never touched your VPS can click it and land straight in, scoped to their bots. Requires a dashboard password (it refuses to expose an open/no-login dashboard). The quick-tunnel URL is **ephemeral** (changes if the tunnel restarts), so generate links fresh; a stable named-tunnel mode is coming.
+
+## v3.2.3
 
 - **Fix:** the sidebar (full layout) now scrolls instead of clipping its bottom nav items on short windows. Completes the modal/scroll audit started in v3.2.2 — modals, drawer, logs, lists, control tab and sidebar all scroll their overflow now.
 
