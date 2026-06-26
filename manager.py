@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.2.1"
+__version__ = "3.2.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -6230,6 +6230,9 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
   width:min(520px,92vw);max-height:92vh;overflow-y:auto;background:var(--panel);border:1px solid var(--line);
   border-radius:16px;padding:1.3rem 1.4rem;display:flex;flex-direction:column;gap:.7rem;
   box-shadow:0 30px 80px #000a}
+/* the modal is a flex-column scroll container; stop its children (cards) from shrinking +
+   clipping (they have overflow:hidden) when content exceeds max-height — let the modal scroll */
+.modal>*{flex-shrink:0}
 .mhead{font-weight:800;font-size:1.15rem;letter-spacing:-.02em;margin-bottom:.2rem}
 .modal label{display:flex;flex-direction:column;gap:.3rem;font-size:.82rem;font-weight:600;color:var(--dim)}
 .modal .hint{font-weight:400;font-size:.68rem;color:#586675;font-family:var(--mono)}

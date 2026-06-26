@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.2.1 — *latest*
+## v3.2.2 — *latest*
+
+- **Fix:** modals now scroll instead of clipping. A tall modal (e.g. the Share panel with many bots + an audit log) was capped at the window height and its cards got squished — buttons and content cut off with no way to scroll to them. The modal's cards no longer shrink, so the modal scrolls and everything is reachable. Applies to all modals (Settings/Files/Proxies too).
+
+## v3.2.1
 
 - **Fix:** the **👥 Share** button was only in the classic header — it's now also in the sidebar nav and quick-action menu, so it shows in the full (sidebar) layout too. Still owner-only.
 
