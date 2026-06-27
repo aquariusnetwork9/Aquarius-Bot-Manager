@@ -1,9 +1,11 @@
 # Live Control Surface (Mission Control)
 
 The **Control Surface** turns the bot manager into a live, front-facing cockpit for
-each AquariusProxy bot — every module, the world map, vitals, and a command palette on
-one page. The proxy console is still there as a fallback; the Control Surface is the
-human-friendly way to drive a bot day to day.
+each bot — every module, the world map, vitals, and a command palette on one page.
+AquariusProxy bots get this **built in**; **ZenithProxy** bots get the same surface by
+installing the [`zenith-abm-bridge`](https://github.com/aquariusnetwork9/zenith-abm-bridge)
+plugin (see [Requirements](#requirements-bot-side) below). The proxy console is still there
+as a fallback; the Control Surface is the human-friendly way to drive a bot day to day.
 
 > Added in **ABM v3.0.0**. Served per-bot at `/control?inst=<name>` and relayed over the
 > same authenticated tunnel as the live viewer — the bot only binds its viewer to
@@ -81,8 +83,12 @@ time from the top-bar dropdown; the Live Map is built into all of them.
 
 ## Requirements (bot side)
 
-The bot must be running an AquariusProxy build with the viewer + control endpoints, and in
-its `config.json`:
+The surface needs the bot to serve the loopback viewer + control endpoints. How you turn
+those on depends on the fork.
+
+### AquariusProxy (built in)
+
+Set the viewer block in the bot's `config.json`:
 
 ```jsonc
 "server": {
@@ -95,8 +101,31 @@ its `config.json`:
 }
 ```
 
-- With **`control: false`** (or the flag absent) the surface still works as a **read-only
-  viewer** — vitals and the map render, but toggles/commands return `403` and do nothing.
+### ZenithProxy (the bridge plugin)
+
+Stock ZenithProxy doesn't ship the viewer/control endpoints — the
+[`zenith-abm-bridge`](https://github.com/aquariusnetwork9/zenith-abm-bridge) plugin adds
+them, so a ZenithProxy bot lights up the Control Surface exactly like an AquariusProxy one.
+
+1. Download `ZenithABMBridge-<version>.jar` from the plugin's
+   [Releases](https://github.com/aquariusnetwork9/zenith-abm-bridge/releases) and drop it in
+   the bot's `plugins/` directory.
+2. Start/restart the bot, then in its console:
+   ```
+   abmBridge on            # serves the live feed (map / vitals / entities)
+   abmBridge control on    # ALLOWS the surface to run commands & toggle modules
+   ```
+3. That's it — ABM auto-detects the bridge (its port lives in
+   `plugins/config/abm-bridge.json`, default `2998`, same as AquariusProxy's viewer).
+
+The module list ABM shows for a ZenithProxy bot reflects **that build's own modules** — the
+[Module reference](#module-reference) below is AquariusProxy's set.
+
+### Either fork
+
+- With **control off** (`control: false` on AquariusProxy, or never running `abmBridge
+  control on`) the surface still works as a **read-only viewer** — vitals and the map render,
+  but toggles/commands return `403` and do nothing.
 - The viewer binds to **loopback only**; the dashboard fetches it server-side and relays it
   over the authenticated (and, across boxes, SSH-tunnelled) connection. Nothing the bot
   serves is reachable directly from the internet.
@@ -221,6 +250,9 @@ authenticated relay**:
 - `GET /viewer/inventory` → vitals + armor + inventory (used by the cockpit panels).
 
 All three themes load the **same** model and the same live brain, so a fix or a new live
-binding lands everywhere at once.
+binding lands everywhere at once. The relay is **fork-agnostic** — it talks to the same
+endpoints whether they come from AquariusProxy natively or from the
+[`zenith-abm-bridge`](https://github.com/aquariusnetwork9/zenith-abm-bridge) plugin on a
+ZenithProxy bot.
 
 See also: **[Usage](Usage)** · **[Security](Security)** · **[Architecture & Limitations](Architecture-and-Limitations)**.

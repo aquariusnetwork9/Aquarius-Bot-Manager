@@ -39,7 +39,7 @@ The 3.x line turns the single-host manager into a **front-facing control plane w
 
 | Feature | What it adds |
 | --- | --- |
-| **Live Control Surface** | A per-bot cockpit at `/control?inst=<name>` — every module, a world map, vitals, and a command runner on one page, in three switchable themes. [Control Surface →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Control-Surface) |
+| **Live Control Surface** | A per-bot cockpit at `/control?inst=<name>` — every module, a world map, vitals, and a command runner on one page, in three switchable themes. Built into AquariusProxy; ZenithProxy bots get it via the [`zenith-abm-bridge`](https://github.com/aquariusnetwork9/zenith-abm-bridge) plugin. [Control Surface →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Control-Surface) |
 | **Shareable guest links** | Hand someone a single URL scoped to specific bots at a tier (view / operate / config), with expiry + instant revoke. No account needed. |
 | **Public sharing** | Give the dashboard a public HTTPS address from a **menu of providers** ABM installs for you — Cloudflare Quick Tunnel (no account), Tailscale Funnel (userspace, no root), ngrok, a named Cloudflare tunnel, or your own reverse proxy. |
 | **Named user accounts (RBAC)** | Real per-person logins with roles **view / operate / config / admin**, each scoped to specific bots — added directly or via a one-time **invite link**. Live disable / reset / delete. |
