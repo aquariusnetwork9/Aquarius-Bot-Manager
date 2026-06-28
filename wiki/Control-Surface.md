@@ -58,7 +58,8 @@ time from the top-bar dropdown; the Live Map is built into all of them.
 | **Live Map** | ✅ live | Real bot-centred map tile + SSE entity overlay; **click the map to set an Elytra destination**. |
 | **Command palette / runner** | ✅ live | Runs any console command and shows the structured result. |
 | **Live configuration (per module)** | ✅ live *(v3.1)* | A **⚙ Live configuration** panel on each module reads the bot's real config and writes single fields back instantly (`GET`/`POST /control/config`); secrets are redacted and never writable. The friendly mockup subcards remain as a read-only overview. |
-| **Pearl pins on the map · trade-list editor** | 🧩 planned | A later release; they need new bot-side data exposure. |
+| **List editors — trades · trips · pearls** | ✅ live *(v3.10, needs AquariusProxy 5.9.0+)* | **Villager trades**, **saved Elytra trips**, and **pearl-stasis locations** can be **added, edited and deleted** from the surface. Each shows the bot's real entries with a per-row 🗑; **＋ New …** opens a guided form (the trade builder validates against the real villager catalog and includes chest coordinates) that writes straight to the bot's config. Gated by the per-module **config** permission. |
+| **Pearl pins on the map** | 🧩 planned | A later release; needs new bot-side data exposure. |
 
 > The settings subcards show **sensible defaults**, not the bot's live config yet. Don't
 > treat the values there as the bot's current configuration until v3.1 wires them to the
@@ -157,8 +158,8 @@ toggle — run their command instead.
 |---|---|---|
 | **Live Map** · `LiveViewer` | The live world map this page is built around. | Read-only viewer; needs `viewer.enabled`. Entity/positions are from the SSE feed; map span is approximate. |
 | **Elytra Autopilot** · `ElytraPilot` | Trip planner & long-haul flight (cruise / highway / e-bounce). | ⚠ A **worn elytra silently breaks e-bounce** — carry spare elytras, don't fly in one you also want to bounce with. Pre-flight audit expects **≥ 2 elytras, ≥ 2 totems, fireworks**. E-bounce is tuned Grim-accepted (~30–38 b/s) but anarchy anti-cheat is a moving target. Native nether routing needs the correct world seed. "Last elytra" safety can log you out. |
-| **Villager Trading** · `VillagerTrader` | Stationary auto trade hall (emerald economy). | Needs supply/output **chest coordinates** set. ⚠ Trade-list editing is **preview** for now — manage trades from the console until the editor lands. |
-| **Pearl Stasis** · `PearlManager` | Ender-pearl stasis loader. | Needs stasis chamber coordinates. ⚠ Map pin-to-add is planned (Phase C); coords are entered manually today. |
+| **Villager Trading** · `VillagerTrader` | Stationary auto trade hall (emerald economy). | Add/edit/delete trades right on the surface (**v3.10**, AquariusProxy 5.9.0+) — the **＋ New trade** builder validates against the real villager catalog and captures the supply/output **chest coordinates**. |
+| **Pearl Stasis** · `PearlManager` | Ender-pearl stasis loader. | Add/edit/delete stasis locations on the surface (**v3.10**, AquariusProxy 5.9.0+) via **＋ Add pearl**. ⚠ Map pin-to-add is still planned (Phase C); coordinates are typed today. |
 | **Stash Manager** · `StashScanner` | Indexes & sorts an owned stash. | Operates on **your own** stash; point it at the right chests/region. |
 | **Auto Miner** · `AquariusMiner` | Top-down quarry & ore search with auto-deposit. | ⚠ Uses the **ender chest as the field buffer — never carry filled shulkers in the mining inventory** (it'll mis-deposit). On laggy anarchy, drops can fly up to ~2 blocks, so it settles/chases/confirms each break. Pauses for Auto Eat. Set bounds + deposit chests. |
 | **Auto Enchanter** · `Enchanter` | Anvil auto-enchant station. | Needs the **anvil/input/output/book** station laid out and coordinates set. |
@@ -244,7 +245,7 @@ authenticated relay**:
 
 - `GET /control/state` → module list + enabled flags (the rail status dots + header chips).
 - `POST /control/command` → runs a console command, returns its structured output.
-- `GET /control/config` → the live config tree (**secrets redacted**); `POST /control/config` `{path,value}` sets one field by dot-path and persists. Powers the **⚙ Live configuration** panel.
+- `GET /control/config` → the live config tree (**secrets redacted**); `POST /control/config` sets/edits config and persists. `{path,value}` (or `{op:"set",…}`) sets one scalar field by dot-path — powers the **⚙ Live configuration** panel. `{op:"put",path,key,value}` / `{op:"add",path,value}` / `{op:"remove",path,key|index}` add or remove whole entries in a config **map** or **list** (deserialized into the real config type) — powers the **trades / trips / pearls** list editors (AquariusProxy 5.9.0+).
 - `GET /viewer/stream` (SSE, ~20 Hz) → position, vitals, dimension, nearby entities.
 - `GET /viewer/map.png` → the bot-centred map tile (Live Map backdrop).
 - `GET /viewer/inventory` → vitals + armor + inventory (used by the cockpit panels).

@@ -497,6 +497,276 @@
     document.head.appendChild(s);
   }
 
+  /* ===========================================================================
+     List editors (v3.10) — the three "add an entry" lists the mockup drew but
+     never wired: villager trades, saved Elytra trips, and pearl locations. Each
+     maps to a real config CONTAINER (a Map or a List) under client.extra; the
+     editor reads live entries from LIVE.config, deletes by key/index, and adds
+     via a small modal form that POSTs the new entry to /control/config (op
+     put|add|remove). The bot deserializes it straight into the config type.
+     Lives in the config column (LO.cfg) so it works in every theme; the dead
+     mockup ".addrow" buttons are also wired to open the same form.
+     =========================================================================== */
+  function mcStrip(id){ return String(id||'').replace(/^minecraft:/,''); }
+  function capWords(s){ return String(s||'').toLowerCase().replace(/(^|[_\s])([a-z])/g, function(_,a,b){ return (a===''?'':' ')+b.toUpperCase(); }).trim(); }
+
+  /* book-enchant display name -> {id, level} (bare registry id, as the bot's EnchantmentRegistry keys them) */
+  var ENCH_ROMAN = { i:1, ii:2, iii:3, iv:4, v:5 };
+  function parseEnch(disp){
+    var parts=String(disp||'').trim().split(/\s+/);
+    var last=(parts[parts.length-1]||'').toLowerCase(), level=1;
+    if(ENCH_ROMAN[last]){ level=ENCH_ROMAN[last]; parts.pop(); }
+    var nm=parts.join(' ').toLowerCase(), id;
+    if(nm.indexOf('curse of ')===0) id=nm.slice(9).replace(/\s+/g,'_')+'_curse';   // Curse of Binding -> binding_curse
+    else id=nm.replace(/\s+/g,'_');
+    return { id:id, level:level };
+  }
+  function enchMap(disp){ var e=parseEnch(disp), o={}; o[e.id]=e.level; return o; }
+
+  /* container readers — a config Map serializes to a JSON object, a List to an array */
+  function mapRows(c){ if(!c||typeof c!=='object'||Array.isArray(c)) return []; return Object.keys(c).map(function(k){ return [k, c[k]]; }); }
+  function listRows(c){ return Array.isArray(c) ? c.map(function(v,i){ return [i, v]; }) : []; }
+  function existingKeys(path){ return mapRows(getPath(LIVE.config, path)).map(function(e){ return e[0]; }); }
+
+  /* form-input helpers (inputs are tagged data-le="<name>") */
+  function $le(ov,name){ return ov.querySelector('[data-le="'+name+'"]'); }
+  function leVal(ov,name){ var e=$le(ov,name); return e?String(e.value):''; }
+  function leNum(ov,name,def){ var e=$le(ov,name); if(!e||String(e.value).trim()==='') return def; var n=parseInt(e.value,10); return isFinite(n)?n:def; }
+  function leChecked(ov,name){ var e=$le(ov,name); return !!(e&&e.checked); }
+  function leCoord(ov,prefix,label){
+    function one(ax){ var e=$le(ov,prefix+ax); var v=e?String(e.value).trim():''; if(!/^-?\d+$/.test(v)) throw new Error('Enter whole numbers for '+label+' (x, y, z).'); return parseInt(v,10); }
+    return { x:one('x'), y:one('y'), z:one('z') };
+  }
+
+  /* form-field HTML helpers */
+  function leTextRow(label,name,ph,def){ return '<div class="leRow"><label>'+esc(label)+'</label><input data-le="'+name+'" placeholder="'+esc(ph||'')+'" value="'+esc(def||'')+'"></div>'; }
+  function leNumRow(label,name,def){ return '<div class="leRow"><label>'+esc(label)+'</label><input data-le="'+name+'" class="leN" inputmode="numeric" value="'+esc(def)+'"></div>'; }
+  function leToggleRow(label,name,on){ return '<div class="leRow"><label>'+esc(label)+'</label><input type="checkbox" data-le="'+name+'"'+(on?' checked':'')+'></div>'; }
+  function leCoordRow(label,prefix){ return '<div class="leRow"><label>'+esc(label)+'</label><span class="leXYZ">'+
+      '<input data-le="'+prefix+'x" placeholder="x" inputmode="numeric">'+
+      '<input data-le="'+prefix+'y" placeholder="y" inputmode="numeric">'+
+      '<input data-le="'+prefix+'z" placeholder="z" inputmode="numeric"></span></div>'; }
+  function leSub(t){ return '<div class="leFormSub">'+esc(t)+'</div>'; }
+  function leHint(t){ return '<div class="leHint">'+esc(t)+'</div>'; }
+
+  /* ---- forms (return HTML; collectors build the config entry + return the POST promise, or throw to show inline) ---- */
+  var TRADER_PATH='client.extra.villagerTrader.trades',
+      ELYTRA_PATH='client.extra.elytraPilot.tripRoutes',
+      PEARL_PATH ='client.extra.pearlLoader.pearls';
+
+  function tradeFormHtml(){
+    // reset the shared builder to a known-valid default each open
+    try{ ABMTrade.load({prof:'Librarian',give1:'minecraft:emerald',give2:'minecraft:book',get:'Enchanted Book',ench:'Mending'}); }catch(e){}
+    return leHint('Pick a real villager offer, name it, then point it at the chests at your trade hall.')+
+      ABMTrade.box()+
+      leTextRow('Trade name','leKey','e.g. mending-books')+
+      leSub('Chests  ·  x y z')+
+      leCoordRow('Give-1 supply chest','c1')+
+      leCoordRow('Give-2 supply chest (if second input)','c2')+
+      leCoordRow('Output chest','co')+
+      leSub('Restock & limits')+
+      leNumRow('Restock stacks (give-1)','rs1',4)+
+      leNumRow('Restock when below (give-1)','rt1',64)+
+      leNumRow('Restock stacks (give-2)','rs2',4)+
+      leNumRow('Restock when below (give-2)','rt2',64)+
+      leNumRow('Store output when above','st',64)+
+      leNumRow('Max give-1 per trade','mx1',99)+
+      leNumRow('Max give-2 per trade','mx2',99);
+  }
+  function tradeCollect(ov){
+    var m=(typeof ABMTrade!=='undefined')?ABMTrade.match():null;
+    if(!m) throw new Error('Choose a valid villager trade first (the builder must show a green ✓).');
+    var s=ABMTrade.state;
+    var key=leVal(ov,'leKey').trim();
+    if(!key) throw new Error('Give the trade a name.');
+    if(existingKeys(TRADER_PATH).indexOf(key)>=0) throw new Error('A trade named “'+key+'” already exists.');
+    var has2 = s.give2 && s.give2!=='__none';
+    var c1=leCoord(ov,'c1','the give-1 supply chest');
+    var co=leCoord(ov,'co','the output chest');
+    var c2= has2 ? leCoord(ov,'c2','the give-2 supply chest') : {x:0,y:0,z:0};
+    var value={
+      enabled:true,
+      villagerProfession: s.prof.toUpperCase(),
+      inputItem1: mcStrip(s.give1),
+      inputItem2: has2 ? mcStrip(s.give2) : 'air',
+      outputItem: mcStrip(m.o[0]),
+      inputItem1Chest:c1, inputItem2Chest:c2, outputChest:co,
+      inputItem1RestockStacks: leNum(ov,'rs1',4),
+      inputItem1RestockCountThreshold: leNum(ov,'rt1',64),
+      inputItem2RestockStacks: leNum(ov,'rs2',4),
+      inputItem2RestockCountThreshold: leNum(ov,'rt2',64),
+      outputItemStoreCountThreshold: leNum(ov,'st',64),
+      maxInput1PerTrade: leNum(ov,'mx1',99),
+      maxInput2PerTrade: leNum(ov,'mx2',99),
+      postTradeStoreMode:'NONE',
+      overflowChestPos:{x:0,y:0,z:0},
+      outputItemEnchantments: (ABMTrade.isBook() ? enchMap(s.bookEnch) : {})
+    };
+    return leMutate('put', TRADER_PATH, { key:key, value:value });
+  }
+
+  function tripFormHtml(){
+    return leHint('A direct trip: the bot flies open-nether to the destination. Overworld targets are projected to the nether automatically.')+
+      leTextRow('Trip name','leKey','e.g. spawn-to-base')+
+      leToggleRow('Destination is in the Nether','leNether',false)+
+      leCoordRow('Destination','cd');
+  }
+  function tripCollect(ov){
+    var key=leVal(ov,'leKey').trim();
+    if(!key) throw new Error('Give the trip a name.');
+    if(existingKeys(ELYTRA_PATH).indexOf(key)>=0) throw new Error('A trip named “'+key+'” already exists.');
+    var endNether=leChecked(ov,'leNether');
+    var d=leCoord(ov,'cd','the destination');
+    var legX = endNether ? d.x : Math.round(d.x/8);
+    var legZ = endNether ? d.z : Math.round(d.z/8);
+    var value={ id:key, endInNether:endNether, destX:d.x, destY:d.y, destZ:d.z,
+      legs:[ { ride:false, x:legX, z:legZ, roadY:70 } ] };
+    return leMutate('put', ELYTRA_PATH, { key:key, value:value });
+  }
+
+  function pearlFormHtml(){
+    return leHint('The block the bot interacts with to release the stasis pearl.')+
+      leTextRow('Pearl name','leKey','e.g. base')+
+      leCoordRow('Interact block','cp');
+  }
+  function pearlCollect(ov){
+    var id=leVal(ov,'leKey').trim();
+    if(!id) throw new Error('Give the pearl a name.');
+    var c=leCoord(ov,'cp','the interact block');
+    return leMutate('add', PEARL_PATH, { value:{ id:id, x:c.x, y:c.y, z:c.z } });
+  }
+
+  var LIST_EDITORS = {
+    trader: { title:'Trades', addLabel:'New trade', kind:'map', path:TRADER_PATH,
+      rowText:function(k,t){ var has2=t.inputItem2&&t.inputItem2!=='air';
+        return { title:k, sub:capWords(t.villagerProfession)+' · '+pretty(mcStrip(t.inputItem1))+(has2?' + '+pretty(mcStrip(t.inputItem2)):'')+' → '+pretty(mcStrip(t.outputItem)) }; },
+      form:tradeFormHtml, collect:tradeCollect },
+    elytra: { title:'Saved trips', addLabel:'New trip', kind:'map', path:ELYTRA_PATH,
+      rowText:function(k,r){ var n=(r.legs&&r.legs.length)||0;
+        return { title:k, sub:(r.endInNether?'Nether':'Overworld')+' → '+r.destX+', '+r.destY+', '+r.destZ+' · '+n+' leg'+(n===1?'':'s') }; },
+      form:tripFormHtml, collect:tripCollect },
+    pearl: { title:'Pearl locations', addLabel:'Add pearl', kind:'list', path:PEARL_PATH,
+      rowText:function(i,p){ return { title:(p.id||('#'+i)), sub:p.x+', '+p.y+', '+p.z }; },
+      form:pearlFormHtml, collect:pearlCollect }
+  };
+
+  function leMutate(op, path, body){
+    var payload={ op:op, path:path };
+    for(var k in body) payload[k]=body[k];
+    return fetch(api('/control/config'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(function(r){ if(r.status===403) throw new Error('control disabled, or you lack permission'); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(d){ if(d && d.ok===false) throw new Error(d.error||'change failed');
+        toast(op==='remove'?'removed':'saved · '+(d&&d.size!=null?d.size+' total':'ok'), 'ok');
+        return refreshAfterMutate();
+      })
+      .catch(function(e){ toast(e.message,'err',4200); throw e; });
+  }
+  function refreshAfterMutate(){ return fetchConfig().then(function(){ try{ render(); }catch(e){} }); }
+
+  function closeLeModal(){ var m=document.getElementById('leModal'); if(m) m.remove(); }
+  function leShowErr(ov,msg){ var e=ov.querySelector('.leErr'); if(e){ e.style.display='block'; e.textContent=msg; } }
+  function openAdd(spec){
+    closeLeModal();
+    var ov=document.createElement('div'); ov.id='leModal'; ov.className='leOv';
+    ov.innerHTML='<div class="leCard"><div class="leTitle">＋ '+esc(spec.addLabel)+'<span class="leClose">×</span></div>'+
+      '<div class="leBody">'+spec.form()+'</div>'+
+      '<div class="leErr" style="display:none"></div>'+
+      '<div class="leFoot"><button class="leBtn leCancel">Cancel</button><button class="leBtn leSaveBtn">Save</button></div></div>';
+    document.body.appendChild(ov);
+    ov.querySelector('.leClose').onclick=closeLeModal;
+    ov.querySelector('.leCancel').onclick=closeLeModal;
+    ov.addEventListener('click', function(e){ if(e.target===ov) closeLeModal(); });
+    ov.querySelector('.leSaveBtn').onclick=function(){
+      var p; try{ p=spec.collect(ov); }catch(err){ leShowErr(ov, err.message); return; }
+      var btn=this; btn.disabled=true; btn.textContent='Saving…';
+      Promise.resolve(p).then(function(){ closeLeModal(); })
+        .catch(function(err){ btn.disabled=false; btn.textContent='Save'; leShowErr(ov, (err&&err.message)||'failed'); });
+    };
+  }
+
+  function buildListEditor(){
+    var spec=LIST_EDITORS[cur]; if(!spec) return;
+    var cont=$(LO.cfg); if(!cont) return;
+    var stale=document.getElementById('leEditor'); if(stale) stale.remove();
+    if(!LIVE.config) return;                              // config not loaded yet — leave the mockup preview alone
+    var container=getPath(LIVE.config, spec.path);
+    var entries = spec.kind==='map' ? mapRows(container) : listRows(container);
+    var canEdit = moduleConfig(cur);
+    var rows = entries.map(function(e){
+      var rt=spec.rowText(e[0], e[1]);
+      var del = canEdit ? '<button class="leDel" title="Delete" data-k="'+esc(String(e[0]))+'" data-lbl="'+esc(String(rt.title))+'">🗑</button>' : '';
+      return '<div class="leItem"><div class="leItemMain"><div class="leItemT">'+esc(rt.title)+'</div><div class="leItemS">'+esc(rt.sub)+'</div></div>'+del+'</div>';
+    }).join('');
+    var panel=document.createElement('div'); panel.id='leEditor'; panel.className='lePanel';
+    panel.innerHTML='<div class="leHead">'+esc(spec.title)+' <span class="leCount">'+entries.length+'</span>'+
+      (canEdit?'<button class="leAdd">＋ '+esc(spec.addLabel)+'</button>':'')+'</div>'+
+      '<div class="leList">'+(rows||'<div class="leEmpty">None yet — add one below.</div>')+'</div>';
+    cont.insertBefore(panel, cont.firstChild);
+    if(!canEdit) return;
+    var addBtn=panel.querySelector('.leAdd'); if(addBtn) addBtn.onclick=function(){ openAdd(spec); };
+    [].forEach.call(panel.querySelectorAll('.leDel'), function(b){
+      b.onclick=function(){
+        var k=this.dataset.k, lbl=this.dataset.lbl;
+        if(!window.confirm('Delete “'+lbl+'”?')) return;
+        var body = spec.kind==='map' ? { key:k } : { index:parseInt(k,10) };
+        leMutate('remove', spec.path, body);
+      };
+    });
+  }
+
+  /* the mockup's dead "＋ New …" buttons (v1 left list panel) — open the same form */
+  function wireAddRows(){
+    var spec=LIST_EDITORS[cur]; if(!spec) return;
+    [].forEach.call(document.querySelectorAll('.addrow'), function(el){
+      if(el.dataset.lw) return; el.dataset.lw='1';
+      el.style.cursor='pointer'; el.style.pointerEvents='auto';
+      el.addEventListener('click', function(){
+        if(moduleConfig(cur)) openAdd(spec);
+        else toast('read-only — your access doesn’t include editing this module','err',3200);
+      });
+    });
+  }
+
+  function injectListEditorCss(){
+    if($('#leCss')) return;
+    var s=document.createElement('style'); s.id='leCss';
+    s.textContent=
+      '.lePanel{border:1px solid var(--acc-dim,#1f7a55);border-radius:12px;background:#3ddc9712;padding:.55rem .7rem .65rem;margin-bottom:.7rem}'+
+      '.lePanel .leHead{display:flex;align-items:center;gap:.5rem;font-weight:700;font-size:.84rem;margin-bottom:.45rem}'+
+      '.leCount{font-family:var(--mono,monospace);font-size:.6rem;color:var(--dim,#7b8a98);border:1px solid var(--line,#1d2730);border-radius:20px;padding:.04rem .42rem}'+
+      '.leAdd{margin-left:auto;font-family:var(--sans,sans-serif);font-size:.74rem;font-weight:700;color:var(--acc,#3ddc97);background:var(--panel,#11171e);border:1px solid var(--acc-dim,#1f7a55);border-radius:8px;padding:.32rem .6rem;cursor:pointer}'+
+      '.leAdd:hover{background:#3ddc9718}'+
+      '.leList{display:flex;flex-direction:column;gap:.3rem}'+
+      '.leItem{display:flex;align-items:center;gap:.6rem;background:#0b0f14;border:1px solid var(--line,#1d2730);border-radius:9px;padding:.4rem .55rem}'+
+      '.leItemMain{flex:1;min-width:0}'+
+      '.leItemT{font-size:.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
+      '.leItemS{font-family:var(--mono,monospace);font-size:.64rem;color:var(--dim,#7b8a98);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
+      '.leDel{flex:none;background:none;border:1px solid transparent;border-radius:7px;cursor:pointer;font-size:.85rem;padding:.2rem .35rem;opacity:.6}'+
+      '.leDel:hover{opacity:1;border-color:#5a1f1f;background:#ff545412}'+
+      '.leEmpty{font-family:var(--mono,monospace);font-size:.66rem;color:var(--dim,#7b8a98);padding:.3rem .1rem}'+
+      /* modal */
+      '.leOv{position:fixed;inset:0;z-index:10000;background:rgba(4,7,10,.66);backdrop-filter:blur(3px);display:flex;align-items:flex-start;justify-content:center;padding:5vh 1rem;overflow:auto}'+
+      '.leCard{width:min(460px,100%);background:var(--panel,#11171e);border:1px solid var(--line,#1d2730);border-radius:14px;box-shadow:0 24px 64px #000a;overflow:hidden}'+
+      '.leTitle{display:flex;align-items:center;font-weight:700;font-size:.92rem;padding:.7rem .85rem;border-bottom:1px solid var(--line,#1d2730)}'+
+      '.leClose{margin-left:auto;cursor:pointer;font-size:1.1rem;color:var(--dim,#7b8a98);line-height:1}.leClose:hover{color:#fff}'+
+      '.leBody{padding:.7rem .85rem;display:flex;flex-direction:column;gap:.4rem;max-height:64vh;overflow:auto}'+
+      '.leHint{font-size:.72rem;color:var(--dim,#7b8a98);line-height:1.45;margin-bottom:.2rem}'+
+      '.leFormSub{font-family:var(--mono,monospace);font-size:.58rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim,#7b8a98);margin:.45rem 0 .05rem;border-top:1px solid #ffffff10;padding-top:.4rem}'+
+      '.leRow{display:flex;align-items:center;gap:.7rem;min-height:30px}'+
+      '.leRow label{flex:1;font-size:.78rem}'+
+      '.leRow input{font-family:var(--mono,monospace);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line,#1d2730);border-radius:7px;padding:.32rem .45rem}'+
+      '.leRow input:not(.leN):not([type=checkbox]){width:160px}'+
+      '.leRow input.leN{width:90px;text-align:right}'+
+      '.leRow input[type=checkbox]{width:auto}'+
+      '.leXYZ{display:flex;gap:.3rem}.leXYZ input{width:58px;text-align:right}'+
+      '.leErr{color:#ff7676;font-size:.72rem;padding:0 .85rem;min-height:0}'+
+      '.leErr:not([style*="none"]){padding:.2rem .85rem .1rem}'+
+      '.leFoot{display:flex;justify-content:flex-end;gap:.5rem;padding:.65rem .85rem;border-top:1px solid var(--line,#1d2730)}'+
+      '.leBtn{font-family:var(--sans,sans-serif);font-size:.78rem;border-radius:8px;padding:.4rem .8rem;cursor:pointer;border:1px solid var(--line,#1d2730);background:#0b0f14;color:var(--dim,#cdd9e2)}'+
+      '.leSaveBtn{font-weight:700;color:var(--acc,#3ddc97);border-color:var(--acc-dim,#1f7a55)}.leSaveBtn:hover{background:#3ddc9718}.leBtn:disabled{opacity:.6;cursor:default}';
+    document.head.appendChild(s);
+  }
+
   /* ---------------- render hook ---------------- */
   function afterRender(){
     filterNav();
@@ -504,6 +774,8 @@
     wireActions();
     lockConfig();
     buildLiveConfig();
+    buildListEditor();
+    wireAddRows();
     if(MAP[cur] && MAP[cur].signature==='liveMap') bindMap();
     refreshHeaderStatus();
   }
@@ -521,6 +793,7 @@
     // label the Live Map with the real bot + drop the mockup's fake pins
     if(typeof ABMMap!=='undefined' && ABMMap.bot){ ABMMap.bot.name = INST || ABMMap.bot.name; ABMMap.pins=[]; }
     injectLiveConfigCss();
+    injectListEditorCss();
     // learn our capability (shared-access guests) before first render so gating applies immediately
     fetchPrincipal().then(function(){
       injectTopbar();

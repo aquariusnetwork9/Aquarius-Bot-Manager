@@ -2,7 +2,20 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.8.0 — *latest*
+## v3.10.0 — *latest*
+
+- **The control surface's "add an entry" buttons actually work now.** Three lists in Mission Control were drawn but never wired — clicking **＋ New trade** (Villager Trading), **＋ New trip** (Elytra Autopilot), or **＋ Add pearl** (Pearl Stasis) did nothing. They now open a real form and write straight to the bot's live config:
+  - **Villager trades** — a guided builder (profession → give → receive, validated against the real Java-Edition trade catalog so you can't configure an offer the bot would wait on forever) plus the supply/output **chest coordinates**, restock thresholds, and per-trade limits. Librarian book trades map the chosen enchantment to the correct registry id automatically. The running trader is told its list changed so a new trade takes effect mid-run.
+  - **Saved Elytra trips** — name + destination (overworld or nether); the nether leg is projected automatically for a direct open-nether flight.
+  - **Pearl-stasis locations** — name + the interact-block coordinates.
+  - Each list now shows the bot's **real, live entries** (not the old mock preview) with a per-row **🗑 delete**. Everything is gated by the existing per-module **config** permission and works in all three themes.
+- **Requires AquariusProxy 5.9.0+** (the bot exposes new add/remove operations on its `/control/config` API). Older bots still show the lists read-only.
+
+## v3.9.0
+
+- **Elytra pitstop & goal-stop controls** surfaced in the Elytra Autopilot card (logout / set-spawn at an intermediate geofence or at the destination).
+
+## v3.8.0
 
 - **ZenithProxy bots get the full live dashboard, via a plugin.** AquariusProxy bots already get the live map, POV viewer, inventory/vitals, module toggles, command runner, and live config editing built in. Now ZenithProxy bots can get the *same* surface by dropping in the new **[`zenith-abm-bridge`](https://github.com/aquariusnetwork9/zenith-abm-bridge)** plugin — no fork switch required. Install the jar, run `abmBridge on` (and `abmBridge control on` to allow command/config writes), and the bot's Live Map / control surface light up in ABM exactly like an AquariusProxy bot. The bridge is **loopback-bound, disabled by default, and write-gated**; ABM relays it over its own authenticated tunnel.
 - **Auto-detect the bridge port.** ABM now resolves a bot's viewer port from the bridge's `plugins/config/abm-bridge.json` too (AquariusProxy uses `server.viewer.port`); both default to `2998`, so a freshly-installed bridge is found with zero config. The viewer's "offline" hint now tells you how to enable it for *either* fork.
