@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.12.0 — *latest*
+## v3.13.0 — *latest*
+
+- **Fix: the ⛶ Fullscreen map errored for every bot.** The fullscreen button opened `control-v4-spatial-map.html`, which was only ever a design mockup — it was never shipped into the control assets (so it 404'd) and the button used a relative URL with no bot id. There's now a **real, live fullscreen map**: it reads `?inst=<bot>`, renders that bot's actual bot-centred map tile with a live entity overlay + vitals from the 20 Hz feed, supports zoom, and **click-to-set-an-Elytra-destination** (▶ Send to Elytra) — all per-bot through the same relay. The ⛶ buttons now open it for the correct bot, and it shows a clear "viewer offline" hint if the bot isn't in-game.
+
+## v3.12.0
 
 - **New: `abm viewer <name> on` — one-command setup to make a bot viewable/controllable.** Enabling a bot's Live Map + control surface used to mean hand-editing its `config.json` and picking a port that didn't clash with other bots on the box. Now `abm viewer <bot> on` does it: it **auto-assigns the next free viewer port** (so co-located bots never collide), enables `server.viewer.enabled` + `control`, binds loopback, and restarts the bot. `abm viewer <bot> off` disables it; `--no-control` makes it view-only; `--no-restart` writes config without restarting. (The bot is stopped before its config is edited so it can't overwrite the change on shutdown.)
 

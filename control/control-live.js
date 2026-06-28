@@ -85,6 +85,17 @@
   function fnum(v,d){ v=parseFloat(v); return isFinite(v)?v:(d||0); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
 
+  /* open the live fullscreen map for THIS bot (the mockup hard-coded a relative URL with no ?inst) */
+  function openFullscreenMap(){
+    var u=new URL('/control/control-v4-spatial-map.html', location.origin);
+    if(INST) u.searchParams.set('inst', INST);
+    if(STYLE && STYLE!=='v1') u.searchParams.set('style', STYLE);
+    if(MOCK) u.searchParams.set('mock', MOCK);
+    if(DIRECT) u.searchParams.set('direct','1');
+    window.open(u.toString(), '_blank');
+  }
+  window.abmOpenFullscreenMap=openFullscreenMap;
+
   var toastWrap;
   function toast(msg, kind, ms){
     if(!toastWrap){ toastWrap=document.createElement('div'); toastWrap.id='liveToast'; document.body.appendChild(toastWrap); }
@@ -213,6 +224,7 @@
       if(btn.dataset.lw) return; btn.dataset.lw='1';
       var label=(btn.textContent||'').trim();
       btn.addEventListener('click', function(){
+        if(/fullscreen/i.test(label)){ openFullscreenMap(); return; }
         if(SAVE_RE.test(label)){ toast('saved locally — live config save arrives in v3.1','ok',3000); return; }
         if(cur==='elytra' && /fly/i.test(label)){ elytraFly(); return; }
         if(STOP_RE.test(label)) setEnabled(cur, false);
@@ -270,6 +282,10 @@
     }, 2000);
     // make click-to-destination actually send to Elytra (parameterized command = console grant)
     if(consoleOk()) cv.onclick = function(ev){ onMapClick(ev, cv, span); };
+    // the mockup's "⛶ Fullscreen" button hard-codes a relative URL with no ?inst — point it at the live page
+    [].forEach.call(document.querySelectorAll('.amBtn'), function(b){
+      if(/fullscreen/i.test(b.textContent||'')){ b.onclick=function(e){ if(e&&e.preventDefault)e.preventDefault(); openFullscreenMap(); }; }
+    });
   }
   function refreshMapOverlay(){
     var cv=$('.amCanvas'); if(!cv) return;

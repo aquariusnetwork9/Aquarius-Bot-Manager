@@ -1,0 +1,179 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABM · Live Map</title>
+<style>
+:root{ --bg:#070a0f; --txt:#e3ebf3; --dim:#7e90a3; --line:#ffffff1f; --acc:#3ddc97; --acc2:#5cc8ff;
+  --amber:#ffb454; --crash:#ff5d5d; --glass:rgba(13,19,28,.78);
+  --mono:ui-monospace,'Space Mono',monospace; --sans:'Sora',system-ui,sans-serif; }
+*{box-sizing:border-box}
+body{margin:0;height:100vh;overflow:hidden;color:var(--txt);font-family:var(--sans);background:var(--bg)}
+button,a.btn{font-family:var(--sans);cursor:pointer;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--txt);
+  padding:.4rem .7rem;border-radius:9px;font-weight:600;font-size:.78rem;transition:.14s;backdrop-filter:blur(6px);text-decoration:none;white-space:nowrap}
+button:hover,a.btn:hover{border-color:var(--acc)}
+button.go{border-color:#1f7a55;color:var(--acc);background:#3ddc9714}
+.stage{position:relative;height:100vh;width:100vw}
+.map{position:absolute;inset:0;background:#070a0f;background-size:cover;background-position:center;image-rendering:pixelated;overflow:hidden}
+.grid{position:absolute;inset:0;pointer-events:none;background:
+  repeating-linear-gradient(0deg,#13202e22 0 1px,transparent 1px 48px),
+  repeating-linear-gradient(90deg,#13202e22 0 1px,transparent 1px 48px)}
+.vig{position:absolute;inset:0;box-shadow:inset 0 0 240px #000a;pointer-events:none}
+.bot{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:4;pointer-events:none}
+.bot .core{width:13px;height:13px;border-radius:50%;background:var(--acc);box-shadow:0 0 16px var(--acc)}
+.bot .ring{position:absolute;inset:-9px;border:1.5px solid #3ddc9766;border-radius:50%;animation:rg 2.4s ease-out infinite}
+@keyframes rg{0%{transform:scale(.6);opacity:.9}100%{transform:scale(1.8);opacity:0}}
+.bot .nm{position:absolute;left:18px;top:-6px;font-family:var(--mono);font-size:.62rem;color:var(--acc);white-space:nowrap;text-shadow:0 1px 3px #000}
+.ent{position:absolute;border-radius:50%;transform:translate(-50%,-50%);border:1px solid #0b1018;z-index:3;pointer-events:none}
+.ent.player{width:10px;height:10px;background:var(--acc2);box-shadow:0 0 8px var(--acc2)}
+.ent.mobH{width:9px;height:9px;background:var(--crash);box-shadow:0 0 7px var(--crash)}
+.ent.mobP{width:8px;height:8px;background:#9fe089}
+.ent.item{width:6px;height:6px;background:var(--amber)}
+.dest{position:absolute;width:16px;height:16px;border:2px solid var(--acc);border-radius:50%;transform:translate(-50%,-50%);z-index:5;box-shadow:0 0 10px var(--acc);display:none}
+.dest::after{content:"";position:absolute;inset:5px;border-radius:50%;background:var(--acc)}
+.topbar{position:absolute;left:14px;top:14px;right:14px;z-index:10;display:flex;align-items:center;gap:.55rem;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:.5rem;font-weight:800;font-size:.86rem;background:var(--glass);border:1px solid var(--line);border-radius:12px;padding:.4rem .7rem;backdrop-filter:blur(12px)}
+.brand .dot{width:9px;height:9px;border-radius:50%;background:var(--crash);box-shadow:0 0 10px var(--crash)}
+.brand .dot.on{background:var(--acc);box-shadow:0 0 10px var(--acc)}
+.vchip{display:inline-flex;align-items:center;gap:.6rem;font-family:var(--mono);font-size:.68rem;color:var(--dim);background:var(--glass);
+  border:1px solid var(--line);border-radius:11px;padding:.4rem .65rem;backdrop-filter:blur(12px)}
+.vchip .hp{color:var(--crash)} .vchip .fd{color:var(--amber)} .vchip .ps{color:var(--acc2)}
+.zoom{display:inline-flex;gap:.3rem;margin-left:auto}
+.coordlbl{position:absolute;left:14px;bottom:12px;z-index:6;font-family:var(--mono);font-size:.66rem;color:var(--dim);background:var(--glass);
+  border:1px solid var(--line);border-radius:9px;padding:.4rem .65rem;backdrop-filter:blur(10px)}
+.readout{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:8;max-width:min(680px,calc(100vw - 28px));
+  font-family:var(--mono);font-size:.7rem;color:var(--txt);background:var(--glass);border:1px solid var(--line);border-radius:11px;
+  padding:.5rem .8rem;backdrop-filter:blur(12px);display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;justify-content:center}
+.readout b{color:var(--acc)} .readout .mono{font-family:var(--mono);color:var(--acc2)}
+.readout button{padding:.28rem .55rem;font-size:.72rem}
+.offline{position:absolute;inset:0;z-index:9;display:none;align-items:center;justify-content:center;text-align:center;
+  color:var(--dim);font-family:var(--mono);font-size:.8rem;line-height:1.7;padding:1.4rem;background:#070a0fcc}
+.offline code{color:var(--amber)}
+@media(max-width:640px){ .vchip{display:none} }
+</style></head>
+<body><div class="stage">
+  <div class="map" id="map">
+    <div class="grid"></div>
+    <div class="vig"></div>
+    <div id="ents"></div>
+    <div class="bot" id="bot"><div class="ring"></div><div class="core"></div><div class="nm" id="botnm">—</div></div>
+    <div class="dest" id="dest"></div>
+    <div class="coordlbl" id="coordlbl">connecting…</div>
+  </div>
+  <div class="topbar">
+    <a class="brand btn" id="backlink" href="#" title="Back to control surface"><span class="dot" id="conn"></span><span id="brandname">ABM</span></a>
+    <span class="vchip" id="vitals">—</span>
+    <span class="zoom"><button id="zoomout" title="Zoom out">−</button><button id="zoomin" title="Zoom in">+</button></span>
+  </div>
+  <div class="readout" id="readout">Click the map to set an Elytra destination.</div>
+  <div class="offline" id="offline">Live map unavailable.<br>The bot must be <b>in-game</b> with its viewer enabled.<br>AquariusProxy: <code>abm viewer &lt;bot&gt; on</code>.</div>
+</div>
+<script>
+(function(){
+  'use strict';
+  var Q=new URLSearchParams(location.search);
+  var INST=Q.get('inst')||'';
+  var MOCK=Q.get('mock');
+  var DIRECT=Q.get('direct')==='1'||Q.get('direct')==='true';
+  var STYLE=Q.get('style')||'';
+  var BASE = MOCK ? MOCK.replace(/\/+$/,'') : DIRECT ? '' : ('/api/instances/'+encodeURIComponent(INST));
+  function api(p){ return BASE+p; }
+  var SIZES=[128,256,512], zi=2;                      // map span (blocks); bot caps at 512
+  function span(){ return SIZES[zi]; }
+  var state=null, mapOk=false;
+
+  document.title='ABM · Live Map · '+(INST||'bot');
+  document.getElementById('brandname').textContent=INST||'bot';
+  var back=document.getElementById('backlink');
+  var bu=new URL('/control', location.origin);
+  if(INST) bu.searchParams.set('inst', INST);
+  if(STYLE) bu.searchParams.set('style', STYLE);
+  if(MOCK) bu.searchParams.set('mock', MOCK);
+  if(DIRECT) bu.searchParams.set('direct','1');
+  back.href=bu.toString();
+
+  function fnum(v,d){ v=parseFloat(v); return isFinite(v)?v:(d||0); }
+  function prettyDim(d){ d=(d||'').toLowerCase(); return d.indexOf('nether')>=0?'Nether':d.indexOf('end')>=0?'The End':'Overworld'; }
+  function hostile(t){ return /ZOMBIE|SKELET|CREEPER|WITHER|BLAZE|PIGLIN|HOGLIN|GHAST|ENDERMAN|SPIDER|SLIME|MAGMA|VEX|VINDICATOR|PILLAGER|RAVAGER|WARDEN|PHANTOM|DROWNED|HUSK|STRAY|GUARDIAN|SHULKER|WITCH/i.test(t||''); }
+  function entClass(t){ t=(t||'').toUpperCase(); if(t.indexOf('PLAYER')>=0)return'player'; if(t.indexOf('ITEM')>=0)return'item'; return hostile(t)?'mobH':'mobP'; }
+
+  /* ---- map background (bot-centred tile, refreshed) ---- */
+  var mapEl=document.getElementById('map');
+  function refreshMap(){
+    var img=new Image();
+    img.onload=function(){ mapEl.style.backgroundImage="url('"+img.src+"')"; mapOk=true; document.getElementById('offline').style.display='none'; };
+    img.onerror=function(){ mapOk=false; if(!state){ document.getElementById('offline').style.display='flex'; } };
+    img.src=api('/viewer/map.png?size='+span())+'&t='+Date.now();
+  }
+
+  /* ---- SSE telemetry ---- */
+  var es=null;
+  function startStream(){
+    try{ es=new EventSource(api('/viewer/stream')); }catch(e){ return; }
+    es.onmessage=function(ev){ try{ onState(JSON.parse(ev.data)); }catch(e){} };
+    es.onerror=function(){ setConn(false); };
+  }
+  function setConn(on){ document.getElementById('conn').classList.toggle('on', !!on); }
+  function onState(s){
+    state=s; setConn(true);
+    document.getElementById('offline').style.display='none';
+    document.getElementById('botnm').textContent=(INST||'bot')+' · '+Math.round(s.x)+', '+Math.round(s.y)+', '+Math.round(s.z);
+    document.getElementById('coordlbl').textContent=prettyDim(s.dimension)+' · ● live · '+(s.entities&&s.entities.length||0)+' nearby';
+    updateVitals(s);
+    drawEntities(s);
+  }
+  function updateVitals(s){
+    document.getElementById('vitals').innerHTML=
+      '<span class="hp">♥ '+Math.round(s.health||0)+'</span>'+
+      '<span class="fd">🍗 '+Math.round(s.food||0)+'</span>'+
+      '<span class="ps">⌖ '+Math.round(s.x)+', '+Math.round(s.y)+', '+Math.round(s.z)+'</span>'+
+      '<span>'+prettyDim(s.dimension)+'</span>';
+  }
+  function drawEntities(s){
+    var box=document.getElementById('ents'); box.innerHTML='';
+    if(!s.entities) return;
+    var sp=span(), frag=document.createDocumentFragment();
+    s.entities.forEach(function(e){
+      var px=50+((e.x-s.x)/sp)*100, py=50+((e.z-s.z)/sp)*100;
+      if(px<-2||px>102||py<-2||py>102) return;
+      var d=document.createElement('div'); d.className='ent '+entClass(e.type);
+      d.style.left=px+'%'; d.style.top=py+'%'; d.title=e.type||''; frag.appendChild(d);
+    });
+    box.appendChild(frag);
+  }
+
+  /* ---- click → Elytra destination ---- */
+  mapEl.addEventListener('click', function(ev){
+    if(!state){ return; }
+    var r=mapEl.getBoundingClientRect();
+    var fx=(ev.clientX-r.left)/r.width, fy=(ev.clientY-r.top)/r.height;
+    var sp=span();
+    var wx=Math.round(state.x+(fx-.5)*sp), wz=Math.round(state.z+(fy-.5)*sp);
+    var d=document.getElementById('dest'); d.style.display='block'; d.style.left=(fx*100)+'%'; d.style.top=(fy*100)+'%';
+    var dim=(state.dimension||'').toLowerCase();
+    var dd=dim.indexOf('nether')>=0?'nether':dim.indexOf('end')>=0?'end':'overworld';
+    var ro=document.getElementById('readout');
+    ro.innerHTML='<b>Destination</b> <span class="mono">'+wx+', ~'+Math.round(state.y)+', '+wz+'</span> '+
+      '<button class="go" id="send">▶ Send to Elytra</button><button id="clr">clear</button>';
+    document.getElementById('send').onclick=function(){
+      runCommand('fly trip '+dd+' '+wx+' '+wz).then(function(){
+        ro.innerHTML='✅ Sent to Elytra Autopilot — flying to '+wx+', '+wz+' ('+dd+').';
+      }).catch(function(e){ ro.innerHTML='⚠ '+(e.message||'failed to send'); });
+    };
+    document.getElementById('clr').onclick=function(){ d.style.display='none'; ro.textContent='Click the map to set an Elytra destination.'; };
+  });
+  function runCommand(cmd){
+    return fetch(api('/control/command'), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd})})
+      .then(function(r){ if(r.status===403) throw new Error('control disabled on this bot'); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
+  }
+
+  /* ---- zoom ---- */
+  document.getElementById('zoomin').onclick=function(){ if(zi>0){ zi--; refreshMap(); if(state) drawEntities(state); } };
+  document.getElementById('zoomout').onclick=function(){ if(zi<SIZES.length-1){ zi++; refreshMap(); if(state) drawEntities(state); } };
+
+  /* ---- boot ---- */
+  if(!INST && !MOCK && !DIRECT){ document.getElementById('coordlbl').textContent='no bot selected (missing ?inst=)'; }
+  refreshMap(); setInterval(refreshMap, 2000);
+  startStream();
+  // if nothing arrives shortly, surface the offline hint
+  setTimeout(function(){ if(!state && !mapOk) document.getElementById('offline').style.display='flex'; }, 4000);
+})();
+</script>
+</body></html>

@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.12.0"
+__version__ = "3.13.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5563,7 +5563,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- live control surface (Mission Control) ----
     CONTROL_STYLES = {"v1": "index.html", "v2": "v2.html", "v3": "v3.html"}
     CONTROL_ASSETS = {"abm-control-data.js", "control-live.js",
-                      "index.html", "v2.html", "v3.html"}
+                      "index.html", "v2.html", "v3.html",
+                      "control-v4-spatial-map.html"}
 
     def _control_dir(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "control")
