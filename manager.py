@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.11.0"
+__version__ = "3.11.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5632,8 +5632,8 @@ class Handler(BaseHTTPRequestHandler):
         """Relay a bot's loopback /control/* endpoints. GET state|commands; POST command (forwards the JSON body).
         Same per-bot port resolution + cross-box behaviour as the viewer relay. The bot 403s `command` unless its
         `server.viewer.control` flag is on — that status is forwarded through."""
-        parts = path.split("/")  # ['', 'api', 'instances', '<name>', 'control', 'state'|'commands'|'command'|'config']
-        if len(parts) < 6 or parts[4] != "control" or parts[5] not in ("state", "commands", "command", "config"):
+        parts = path.split("/")  # ['', 'api', 'instances', '<name>', 'control', 'state'|'commands'|'command'|'config'|'lookingat']
+        if len(parts) < 6 or parts[4] != "control" or parts[5] not in ("state", "commands", "command", "config", "lookingat"):
             return self._json({"error": "not found"}, 404)
         sub = parts[5]
         name = urllib.parse.unquote(parts[3])

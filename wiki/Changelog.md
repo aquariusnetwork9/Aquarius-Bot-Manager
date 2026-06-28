@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.11.0 — *latest*
+## v3.11.1 — *latest*
+
+- **Fix: the 📍 "use look target" button did nothing.** ABM's control relay forwards a fixed allow-list of bot endpoints, and the new `/control/lookingat` wasn't on it — so the request 404'd at the relay before ever reaching the bot. Added it; the button now works (bot must be in-game).
+
+## v3.11.0
 
 - **Edit entries, not just add/delete.** Every trade / saved trip / pearl now has an **✎ edit** button that opens the same form pre-filled with its current values; saving overwrites it in place (the villager builder reverse-maps a stored trade — profession, items, output, book enchant — back into the validated picker). *(Needs AquariusProxy 5.9.1+ for editing **pearl** locations in place.)*
 - **📍 "use the block the bot is looking at" for every coordinate.** Next to each x/y/z field (chest positions, pearl interact-block, trip destination) there's a 📍 button — aim the bot at the block and click it to fill the coordinates from the bot's crosshair instead of typing them. Backed by the bot's new `GET /control/lookingat` (a 96-block raycast). If the bot isn't in-game or nothing's in its crosshair, it tells you.
