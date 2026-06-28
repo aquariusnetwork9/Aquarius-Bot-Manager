@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.11.1 — *latest*
+## v3.11.2 — *latest*
+
+- **Fix: a bot without its own viewer showed *another* bot's live map / control feeds.** The viewer port resolver defaulted every bot to `2998`, so any bot whose viewer wasn't enabled (or that shared the default port) got routed to whichever bot actually owns `2998` — its Live Map, vitals, and control surface silently showed the *wrong* bot. Now a bot whose viewer is disabled resolves to **no port** and correctly reads **"Viewer offline"** instead. To actually view/control a second bot on the same box, enable its viewer on a **unique** `server.viewer.port` (two bots can't share one) — the "Viewer offline" panel spells out the steps.
+
+## v3.11.1
 
 - **Fix: the 📍 "use look target" button did nothing.** ABM's control relay forwards a fixed allow-list of bot endpoints, and the new `/control/lookingat` wasn't on it — so the request 404'd at the relay before ever reaching the bot. Added it; the button now works (bot must be in-game).
 

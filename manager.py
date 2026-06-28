@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.11.1"
+__version__ = "3.11.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -297,11 +297,13 @@ _VIEWER_PORT_CACHE = {}
 
 
 def viewer_port_for(inst):
-    """Which loopback port a bot's diagnostic viewer feed listens on (server.viewer.port).
-    Resolution order: an explicit `viewer_port` in instances.json (our own config) wins;
-    otherwise auto-discover it from the bot's own config.json (`server.viewer.port`), so
-    several viewer-enabled bots on one box each get their right port with zero manual setup;
-    otherwise fall back to the 2998 default. Only the integer port is read — never tokens —
+    """Which loopback port a bot's diagnostic viewer feed listens on, or **None** if the bot
+    has no viewer feed enabled. Resolution order: an explicit `viewer_port` in instances.json
+    (our own config) wins; otherwise auto-discover it from the bot's own config.json
+    (`server.viewer.port`, only when `server.viewer.enabled`) or the zenith-abm-bridge config,
+    so several viewer-enabled bots on one box each get their own port. A bot whose viewer is
+    OFF returns None — callers then show "offline" for it instead of silently falling back to
+    whichever bot happens to own the 2998 default. Only the integer port is read — never tokens —
     and the parse is mtime-cached so the hot polling path doesn't re-read the file."""
     explicit = inst.get("viewer_port")
     if explicit:
@@ -326,29 +328,32 @@ def viewer_port_for(inst):
     except OSError:
         br_m = None
     if cfg_m is None and br_m is None:
-        return 2998
+        return None
     cached = _VIEWER_PORT_CACHE.get(path)
     if cached and cached[0] == (cfg_m, br_m):
         return cached[1]
-    port = 2998
-    if cfg_m is not None:                       # AquariusProxy native: server.viewer.port
+    port = None
+    if cfg_m is not None:                       # AquariusProxy native: server.viewer.{enabled,port}
         try:
             with open(path) as f:
                 data = json.load(f)
             sv = (data.get("server") or {}).get("viewer")
-            if isinstance(sv, dict):
+            # only resolve a port when the viewer is actually ON — otherwise return None so the relay
+            # shows "offline" for this bot instead of silently falling back to whoever owns 2998.
+            if isinstance(sv, dict) and sv.get("enabled"):
                 p = int(sv.get("port", 2998))
                 if 1024 <= p <= 65535:
                     port = p
         except (OSError, ValueError, TypeError, AttributeError):
             pass
-    if port == 2998 and br_m is not None:       # ZenithProxy bridge plugin: abm-bridge.json -> port
+    if port is None and br_m is not None:       # ZenithProxy bridge plugin: abm-bridge.json -> {enabled,port}
         try:
             with open(bridge) as f:
                 bdata = json.load(f)
-            p = int(bdata.get("port", 2998))
-            if 1024 <= p <= 65535:
-                port = p
+            if bdata.get("enabled", True):
+                p = int(bdata.get("port", 2998))
+                if 1024 <= p <= 65535:
+                    port = p
         except (OSError, ValueError, TypeError, AttributeError):
             pass
     _VIEWER_PORT_CACHE[path] = ((cfg_m, br_m), port)
@@ -5563,6 +5568,8 @@ class Handler(BaseHTTPRequestHandler):
                     port = p
             except (ValueError, TypeError, IndexError):
                 pass
+        if not port:                               # viewer not enabled on this bot — don't fall back to 2998
+            return self._json({"offline": True})
         upstream = {"state": "state.json", "map": "map.png", "chunks": "chunks", "inventory": "inventory"}[sub]
         url = f"http://127.0.0.1:{port}/viewer/{upstream}"
         if sub == "map":
@@ -5646,6 +5653,8 @@ class Handler(BaseHTTPRequestHandler):
                     port = p
             except (ValueError, TypeError, IndexError):
                 pass
+        if not port:                               # viewer not enabled on this bot — don't fall back to 2998
+            return self._json({"offline": True})
         url = f"http://127.0.0.1:{port}/control/{sub}"
         # command is always a POST; config mirrors the incoming method (GET read / POST field write)
         is_post = sub == "command" or (sub == "config" and self.command == "POST")
@@ -5712,6 +5721,11 @@ class Handler(BaseHTTPRequestHandler):
                         port = p
                 except (ValueError, TypeError, IndexError):
                     pass
+            if not port:                           # viewer not enabled — EventSource sees 503 and stops retrying hard
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             url = f"http://127.0.0.1:{port}/viewer/stream"
         try:
             up = urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=10)
