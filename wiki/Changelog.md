@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.11.2 — *latest*
+## v3.12.0 — *latest*
+
+- **New: `abm viewer <name> on` — one-command setup to make a bot viewable/controllable.** Enabling a bot's Live Map + control surface used to mean hand-editing its `config.json` and picking a port that didn't clash with other bots on the box. Now `abm viewer <bot> on` does it: it **auto-assigns the next free viewer port** (so co-located bots never collide), enables `server.viewer.enabled` + `control`, binds loopback, and restarts the bot. `abm viewer <bot> off` disables it; `--no-control` makes it view-only; `--no-restart` writes config without restarting. (The bot is stopped before its config is edited so it can't overwrite the change on shutdown.)
+
+## v3.11.2
 
 - **Fix: a bot without its own viewer showed *another* bot's live map / control feeds.** The viewer port resolver defaulted every bot to `2998`, so any bot whose viewer wasn't enabled (or that shared the default port) got routed to whichever bot actually owns `2998` — its Live Map, vitals, and control surface silently showed the *wrong* bot. Now a bot whose viewer is disabled resolves to **no port** and correctly reads **"Viewer offline"** instead. To actually view/control a second bot on the same box, enable its viewer on a **unique** `server.viewer.port` (two bots can't share one) — the "Viewer offline" panel spells out the steps.
 

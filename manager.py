@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.11.2"
+__version__ = "3.12.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -357,6 +357,73 @@ def viewer_port_for(inst):
         except (OSError, ValueError, TypeError, AttributeError):
             pass
     _VIEWER_PORT_CACHE[path] = ((cfg_m, br_m), port)
+    return port
+
+
+def _assigned_viewer_ports(cfg, exclude=None):
+    """Every viewer port already spoken for across instances (each bot's config.json server.viewer.port
+    plus any instances.json viewer_port override), so we never hand two bots the same one."""
+    used = set()
+    for inst in cfg.get("instances", []):
+        if exclude and inst.get("name") == exclude:
+            continue
+        vp = inst.get("viewer_port")
+        if vp:
+            try:
+                used.add(int(vp))
+            except (ValueError, TypeError):
+                pass
+        path = os.path.join(inst.get("dir") or "", inst.get("config_file") or "config.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            sv = (data.get("server") or {}).get("viewer")
+            if isinstance(sv, dict) and sv.get("port"):
+                used.add(int(sv["port"]))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return used
+
+
+def _next_free_viewer_port(cfg, exclude=None, base=2998):
+    """Lowest port >= base not already assigned to another bot's viewer (so co-located bots don't collide)."""
+    used = _assigned_viewer_ports(cfg, exclude)
+    p = base
+    while p in used:
+        p += 1
+    return p
+
+
+def set_viewer(inst, cfg, on=True, control=True):
+    """Enable/disable a bot's diagnostic viewer in its config.json. On enable, keeps the bot's current port
+    if it's already unique, else assigns the next free one (co-located bots can't share a port). Backs up the
+    config once. Returns the chosen port (or None when disabling). The bot must be (re)started to apply it —
+    callers stop the bot first so it can't overwrite the file on shutdown."""
+    path = os.path.join(inst.get("dir") or "", inst.get("config_file") or "config.json")
+    if not os.path.isfile(path):
+        raise ValueError(f"no config.json for {inst.get('name')}")
+    with open(path) as f:
+        data = json.load(f)
+    sv = data.setdefault("server", {}).setdefault("viewer", {})
+    port = None
+    if on:
+        cur = sv.get("port")
+        used = _assigned_viewer_ports(cfg, exclude=inst.get("name"))
+        port = cur if (isinstance(cur, int) and 1024 <= cur <= 65535 and cur not in used) \
+            else _next_free_viewer_port(cfg, exclude=inst.get("name"))
+        sv["enabled"] = True
+        sv["control"] = bool(control)
+        sv["port"] = port
+        sv["bindHost"] = "127.0.0.1"
+    else:
+        sv["enabled"] = False
+    bak = path + ".bak-viewer"
+    if not os.path.exists(bak):
+        shutil.copy2(path, bak)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
     return port
 
 
@@ -7187,6 +7254,14 @@ def main():
     p.add_argument("--enable", dest="p_enable", action="store_true")
     p.add_argument("--disable", dest="p_disable", action="store_true")
 
+    p = sub.add_parser("viewer", help="enable/disable a bot's live-map + control viewer on a unique port")
+    p.add_argument("name")
+    p.add_argument("state", nargs="?", choices=["on", "off"], default="on")
+    p.add_argument("--no-control", dest="no_control", action="store_true",
+                   help="view-only — enable the feed but not command/config control")
+    p.add_argument("--no-restart", dest="no_restart", action="store_true",
+                   help="write config only; don't restart (applies on next start)")
+
     p = sub.add_parser("proxybulk", help="assign proxies across many instances (round-robin / same / random)")
     p.add_argument("--targets", default="all",
                    help="comma-separated instance names, 'all' (default), or 'errored' (only bots with proxy errors)")
@@ -7373,6 +7448,29 @@ def main():
                 print(f"{args.name}: set to {r['host']}:{r['port']}")
             except ValueError as e:
                 die(str(e))
+    elif args.cmd == "viewer":
+        inst = cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}")
+        on = args.state != "off"
+        # stop first so the bot can't overwrite config.json on shutdown, then edit, then start
+        if not args.no_restart:
+            stop(inst)
+            time.sleep(0.5)
+        try:
+            port = set_viewer(inst, cfg, on=on, control=not args.no_control)
+        except ValueError as e:
+            if not args.no_restart:
+                start(inst)
+            die(str(e))
+        if on:
+            print(f"{args.name}: viewer enabled on port {port} "
+                  + ("(+control)" if not args.no_control else "(view-only)"))
+        else:
+            print(f"{args.name}: viewer disabled")
+        if not args.no_restart:
+            start(inst)
+            print(f"{args.name}: restarted")
+        else:
+            print(f"(config written; run `abm restart {args.name}` to apply)")
     elif args.cmd == "proxybulk":
         tnames = [t for t in re.split(r"[,\s]+", args.targets) if t]
         if "all" in tnames:
