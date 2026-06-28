@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.10.0 — *latest*
+## v3.11.0 — *latest*
+
+- **Edit entries, not just add/delete.** Every trade / saved trip / pearl now has an **✎ edit** button that opens the same form pre-filled with its current values; saving overwrites it in place (the villager builder reverse-maps a stored trade — profession, items, output, book enchant — back into the validated picker). *(Needs AquariusProxy 5.9.1+ for editing **pearl** locations in place.)*
+- **📍 "use the block the bot is looking at" for every coordinate.** Next to each x/y/z field (chest positions, pearl interact-block, trip destination) there's a 📍 button — aim the bot at the block and click it to fill the coordinates from the bot's crosshair instead of typing them. Backed by the bot's new `GET /control/lookingat` (a 96-block raycast). If the bot isn't in-game or nothing's in its crosshair, it tells you.
+
+## v3.10.0
 
 - **The control surface's "add an entry" buttons actually work now.** Three lists in Mission Control were drawn but never wired — clicking **＋ New trade** (Villager Trading), **＋ New trip** (Elytra Autopilot), or **＋ Add pearl** (Pearl Stasis) did nothing. They now open a real form and write straight to the bot's live config:
   - **Villager trades** — a guided builder (profession → give → receive, validated against the real Java-Edition trade catalog so you can't configure an offer the bot would wait on forever) plus the supply/output **chest coordinates**, restock thresholds, and per-trade limits. Librarian book trades map the chosen enchantment to the correct registry id automatically. The running trader is told its list changed so a new trade takes effect mid-run.

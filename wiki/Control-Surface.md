@@ -58,7 +58,7 @@ time from the top-bar dropdown; the Live Map is built into all of them.
 | **Live Map** | ✅ live | Real bot-centred map tile + SSE entity overlay; **click the map to set an Elytra destination**. |
 | **Command palette / runner** | ✅ live | Runs any console command and shows the structured result. |
 | **Live configuration (per module)** | ✅ live *(v3.1)* | A **⚙ Live configuration** panel on each module reads the bot's real config and writes single fields back instantly (`GET`/`POST /control/config`); secrets are redacted and never writable. The friendly mockup subcards remain as a read-only overview. |
-| **List editors — trades · trips · pearls** | ✅ live *(v3.10, needs AquariusProxy 5.9.0+)* | **Villager trades**, **saved Elytra trips**, and **pearl-stasis locations** can be **added, edited and deleted** from the surface. Each shows the bot's real entries with a per-row 🗑; **＋ New …** opens a guided form (the trade builder validates against the real villager catalog and includes chest coordinates) that writes straight to the bot's config. Gated by the per-module **config** permission. |
+| **List editors — trades · trips · pearls** | ✅ live *(v3.10–3.11, needs AquariusProxy 5.9.0+ / 5.9.1+ for pearl edit)* | **Villager trades**, **saved Elytra trips**, and **pearl-stasis locations** can be **added (＋), edited (✎) and deleted (🗑)** from the surface. Each shows the bot's real entries; the form validates trades against the real villager catalog and captures chest coordinates. Every coordinate field has a **📍** button that fills x/y/z from the block the bot is looking at (`/control/lookingat`). Writes straight to the bot's config; gated by the per-module **config** permission. |
 | **Pearl pins on the map** | 🧩 planned | A later release; needs new bot-side data exposure. |
 
 > The settings subcards show **sensible defaults**, not the bot's live config yet. Don't
@@ -245,7 +245,8 @@ authenticated relay**:
 
 - `GET /control/state` → module list + enabled flags (the rail status dots + header chips).
 - `POST /control/command` → runs a console command, returns its structured output.
-- `GET /control/config` → the live config tree (**secrets redacted**); `POST /control/config` sets/edits config and persists. `{path,value}` (or `{op:"set",…}`) sets one scalar field by dot-path — powers the **⚙ Live configuration** panel. `{op:"put",path,key,value}` / `{op:"add",path,value}` / `{op:"remove",path,key|index}` add or remove whole entries in a config **map** or **list** (deserialized into the real config type) — powers the **trades / trips / pearls** list editors (AquariusProxy 5.9.0+).
+- `GET /control/config` → the live config tree (**secrets redacted**); `POST /control/config` sets/edits config and persists. `{path,value}` (or `{op:"set",…}`) sets one scalar field by dot-path — powers the **⚙ Live configuration** panel. `{op:"put",path,key|index,value}` / `{op:"add",path,value}` / `{op:"remove",path,key|index}` add, edit (overwrite by key, or list set-by-index) or remove whole entries in a config **map** or **list** (deserialized into the real config type) — powers the **trades / trips / pearls** list editors (AquariusProxy 5.9.0+, list-edit 5.9.1+).
+- `GET /control/lookingat` → `{hit,x,y,z,block}` — the block the bot's crosshair is on (96-block raycast); powers the 📍 fill-from-look-target button (AquariusProxy 5.9.1+).
 - `GET /viewer/stream` (SSE, ~20 Hz) → position, vitals, dimension, nearby entities.
 - `GET /viewer/map.png` → the bot-centred map tile (Live Map backdrop).
 - `GET /viewer/inventory` → vitals + armor + inventory (used by the cockpit panels).

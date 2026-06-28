@@ -522,6 +522,21 @@
     return { id:id, level:level };
   }
   function enchMap(disp){ var e=parseEnch(disp), o={}; o[e.id]=e.level; return o; }
+  /* reverse maps for EDIT prefill: stored Trade (bare ids/enum) -> ABMTrade builder state */
+  function tradeGetName(prof,give1,give2,outputItem){
+    if(typeof TRADE_CATALOG==='undefined'||typeof ABMTrade==='undefined') return null;
+    var oid='minecraft:'+outputItem;
+    for(var i=0;i<TRADE_CATALOG.length;i++){ var e=TRADE_CATALOG[i]; var g2=e.g[1]?e.g[1][0]:'__none';
+      if(e.p===prof && e.g[0][0]===give1 && g2===give2 && e.o[0]===oid) return ABMTrade.outName(e); }
+    return null;
+  }
+  function enchDisplay(emap){
+    if(!emap||typeof BOOK_ENCHANTS==='undefined') return 'Mending';
+    var keys=Object.keys(emap); if(!keys.length) return 'Mending';
+    var id=keys[0], lvl=emap[id];
+    for(var i=0;i<BOOK_ENCHANTS.length;i++){ var p=parseEnch(BOOK_ENCHANTS[i]); if(p.id===id && p.level===lvl) return BOOK_ENCHANTS[i]; }
+    return 'Mending';
+  }
 
   /* container readers — a config Map serializes to a JSON object, a List to an array */
   function mapRows(c){ if(!c||typeof c!=='object'||Array.isArray(c)) return []; return Object.keys(c).map(function(k){ return [k, c[k]]; }); }
@@ -539,13 +554,13 @@
   }
 
   /* form-field HTML helpers */
-  function leTextRow(label,name,ph,def){ return '<div class="leRow"><label>'+esc(label)+'</label><input data-le="'+name+'" placeholder="'+esc(ph||'')+'" value="'+esc(def||'')+'"></div>'; }
+  function leTextRow(label,name,ph,def,ro){ return '<div class="leRow"><label>'+esc(label)+'</label><input data-le="'+name+'" placeholder="'+esc(ph||'')+'" value="'+esc(def||'')+'"'+(ro?' readonly':'')+'></div>'; }
   function leNumRow(label,name,def){ return '<div class="leRow"><label>'+esc(label)+'</label><input data-le="'+name+'" class="leN" inputmode="numeric" value="'+esc(def)+'"></div>'; }
   function leToggleRow(label,name,on){ return '<div class="leRow"><label>'+esc(label)+'</label><input type="checkbox" data-le="'+name+'"'+(on?' checked':'')+'></div>'; }
-  function leCoordRow(label,prefix){ return '<div class="leRow"><label>'+esc(label)+'</label><span class="leXYZ">'+
-      '<input data-le="'+prefix+'x" placeholder="x" inputmode="numeric">'+
-      '<input data-le="'+prefix+'y" placeholder="y" inputmode="numeric">'+
-      '<input data-le="'+prefix+'z" placeholder="z" inputmode="numeric"></span></div>'; }
+  function leCoordRow(label,prefix,val){ val=val||{};
+    function inp(ax){ var v=(val[ax]!=null&&val[ax]!=='')?(' value="'+esc(val[ax])+'"'):''; return '<input data-le="'+prefix+ax+'" placeholder="'+ax+'" inputmode="numeric"'+v+'>'; }
+    return '<div class="leRow"><label>'+esc(label)+'</label><span class="leXYZ">'+inp('x')+inp('y')+inp('z')+
+      '<button type="button" class="leLook" data-le-look="'+prefix+'" title="Use the block the bot is looking at">📍</button></span></div>'; }
   function leSub(t){ return '<div class="leFormSub">'+esc(t)+'</div>'; }
   function leHint(t){ return '<div class="leHint">'+esc(t)+'</div>'; }
 
@@ -554,32 +569,41 @@
       ELYTRA_PATH='client.extra.elytraPilot.tripRoutes',
       PEARL_PATH ='client.extra.pearlLoader.pearls';
 
-  function tradeFormHtml(){
-    // reset the shared builder to a known-valid default each open
-    try{ ABMTrade.load({prof:'Librarian',give1:'minecraft:emerald',give2:'minecraft:book',get:'Enchanted Book',ench:'Mending'}); }catch(e){}
-    return leHint('Pick a real villager offer, name it, then point it at the chests at your trade hall.')+
+  function tradeFormHtml(val,key,mode){
+    var ro = mode==='edit';
+    if(val){   // EDIT: reverse-map the stored Trade back into the builder
+      var prof=capWords(val.villagerProfession);
+      var give1='minecraft:'+val.inputItem1;
+      var give2=(val.inputItem2 && val.inputItem2!=='air')?('minecraft:'+val.inputItem2):'__none';
+      var get=tradeGetName(prof,give1,give2,val.outputItem);
+      try{ ABMTrade.load({prof:prof,give1:give1,give2:give2,get:get||'',ench:enchDisplay(val.outputItemEnchantments)}); }catch(e){}
+    } else {   // ADD: reset the shared builder to a known-valid default
+      try{ ABMTrade.load({prof:'Librarian',give1:'minecraft:emerald',give2:'minecraft:book',get:'Enchanted Book',ench:'Mending'}); }catch(e){}
+    }
+    var v=val||{};
+    return leHint(ro?'Adjust the offer or chests, then Save.':'Pick a real villager offer, name it, then point it at the chests at your trade hall.')+
       ABMTrade.box()+
-      leTextRow('Trade name','leKey','e.g. mending-books')+
-      leSub('Chests  ·  x y z')+
-      leCoordRow('Give-1 supply chest','c1')+
-      leCoordRow('Give-2 supply chest (if second input)','c2')+
-      leCoordRow('Output chest','co')+
+      leTextRow('Trade name','leKey','e.g. mending-books', key||'', ro)+
+      leSub('Chests  ·  x y z  —  📍 uses the block the bot is looking at')+
+      leCoordRow('Give-1 supply chest','c1', v.inputItem1Chest)+
+      leCoordRow('Give-2 supply chest (if second input)','c2', v.inputItem2Chest)+
+      leCoordRow('Output chest','co', v.outputChest)+
       leSub('Restock & limits')+
-      leNumRow('Restock stacks (give-1)','rs1',4)+
-      leNumRow('Restock when below (give-1)','rt1',64)+
-      leNumRow('Restock stacks (give-2)','rs2',4)+
-      leNumRow('Restock when below (give-2)','rt2',64)+
-      leNumRow('Store output when above','st',64)+
-      leNumRow('Max give-1 per trade','mx1',99)+
-      leNumRow('Max give-2 per trade','mx2',99);
+      leNumRow('Restock stacks (give-1)','rs1', v.inputItem1RestockStacks!=null?v.inputItem1RestockStacks:4)+
+      leNumRow('Restock when below (give-1)','rt1', v.inputItem1RestockCountThreshold!=null?v.inputItem1RestockCountThreshold:64)+
+      leNumRow('Restock stacks (give-2)','rs2', v.inputItem2RestockStacks!=null?v.inputItem2RestockStacks:4)+
+      leNumRow('Restock when below (give-2)','rt2', v.inputItem2RestockCountThreshold!=null?v.inputItem2RestockCountThreshold:64)+
+      leNumRow('Store output when above','st', v.outputItemStoreCountThreshold!=null?v.outputItemStoreCountThreshold:64)+
+      leNumRow('Max give-1 per trade','mx1', v.maxInput1PerTrade!=null?v.maxInput1PerTrade:99)+
+      leNumRow('Max give-2 per trade','mx2', v.maxInput2PerTrade!=null?v.maxInput2PerTrade:99);
   }
-  function tradeCollect(ov){
+  function tradeCollect(ov,ctx){
     var m=(typeof ABMTrade!=='undefined')?ABMTrade.match():null;
     if(!m) throw new Error('Choose a valid villager trade first (the builder must show a green ✓).');
     var s=ABMTrade.state;
-    var key=leVal(ov,'leKey').trim();
+    var key = ctx.mode==='edit' ? ctx.key : leVal(ov,'leKey').trim();
     if(!key) throw new Error('Give the trade a name.');
-    if(existingKeys(TRADER_PATH).indexOf(key)>=0) throw new Error('A trade named “'+key+'” already exists.');
+    if(ctx.mode==='add' && existingKeys(TRADER_PATH).indexOf(key)>=0) throw new Error('A trade named “'+key+'” already exists.');
     var has2 = s.give2 && s.give2!=='__none';
     var c1=leCoord(ov,'c1','the give-1 supply chest');
     var co=leCoord(ov,'co','the output chest');
@@ -605,16 +629,16 @@
     return leMutate('put', TRADER_PATH, { key:key, value:value });
   }
 
-  function tripFormHtml(){
+  function tripFormHtml(val,key,mode){ var ro=mode==='edit', v=val||{};
     return leHint('A direct trip: the bot flies open-nether to the destination. Overworld targets are projected to the nether automatically.')+
-      leTextRow('Trip name','leKey','e.g. spawn-to-base')+
-      leToggleRow('Destination is in the Nether','leNether',false)+
-      leCoordRow('Destination','cd');
+      leTextRow('Trip name','leKey','e.g. spawn-to-base', key||'', ro)+
+      leToggleRow('Destination is in the Nether','leNether', !!v.endInNether)+
+      leCoordRow('Destination','cd', (val?{x:v.destX,y:v.destY,z:v.destZ}:undefined));
   }
-  function tripCollect(ov){
-    var key=leVal(ov,'leKey').trim();
+  function tripCollect(ov,ctx){
+    var key = ctx.mode==='edit' ? ctx.key : leVal(ov,'leKey').trim();
     if(!key) throw new Error('Give the trip a name.');
-    if(existingKeys(ELYTRA_PATH).indexOf(key)>=0) throw new Error('A trip named “'+key+'” already exists.');
+    if(ctx.mode==='add' && existingKeys(ELYTRA_PATH).indexOf(key)>=0) throw new Error('A trip named “'+key+'” already exists.');
     var endNether=leChecked(ov,'leNether');
     var d=leCoord(ov,'cd','the destination');
     var legX = endNether ? d.x : Math.round(d.x/8);
@@ -624,28 +648,30 @@
     return leMutate('put', ELYTRA_PATH, { key:key, value:value });
   }
 
-  function pearlFormHtml(){
-    return leHint('The block the bot interacts with to release the stasis pearl.')+
-      leTextRow('Pearl name','leKey','e.g. base')+
-      leCoordRow('Interact block','cp');
+  function pearlFormHtml(val,key,mode){ var v=val||{};
+    return leHint('The block the bot interacts with to release the stasis pearl. Tip: aim the bot at it and hit 📍.')+
+      leTextRow('Pearl name','leKey','e.g. base', v.id||'', false)+
+      leCoordRow('Interact block','cp', (val?{x:v.x,y:v.y,z:v.z}:undefined));
   }
-  function pearlCollect(ov){
+  function pearlCollect(ov,ctx){
     var id=leVal(ov,'leKey').trim();
     if(!id) throw new Error('Give the pearl a name.');
     var c=leCoord(ov,'cp','the interact block');
-    return leMutate('add', PEARL_PATH, { value:{ id:id, x:c.x, y:c.y, z:c.z } });
+    var value={ id:id, x:c.x, y:c.y, z:c.z };
+    if(ctx.mode==='edit') return leMutate('put', PEARL_PATH, { index:ctx.index, value:value });
+    return leMutate('add', PEARL_PATH, { value:value });
   }
 
   var LIST_EDITORS = {
-    trader: { title:'Trades', addLabel:'New trade', kind:'map', path:TRADER_PATH,
+    trader: { title:'Trades', addLabel:'New trade', noun:'trade', kind:'map', path:TRADER_PATH,
       rowText:function(k,t){ var has2=t.inputItem2&&t.inputItem2!=='air';
         return { title:k, sub:capWords(t.villagerProfession)+' · '+pretty(mcStrip(t.inputItem1))+(has2?' + '+pretty(mcStrip(t.inputItem2)):'')+' → '+pretty(mcStrip(t.outputItem)) }; },
       form:tradeFormHtml, collect:tradeCollect },
-    elytra: { title:'Saved trips', addLabel:'New trip', kind:'map', path:ELYTRA_PATH,
+    elytra: { title:'Saved trips', addLabel:'New trip', noun:'trip', kind:'map', path:ELYTRA_PATH,
       rowText:function(k,r){ var n=(r.legs&&r.legs.length)||0;
         return { title:k, sub:(r.endInNether?'Nether':'Overworld')+' → '+r.destX+', '+r.destY+', '+r.destZ+' · '+n+' leg'+(n===1?'':'s') }; },
       form:tripFormHtml, collect:tripCollect },
-    pearl: { title:'Pearl locations', addLabel:'Add pearl', kind:'list', path:PEARL_PATH,
+    pearl: { title:'Pearl locations', addLabel:'Add pearl', noun:'pearl', kind:'list', path:PEARL_PATH,
       rowText:function(i,p){ return { title:(p.id||('#'+i)), sub:p.x+', '+p.y+', '+p.z }; },
       form:pearlFormHtml, collect:pearlCollect }
   };
@@ -665,19 +691,43 @@
 
   function closeLeModal(){ var m=document.getElementById('leModal'); if(m) m.remove(); }
   function leShowErr(ov,msg){ var e=ov.querySelector('.leErr'); if(e){ e.style.display='block'; e.textContent=msg; } }
-  function openAdd(spec){
+  /* wire every 📍 button in a form to fetch the block the bot is looking at and fill that coord row */
+  function wireLookButtons(ov){
+    [].forEach.call(ov.querySelectorAll('.leLook'), function(b){
+      b.onclick=function(){
+        var pre=this.dataset.leLook, self=this; self.disabled=true; self.textContent='…';
+        fetch(api('/control/lookingat'), {cache:'no-store'})
+          .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+          .then(function(d){
+            self.disabled=false; self.textContent='📍';
+            if(d && d.hit){
+              var X=$le(ov,pre+'x'), Y=$le(ov,pre+'y'), Z=$le(ov,pre+'z');
+              if(X) X.value=d.x; if(Y) Y.value=d.y; if(Z) Z.value=d.z;
+              toast('filled from the '+(d.block||'block')+' the bot is looking at','ok');
+            } else if(d && d.offline){ toast('the bot isn’t in-game right now','err',3200); }
+            else { toast('nothing in the bot’s crosshair — aim it at the block first','err',3600); }
+          })
+          .catch(function(e){ self.disabled=false; self.textContent='📍'; toast('look-up failed: '+e.message,'err',3600); });
+      };
+    });
+  }
+
+  function openForm(spec, mode, rowKey, val){
     closeLeModal();
+    var ctx={ mode:mode, key: spec.kind==='map' ? rowKey : null, index: spec.kind==='list' ? rowKey : null };
+    var title = mode==='edit' ? ('Edit '+esc(spec.noun)) : ('＋ '+esc(spec.addLabel));
     var ov=document.createElement('div'); ov.id='leModal'; ov.className='leOv';
-    ov.innerHTML='<div class="leCard"><div class="leTitle">＋ '+esc(spec.addLabel)+'<span class="leClose">×</span></div>'+
-      '<div class="leBody">'+spec.form()+'</div>'+
+    ov.innerHTML='<div class="leCard"><div class="leTitle">'+title+'<span class="leClose">×</span></div>'+
+      '<div class="leBody">'+spec.form(val, rowKey, mode)+'</div>'+
       '<div class="leErr" style="display:none"></div>'+
       '<div class="leFoot"><button class="leBtn leCancel">Cancel</button><button class="leBtn leSaveBtn">Save</button></div></div>';
     document.body.appendChild(ov);
     ov.querySelector('.leClose').onclick=closeLeModal;
     ov.querySelector('.leCancel').onclick=closeLeModal;
     ov.addEventListener('click', function(e){ if(e.target===ov) closeLeModal(); });
+    wireLookButtons(ov);
     ov.querySelector('.leSaveBtn').onclick=function(){
-      var p; try{ p=spec.collect(ov); }catch(err){ leShowErr(ov, err.message); return; }
+      var p; try{ p=spec.collect(ov, ctx); }catch(err){ leShowErr(ov, err.message); return; }
       var btn=this; btn.disabled=true; btn.textContent='Saving…';
       Promise.resolve(p).then(function(){ closeLeModal(); })
         .catch(function(err){ btn.disabled=false; btn.textContent='Save'; leShowErr(ov, (err&&err.message)||'failed'); });
@@ -694,8 +744,9 @@
     var canEdit = moduleConfig(cur);
     var rows = entries.map(function(e){
       var rt=spec.rowText(e[0], e[1]);
-      var del = canEdit ? '<button class="leDel" title="Delete" data-k="'+esc(String(e[0]))+'" data-lbl="'+esc(String(rt.title))+'">🗑</button>' : '';
-      return '<div class="leItem"><div class="leItemMain"><div class="leItemT">'+esc(rt.title)+'</div><div class="leItemS">'+esc(rt.sub)+'</div></div>'+del+'</div>';
+      var acts = canEdit ? '<button class="leEdit" title="Edit" data-k="'+esc(String(e[0]))+'">✎</button>'+
+                           '<button class="leDel" title="Delete" data-k="'+esc(String(e[0]))+'" data-lbl="'+esc(String(rt.title))+'">🗑</button>' : '';
+      return '<div class="leItem"><div class="leItemMain"><div class="leItemT">'+esc(rt.title)+'</div><div class="leItemS">'+esc(rt.sub)+'</div></div>'+acts+'</div>';
     }).join('');
     var panel=document.createElement('div'); panel.id='leEditor'; panel.className='lePanel';
     panel.innerHTML='<div class="leHead">'+esc(spec.title)+' <span class="leCount">'+entries.length+'</span>'+
@@ -703,7 +754,16 @@
       '<div class="leList">'+(rows||'<div class="leEmpty">None yet — add one below.</div>')+'</div>';
     cont.insertBefore(panel, cont.firstChild);
     if(!canEdit) return;
-    var addBtn=panel.querySelector('.leAdd'); if(addBtn) addBtn.onclick=function(){ openAdd(spec); };
+    var addBtn=panel.querySelector('.leAdd'); if(addBtn) addBtn.onclick=function(){ openForm(spec,'add',null,null); };
+    [].forEach.call(panel.querySelectorAll('.leEdit'), function(b){
+      b.onclick=function(){
+        var k=this.dataset.k, c=getPath(LIVE.config, spec.path), rowKey, val;
+        if(spec.kind==='map'){ rowKey=k; val=c?c[k]:null; }
+        else { rowKey=parseInt(k,10); val=Array.isArray(c)?c[rowKey]:null; }
+        if(val==null){ toast('entry not found — refresh','err'); return; }
+        openForm(spec,'edit', rowKey, val);
+      };
+    });
     [].forEach.call(panel.querySelectorAll('.leDel'), function(b){
       b.onclick=function(){
         var k=this.dataset.k, lbl=this.dataset.lbl;
@@ -721,7 +781,7 @@
       if(el.dataset.lw) return; el.dataset.lw='1';
       el.style.cursor='pointer'; el.style.pointerEvents='auto';
       el.addEventListener('click', function(){
-        if(moduleConfig(cur)) openAdd(spec);
+        if(moduleConfig(cur)) openForm(spec,'add',null,null);
         else toast('read-only — your access doesn’t include editing this module','err',3200);
       });
     });
@@ -741,8 +801,11 @@
       '.leItemMain{flex:1;min-width:0}'+
       '.leItemT{font-size:.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
       '.leItemS{font-family:var(--mono,monospace);font-size:.64rem;color:var(--dim,#7b8a98);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
-      '.leDel{flex:none;background:none;border:1px solid transparent;border-radius:7px;cursor:pointer;font-size:.85rem;padding:.2rem .35rem;opacity:.6}'+
+      '.leEdit,.leDel{flex:none;background:none;border:1px solid transparent;border-radius:7px;cursor:pointer;font-size:.85rem;padding:.2rem .35rem;opacity:.6}'+
+      '.leEdit:hover{opacity:1;border-color:var(--acc-dim,#1f7a55);background:#3ddc9712}'+
       '.leDel:hover{opacity:1;border-color:#5a1f1f;background:#ff545412}'+
+      '.leLook{flex:none;background:#0b0f14;border:1px solid var(--line,#1d2730);border-radius:7px;cursor:pointer;font-size:.8rem;padding:.2rem .34rem;line-height:1}'+
+      '.leLook:hover{border-color:var(--acc,#3ddc97)}.leLook:disabled{opacity:.5;cursor:default}'+
       '.leEmpty{font-family:var(--mono,monospace);font-size:.66rem;color:var(--dim,#7b8a98);padding:.3rem .1rem}'+
       /* modal */
       '.leOv{position:fixed;inset:0;z-index:10000;background:rgba(4,7,10,.66);backdrop-filter:blur(3px);display:flex;align-items:flex-start;justify-content:center;padding:5vh 1rem;overflow:auto}'+
