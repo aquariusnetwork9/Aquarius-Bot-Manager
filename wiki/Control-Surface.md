@@ -56,28 +56,71 @@ time from the top-bar dropdown; the Live Map is built into all of them.
 | **Action buttons** (▶ run / ■ stop) | ✅ live | Best-effort per module; Elytra's **Fly there** sends `fly trip <dim> <x> <z>`. |
 | **Vitals** (health, food, position, dimension, speed) | ✅ live | From the ~20 Hz SSE viewer feed. |
 | **Live Map** | ✅ live | Real bot-centred map tile + SSE entity overlay; **click the map to set an Elytra destination**. |
+| **Fullscreen satellite map** | ✅ live *(v3.19)* | Leaflet slippy-map with a 2b2t.place **satellite** base, **grid / highways / obsidian / live-render** toggles, **bot-follow**, and Xaero-scale zoom-out. See [below](#the-fullscreen-satellite-map). |
 | **Command palette / runner** | ✅ live | Runs any console command and shows the structured result. |
 | **Live configuration (per module)** | ✅ live *(v3.1)* | A **⚙ Live configuration** panel on each module reads the bot's real config and writes single fields back instantly (`GET`/`POST /control/config`); secrets are redacted and never writable. The friendly mockup subcards remain as a read-only overview. |
 | **List editors — trades · trips · pearls** | ✅ live *(v3.10–3.11, needs AquariusProxy 5.9.0+ / 5.9.1+ for pearl edit)* | **Villager trades**, **saved Elytra trips**, and **pearl-stasis locations** can be **added (＋), edited (✎) and deleted (🗑)** from the surface. Each shows the bot's real entries; the form validates trades against the real villager catalog and captures chest coordinates. Every coordinate field has a **📍** button that fills x/y/z from the block the bot is looking at (`/control/lookingat`). Writes straight to the bot's config; gated by the per-module **config** permission. |
+| **Villager trade groups** | ✅ live *(v3.15)* | Group trades to **share one input-supply profile** + **self-refill/park** behaviour; a Groups manager + a group selector on the trade form. |
+| **Kit Maker live builder** | ✅ live *(v3.18)* | Build shulker-kit templates on a visual **slot grid** with per-slot enchant matching, save them to a **kit library**, and see a green **"kits buildable"** estimate from stock. |
 | **Pearl pins on the map** | 🧩 planned | A later release; needs new bot-side data exposure. |
 
-> The settings subcards show **sensible defaults**, not the bot's live config yet. Don't
-> treat the values there as the bot's current configuration until v3.1 wires them to the
-> real config. Everything marked ✅ above reflects the **real, live bot**.
+> Each module's **⚙ Live configuration** panel reflects the **real, live bot** config (since
+> v3.1). The friendly mockup subcards above it are a read-only overview — edit values in the
+> ⚙ panel (or the list editors), which write straight to the running bot.
 
 ---
 
 ## The Live Map
 
-- **Bot-centred** real map tile that refreshes continuously, with the bot at the centre.
+The map card on the surface is **bot-centred** and refreshes continuously:
+
+- A real **bot-centred map tile**, the bot pinned at the centre.
 - **Entity overlay** from the live feed — players (blue), hostiles (red), passives (green),
   items (amber).
 - **Click anywhere → set an Elytra destination.** A crosshair drops, the world coordinates
   are computed from the bot's position, and **▶ Send to Elytra** dispatches
   `fly trip <dimension> <x> <z>`.
-- **⛶ Fullscreen** expands the map; **◎ Recenter** re-centres on the bot.
+- **⛶ Fullscreen** opens the full satellite map (below); **◎ Recenter** re-centres on the bot.
 
-> The click-to-coordinate math uses an approximate map span. For pinpoint long-haul
+---
+
+## The fullscreen satellite map
+
+> Added in **ABM v3.19.0**. Open it with the **⛶ Fullscreen** button on the map card, or
+> go straight to `/control/control-v4-spatial-map.html?inst=<bot>`.
+
+The fullscreen map is a full [Leaflet](https://leafletjs.com) slippy-map with a live
+**"satellite" base layer** rendered from the [2b2t.place](https://2b2t.place) tile snapshot
+of the greater-spawn region. Pan it like any web map and **zoom out to Xaero World-Map
+scale** (the whole ±500k spawn area) or in to ~1 block per pixel.
+
+![Fullscreen satellite map — spawn region with highway overlay](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/control-fullscreen-map.png)
+
+A **Layers** panel (top-right) toggles each overlay independently:
+
+| Layer | What it shows |
+|---|---|
+| **Satellite** | The 2b2t.place rendered-terrain base (the greater-spawn snapshot). |
+| **Obsidian** | An obsidian-only overlay from the same snapshot (roads, builds). |
+| **New chunks** | Newly-generated chunks from the snapshot. |
+| **Live render** | The bot's **own** freshly-rendered chunks near it (real-time, vs the historical snapshot). |
+| **Grid** | A world-aligned grid (adaptive spacing) with the x=0 / z=0 axes emphasised. |
+| **Highways** | Xaero-style vector lines for the **8 nether highways** — the X/Z axes and the x=±z diagonals from spawn. |
+
+- **Follows the bot** by default (the **Follow bot** toggle); dragging the map unlocks
+  follow, and **⌖ Recenter** re-locks on the bot.
+- Keeps the **live entity overlay** and **click-to-set-an-Elytra-destination** from the
+  small map, and switches **dimension with the bot** (Overworld / Nether / End tiles).
+
+> **The ~24 TB 2b2t.place snapshot is never stored on your VPS.** Tiles are fetched on
+> demand the first time they scroll into view and kept in a **hard-capped LRU disk cache**
+> (default 64 MB via `ABM_TILECACHE_MB`; set `0` for pure pass-through). So a panned-over
+> area is instant, the cache can't grow unbounded, void areas are negative-cached, and the
+> "satellite" simply ends past the snapshotted region (the bot/entity/grid/highway layers
+> still work everywhere). `?tilesrc=direct` bypasses the VPS proxy and pulls tiles straight
+> to the browser.
+
+> The click-to-coordinate math uses the map projection directly. For pinpoint long-haul
 > targets, confirm the X/Z in the Elytra module's **Destination** card.
 
 ---
@@ -158,12 +201,12 @@ toggle — run their command instead.
 |---|---|---|
 | **Live Map** · `LiveViewer` | The live world map this page is built around. | Read-only viewer; needs `viewer.enabled`. Entity/positions are from the SSE feed; map span is approximate. |
 | **Elytra Autopilot** · `ElytraPilot` | Trip planner & long-haul flight (cruise / highway / e-bounce). | ⚠ A **worn elytra silently breaks e-bounce** — carry spare elytras, don't fly in one you also want to bounce with. Pre-flight audit expects **≥ 2 elytras, ≥ 2 totems, fireworks**. E-bounce is tuned Grim-accepted (~30–38 b/s) but anarchy anti-cheat is a moving target. Native nether routing needs the correct world seed. "Last elytra" safety can log you out. |
-| **Villager Trading** · `VillagerTrader` | Stationary auto trade hall (emerald economy). | Add/edit/delete trades right on the surface (**v3.10**, AquariusProxy 5.9.0+) — the **＋ New trade** builder validates against the real villager catalog and captures the supply/output **chest coordinates**. |
+| **Villager Trading** · `VillagerTrader` | Stationary auto trade hall (emerald economy). | Add/edit/delete trades right on the surface (**v3.10**, AquariusProxy 5.9.0+) — the **＋ New trade** builder validates against the real villager catalog and captures the supply/output **chest coordinates**. **Trade groups** (**v3.15**) share one input-supply profile across trades with self-refill/park. ⚠ Stock emerald supply chests with loose emeralds **or emerald blocks** (both are counted; AquariusProxy 5.12.1+). |
 | **Pearl Stasis** · `PearlManager` | Ender-pearl stasis loader. | Add/edit/delete stasis locations on the surface (**v3.10**, AquariusProxy 5.9.0+) via **＋ Add pearl**. ⚠ Map pin-to-add is still planned (Phase C); coordinates are typed today. |
 | **Stash Manager** · `StashScanner` | Indexes & sorts an owned stash. | Operates on **your own** stash; point it at the right chests/region. |
 | **Auto Miner** · `AquariusMiner` | Top-down quarry & ore search with auto-deposit. | ⚠ Uses the **ender chest as the field buffer — never carry filled shulkers in the mining inventory** (it'll mis-deposit). On laggy anarchy, drops can fly up to ~2 blocks, so it settles/chases/confirms each break. Pauses for Auto Eat. Set bounds + deposit chests. |
 | **Auto Enchanter** · `Enchanter` | Anvil auto-enchant station. | Needs the **anvil/input/output/book** station laid out and coordinates set. |
-| **Kit Builder** · `KitMaker` | Fills template shulker kits. | Define the slot template + item sources. |
+| **Kit Builder** · `KitMaker` | Fills template shulker kits. | Build templates on a visual **slot grid** with per-slot enchant matching and save them to a **kit library** (**v3.18**) — no physical example kit needed; the surface shows a green **"kits buildable"** estimate from stock. |
 | **Packet Sniffer** · `AquariusSniffer` | Live packet inspector (debug). | ⚠ Debug tool — **high log/throughput volume**; leave off in normal operation. |
 | **Highway Builder** · `HighwayBuilder` | Auto nether-highway paver: clears the tunnel + lays an obsidian road. | ⚠ **Destructive** — it clears blocks along the path. Off by default. Needs obsidian + restock; intended for nether highways. |
 | **Schematic Builder** · `Litematica` | Builds `.litematic` / `.nbt` schematics via Baritone. | Needs a real schematic file staged on the bot; build pacing depends on materials + Baritone. |

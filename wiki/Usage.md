@@ -16,6 +16,28 @@ Open the web UI (see **[[Installation]]**). Top bar buttons:
 - **+ New instance** — register an existing directory.
 - **▶ Start all / ⟳ Restart all** — bulk lifecycle.
 
+### Layout & navigation
+Prefer a sidebar to the top bar? **Settings → Appearance → Sidebar** offers four layouts — **Off** (the classic header above), an **icon rail**, a **full** sidebar (labeled nav + pinned live CPU/MEM/DISK vitals), or a **command center** (search box + live crash alert + a live bot roster) — each **left- or right-oriented**.
+
+![Full sidebar with the Fleet page](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/sidebar-full.png)
+
+With a sidebar on, the nav adds three dedicated pages:
+- **Fleet** — every box (this one + connected nodes) with health gauges, bot counts and a bots table.
+- **Activity & alerts** — a live snapshot of crashes, resource-threshold breaches and proxy-console issues.
+- **Telemetry** — per-bot detail: live status / CPU / memory tiles, a CPU chart, and an embedded console tail.
+
+![Fleet page](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/page-fleet.png)
+
+### Command palette (⌘K)
+Press **⌘K** (Ctrl-K) anywhere to open a search palette over your bots and pages. It searches bots **on this box and on every connected box** — pick a local bot to open its telemetry/console, a remote bot to switch to that box, or a page to jump there.
+
+![Command palette](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/command-palette.png)
+
+### Automation
+The **Automation** page runs jobs on the controller every ~30 s. Add a **time schedule** — cron (`0 4 * * *`), `every:2h`, or `daily:04:00` — or an **on-crash watchdog** that auto-restarts a crashed bot up to *N* times (with a cooldown). Each job targets one bot or **all**, on **this box, a specific connected box, or all boxes**, with actions restart / start / stop / send-a-command (e.g. `fly resupplyspares`). Toggle jobs on/off, **Run now**, and optionally ping a **Discord webhook** when a job runs or fails or the watchdog fires. Jobs are stored in `settings.schedules` and are included in config backup/restore.
+
+![Automation page](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/automation.png)
+
 ![Deploy a proxy modal](https://raw.githubusercontent.com/wiki/aquariusnetwork9/Aquarius-Bot-Manager/deploy.png)
 *🚀 Deploy stands up a brand-new AquariusProxy / ZenithProxy / custom-fork bot — name it, set memory/CPU caps, and the launcher self-bootstraps Java and the jar.*
 

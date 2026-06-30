@@ -2,7 +2,28 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.13.0 — *latest*
+## v3.19.0 — *latest*
+
+- **Fullscreen world map, rebuilt as a live satellite map.** The ⛶ Fullscreen map is now a full Leaflet slippy-map with a **"satellite" base layer** rendered from the [2b2t.place](https://2b2t.place) tile snapshot of the greater-spawn region — pan and **zoom out to Xaero World-Map scale** (the whole ±500k spawn area) or in to ~1 block/pixel. A **Layers** panel toggles **Satellite** terrain, an **Obsidian** overlay, **New chunks**, the bot's own **Live render**, a world-aligned **Grid**, and **Highways** (Xaero-style vector lines for the 8 nether roads — axes + diagonals from origin). The map **follows the bot** (unlocks on drag; ⌖ Recenter re-locks), keeps the live entity overlay + click-to-set-an-Elytra-destination, and switches dimension with the bot (Overworld / Nether / End).
+  - **The ~24 TB snapshot is never stored on your VPS.** Tiles are fetched on demand the first time they scroll into view and kept in a **hard-capped LRU disk cache** (default 64 MB via `ABM_TILECACHE_MB`; `0` = pure pass-through) — so a panned-over area is instant, the cache can't grow unbounded, and void tiles are negative-cached. The tile proxy (`/api/map/tile/…`) is SSRF-guarded and served by whichever box your browser is on; `?tilesrc=direct` bypasses the VPS and pulls tiles straight to the browser.
+
+## v3.18.0
+
+- **Kit Maker — a live kit builder + reusable kit library.** Build shulker-kit templates right in the Control Surface: a visual slot grid, an item picker from the real item catalog, independent **per-slot enchant matching** (e.g. silk-touch vs fortune pickaxe), and a green **"kits buildable" estimate** from your current stock. Templates save to a **kit library** and get assigned to the bot's Kit Maker module — no more building a physical example kit by hand.
+- **Proxies: random-unique assignment** — bulk-assign every bot a **distinct** random proxy (no collisions) in one click.
+- *v3.18.1–3.18.2* — fixes to the villager trade-builder modal (builder singletons exposed on `window`; the modal no longer sticks on a librarian).
+
+## v3.15.0 – v3.15.1
+
+- **Villager trade groups — shared supply, self-refill & park.** Group several trades so they **share one input-supply profile** (give-chests, restock thresholds, carry caps, overflow) while each keeps its own output chest. An emerald-**earner** member (sells items for emeralds) funds the group: when a group runs low the spender detours to the earner, and when every trade is exhausted the bot **parks in place** instead of wandering, then auto-resumes once the chests are refilled. The Control Surface gains a **Groups manager** (repurposing the old left panel) and a group selector on the trade form. **v3.15.1** adds bulk-adding existing trades to a group via a member checklist. Also fixes the trade builder so buildable outputs like **bookshelves / glass / clocks** (not just enchanted books) are selectable.
+
+## v3.14.0 – v3.14.2
+
+- **Stand up AquariusProxy bots cleanly — viewer & control plane on by default.** The deploy/migrate path now **places and pins the bot's jar from `api.github.com`**, so a fresh AquariusProxy bot never dies with "jar not found" (the `github.2b2t.vc` mirror only serves rfresh2 repos). New bots come up with the **live viewer + control plane enabled by default** (`--no-viewer` opts out), plus a **one-click viewer toggle** on each bot card.
+- **v3.14.1** — the viewer-enable button is now reliable and reports success/failure honestly instead of silently no-op'ing.
+- **v3.14.2** — **fix garbled POV at far-out bases:** the first-person POV renderer uses a **floating origin**, so the WebGL view no longer falls apart at the large coordinates typical of a real base.
+
+## v3.13.0
 
 - **Fix: the ⛶ Fullscreen map errored for every bot.** The fullscreen button opened `control-v4-spatial-map.html`, which was only ever a design mockup — it was never shipped into the control assets (so it 404'd) and the button used a relative URL with no bot id. There's now a **real, live fullscreen map**: it reads `?inst=<bot>`, renders that bot's actual bot-centred map tile with a live entity overlay + vitals from the 20 Hz feed, supports zoom, and **click-to-set-an-Elytra-destination** (▶ Send to Elytra) — all per-bot through the same relay. The ⛶ buttons now open it for the correct bot, and it shows a clear "viewer offline" hint if the bot isn't in-game.
 

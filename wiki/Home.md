@@ -20,7 +20,7 @@ As of **v1.4.0** a manager can additionally act as a **controller** that connect
 ## What it does
 
 - **Lifecycle** — start / stop / restart / view logs for every bot, one or all at once.
-- **Live Control Surface** — a front-facing cockpit per bot: live module toggles, vitals, a command palette, and an interactive **Live Map** (click to fly), in three switchable themes. See **[[Control Surface]]**.
+- **Live Control Surface** — a front-facing cockpit per bot: live module toggles, vitals, a command palette, live per-module config + list editors, and an interactive **Live Map** (click to fly) with a full **fullscreen satellite map** (2b2t.place tiles, grid/highway overlays, Xaero-scale zoom), in three switchable themes. See **[[Control Surface]]**.
 - **Live console** — attach to each bot's stdin/stdout, with editable quick-command presets.
 - **Structured config editor** — a curated AquariusProxy/ZenithProxy settings editor with a raw-JSON fallback; **Save** or **Save & Restart**.
 - **Proxies** — per-bot host/port/username/password editor, bulk round-robin assignment, and one-click **import from a Webshare subscription**. See **[[Proxies]]**.
@@ -29,7 +29,9 @@ As of **v1.4.0** a manager can additionally act as a **controller** that connect
 - **One-click deploy** — stand up a new AquariusProxy / ZenithProxy / custom-fork bot from scratch; the launcher self-bootstraps Java and the jar.
 - **Jailed file manager** — browse/edit configs within an allowlist of roots.
 - **Multi-VPS controller** — connect your other boxes over SSH tunnels and run them from one dashboard: a Fleet view, an in-page box switcher, and DigitalOcean connect/provision/destroy. See **[[Multi-VPS Controller]]**.
-- **Themes & visual customization** — 11 theme presets, accent swatches, a custom background image, and a density control.
+- **Multi-user access & sharing** — named **user accounts with roles** (View / Operate / Config / Admin), **fine-grained per-module permissions**, and one-time invite links; or hand out **tiered shareable links** scoped to specific bots. Expose the dashboard publicly with one click via a **pluggable tunnel menu** (Cloudflare / Tailscale Funnel / ngrok / your own domain). See **[[Security]]**.
+- **Automation** — a scheduler (cron / interval / daily) plus an on-crash watchdog, run across one box or the whole fleet, with optional Discord notifications.
+- **Themes & visual customization** — theme presets + accent swatches, 10 selectable fonts, a custom background image, a density control, and selectable sidebar/command-center layouts.
 - **Self-update & backup** — update the manager in place (with an "update available" badge) and download/restore a portable config backup.
 - **Reconnect-friendly** — bots and the dashboard survive your browser closing or your PC rebooting; a **Connect** panel hands you a one-click reconnect shortcut.
 
