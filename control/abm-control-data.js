@@ -1015,3 +1015,14 @@ if(typeof window!=='undefined' && window.addEventListener){
     document.body.appendChild(b);
   });
 }
+
+/* Expose the builder singletons on window so INLINE on*= handlers can resolve them.
+   Top-level `const` is shared between <script>s (control-live.js can call ABMTrade.box()),
+   but it is NOT a property of window — and inline event-handler attributes (e.g. the trade
+   builder's profession <select onchange="ABMTrade.set('prof',...)">) only resolve names
+   against window. Without this the profession/give/get dropdowns silently no-op and the
+   builder stays stuck on its default (librarian) offer no matter which villager you pick. */
+if(typeof window!=='undefined'){
+  window.ABMTrade=ABMTrade; window.ABMPickers=ABMPickers;
+  window.ABMBuilders=ABMBuilders; window.ABMMap=ABMMap;
+}
