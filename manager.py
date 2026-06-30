@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.13.0"
+__version__ = "3.14.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1943,8 +1943,98 @@ def _launcher_asset(repo, osname, arch, log):
     raise ValueError(f"no launcher for {osname}-{arch} in {repo}@launcher-v3 (have: {have})")
 
 
+# ---------------------------------------------------------------------------
+# AquariusProxy jar pinning + viewer seeding
+#
+# The forked launcher inherited ZenithProxy's update host, github.2b2t.vc, which ONLY serves
+# rfresh2's own repos (it 500s on aquariusnetwork9/AquariusProxy and everything else). So a freshly
+# deployed AquariusProxy bot can't auto-fetch its jar and dies with "AquariusProxy.jar not found".
+# We sidestep that by placing the jar ourselves from api.github.com and pinning auto_update off —
+# the same setup the live fleet runs. Do NOT point the launcher back at the mirror for our fork.
+# ---------------------------------------------------------------------------
+AQUARIUS_REPO = "aquariusnetwork9/AquariusProxy"
+AQUARIUS_JAVA_CHANNEL = "java.1.21.4"
+
+
+def _aquarius_latest_jar(log, channel=AQUARIUS_JAVA_CHANNEL):
+    """Newest AquariusProxy release on the launcher's `channel`, via api.github.com (the mirror the
+    launcher uses won't serve our fork). Returns (version_tag, jar_download_url)."""
+    import urllib.request
+    api = f"https://api.github.com/repos/{AQUARIUS_REPO}/releases?per_page=40"
+    log(f"querying {api}")
+    req = urllib.request.Request(api, headers={"User-Agent": "aquarius-bot-manager",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        rels = json.loads(r.read().decode())
+    suffix = "+" + channel
+    for rel in rels:                              # GitHub returns releases newest-first
+        if not (rel.get("tag_name", "") or "").endswith(suffix):
+            continue
+        for a in rel.get("assets", []):
+            if a.get("name") == "AquariusProxy.jar":
+                return rel["tag_name"], a["browser_download_url"]
+    raise ValueError(f"no AquariusProxy.jar asset for channel '{channel}' on {AQUARIUS_REPO}")
+
+
+def place_aquarius_jar(directory, log):
+    """Download the latest AquariusProxy.jar into <dir>/launcher/ and pin launch_config.json so the
+    launcher runs it without hitting the (fork-incompatible) update mirror. Returns the version tag."""
+    import urllib.request
+    tag, url = _aquarius_latest_jar(log)
+    ldir = os.path.join(directory, "launcher")
+    os.makedirs(ldir, exist_ok=True)
+    dest = os.path.join(ldir, "AquariusProxy.jar")
+    log(f"placing AquariusProxy.jar {tag} (launcher mirror can't serve our fork — pinning it instead)…")
+    req = urllib.request.Request(url, headers={"User-Agent": "aquarius-bot-manager"})
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    os.replace(tmp, dest)
+    log(f"downloaded AquariusProxy.jar {tag} ({os.path.getsize(dest) // (1024 * 1024)} MB)")
+    lc_path = os.path.join(directory, "launch_config.json")
+    lc = {}
+    if os.path.isfile(lc_path):
+        try:
+            with open(lc_path) as f:
+                lc = json.load(f)
+        except (OSError, ValueError):
+            lc = {}
+    lc.update({"auto_update": False, "auto_update_launcher": False,
+               "release_channel": AQUARIUS_JAVA_CHANNEL, "version": tag, "local_version": tag,
+               "repo_owner": "aquariusnetwork9", "repo_name": "AquariusProxy"})
+    ltmp = lc_path + ".tmp"
+    with open(ltmp, "w") as f:
+        json.dump(lc, f, indent=2)
+    os.replace(ltmp, lc_path)
+    log(f"pinned launch_config.json -> {tag} (auto_update off)")
+    return tag
+
+
+def seed_viewer_config(directory, cfg, log, control=True):
+    """Pre-enable the bot's native viewer (live map + control plane) in config.json on a free
+    loopback port, so it's online from first boot. Creates a minimal config.json if absent (the
+    proxy fills in the rest of its defaults on first load). Returns the chosen port."""
+    path = os.path.join(directory, "config.json")
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    port = _next_free_viewer_port(cfg)
+    sv = data.setdefault("server", {}).setdefault("viewer", {})
+    sv.update({"enabled": True, "control": bool(control), "port": port, "bindHost": "127.0.0.1"})
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+    log(f"viewer + control plane enabled on 127.0.0.1:{port} (live map / Mission Control ready)")
+    return port
+
+
 def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None,
-                 autostart=True):
+                 autostart=True, viewer=True):
     """Start a background deploy: download the fork's launcher, unzip into `directory`,
     register the instance. Returns immediately; poll DEPLOY_JOB for progress.
     autostart defaults True so a VPS reboot relaunches the bot via the boot unit.
@@ -1986,6 +2076,21 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
                 pass
         log(f"launch command: {launch_cmd}")
         fresh = load_config(cfg_path)
+        # AquariusProxy's launcher can't auto-fetch our fork (mirror is rfresh2-only), so place the
+        # jar + pin the config here; otherwise the bot dies on first start with "jar not found".
+        is_aquarius = (repo == DEPLOY_SOURCES["aquarius"])
+        if is_aquarius:
+            try:
+                place_aquarius_jar(directory, log)
+            except Exception as e:
+                log(f"[warn] could not pre-place the AquariusProxy jar ({e}); "
+                    "the bot may fail to start until a jar is placed manually")
+            if viewer:
+                try:
+                    seed_viewer_config(directory, fresh, log)
+                except Exception as e:
+                    log(f"[warn] could not enable the viewer by default ({e}); "
+                        "turn it on later from the Live viewer panel")
         if name in fresh["by_name"]:
             log(f"'{name}' already registered — files are in place, left config as-is")
         else:
@@ -1994,8 +2099,13 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
             log(f"registered instance '{name}'"
                 + (f" with limits {clean_lim}" if clean_lim else "")
                 + (" [autostart on boot]" if autostart else ""))
-        log("✓ deploy complete — start it from the dashboard "
-            "(the launcher fetches Java + the proxy jar on first run).")
+        if is_aquarius:
+            log("✓ deploy complete — jar pinned"
+                + (" + viewer/control plane on" if viewer else "")
+                + "; start it from the dashboard, then `connect` to log in the account.")
+        else:
+            log("✓ deploy complete — start it from the dashboard "
+                "(the launcher fetches Java + the proxy jar on first run).")
 
     DEPLOY_JOB.start(name, target)
     return {"ok": True, "name": name, "dir": directory, "repo": repo}
@@ -2075,16 +2185,17 @@ def migrate_to_aquarius(cfg_path, name):
             if fn.lower().endswith(".jar") and os.path.isfile(os.path.join(directory, fn)):
                 shutil.copy2(os.path.join(directory, fn), os.path.join(bak, fn)); backed.append(fn)
         log(f"backed up -> {os.path.basename(bak)}  ({', '.join(backed)})")
-        # 3) repoint launch_config.json (keep the valid version; let the launcher pull the jar)
+        # 3) repoint launch_config.json -> our fork. We pin the jar ourselves in step 5 (place_aquarius_jar
+        #    rewrites version + auto_update), because the launcher's update mirror won't serve our fork.
         with open(lc_path) as f:
             lc = json.load(f)
         lc["repo_owner"] = "aquariusnetwork9"
         lc["repo_name"] = "AquariusProxy"
         lc["auto_update_launcher"] = False     # we manage the launcher binary ourselves
-        lc["auto_update"] = True
+        lc["auto_update"] = False              # mirror can't serve our fork — pinned jar instead
         with open(lc_path, "w") as f:
             json.dump(lc, f, indent=2)
-        log("repointed launch_config.json -> aquariusnetwork9/AquariusProxy (kept version)")
+        log("repointed launch_config.json -> aquariusnetwork9/AquariusProxy")
         # 4) swap the launcher binary — the key step (repointing alone falls back to the old jar)
         osname, arch = _detect_platform()
         asset, url = _launcher_asset("aquariusnetwork9/AquariusProxy", osname, arch, log)
@@ -2105,13 +2216,19 @@ def migrate_to_aquarius(cfg_path, name):
             log("swapped the launch binary -> Aquarius launcher")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        # 5) start
+        # 5) place the AquariusProxy jar + pin (the launcher's update mirror is rfresh2-only, so it
+        #    can't fetch our fork — without this the bot dies on first start with "jar not found")
+        try:
+            place_aquarius_jar(directory, log)
+        except Exception as e:
+            log(f"[error] could not place the AquariusProxy jar ({e}). The bot won't start until a "
+                "jar is in launcher/AquariusProxy.jar — roll back or place it manually.")
+        # 6) start
         log("starting bot…")
         start(inst)
-        log("✓ migration done — the Aquarius launcher removes ZenithProxy.jar and pulls AquariusProxy.")
+        log("✓ migration done — AquariusProxy jar pinned, account + settings kept.")
         log("  Watch the console for 'config.json loaded.' then 'AquariusProxy started!', then run `connect` to log in.")
-        log("  Same account + settings are kept. If anything's off, use Roll back (restores "
-            + os.path.basename(bak) + ").")
+        log("  If anything's off, use Roll back (restores " + os.path.basename(bak) + ").")
 
     MIGRATE_JOB.start(name, target)
     return {"ok": True, "name": name, "dir": directory}
@@ -2138,12 +2255,16 @@ def rollback_migration(cfg_path, name):
             if instance_status(inst) != "running":
                 break
             time.sleep(0.5)
-        for fn in os.listdir(directory):       # drop the AquariusProxy jar the new launcher pulled
-            if fn.lower().endswith(".jar") and "aquarius" in fn.lower():
-                try:
-                    os.remove(os.path.join(directory, fn)); log(f"removed {fn}")
-                except OSError:
-                    pass
+        # drop the AquariusProxy jar (top-level legacy spot + the launcher/ dir we now pin into)
+        for d in (directory, os.path.join(directory, "launcher")):
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if fn.lower().endswith(".jar") and "aquarius" in fn.lower():
+                    try:
+                        os.remove(os.path.join(d, fn)); log(f"removed {os.path.relpath(os.path.join(d, fn), directory)}")
+                    except OSError:
+                        pass
         for fn in os.listdir(bak):
             shutil.copy2(os.path.join(bak, fn), os.path.join(directory, fn))
         lpath = os.path.join(directory, "launch")
@@ -5222,6 +5343,8 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _inst_tier(rest, method):
         """Capability tier required for an instance sub-route, or None = owner-only/unknown."""
+        if rest == "viewer":                     # POST = enable/disable the viewer (edits config + restarts)
+            return "config" if method == "POST" else None
         if rest.startswith("viewer/"):
             return "view"
         if rest.startswith("control/"):
@@ -6719,7 +6842,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(deploy_proxy(self.cfg_path, p.get("name"), p.get("dir"),
                                                p.get("source"), owner_repo=p.get("owner_repo"),
                                                limits=p.get("limits"),
-                                               autostart=p.get("autostart", True)))
+                                               autostart=p.get("autostart", True),
+                                               viewer=p.get("viewer", True)))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
             except json.JSONDecodeError as e:
@@ -6820,6 +6944,35 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no such instance"}, 404)
             action = {"start": start, "stop": stop, "restart": restart}[m.group(2)]
             return self._json({"result": action(inst), "status": instance_status(inst)})
+
+        # enable/disable a bot's native viewer + control plane (config.json server.viewer), then
+        # restart so it takes effect. {"enable":bool, "control":bool}. AquariusProxy native — for
+        # ZenithProxy the feed comes from the zenith-abm-bridge plugin instead.
+        m = re.match(r"^/api/instances/([^/]+)/viewer$", path)
+        if m:
+            inst = self._find(cfg, m.group(1))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                p = {}
+            on = bool(p.get("enable", True))
+            control = bool(p.get("control", True))
+            was_running = instance_status(inst) == "running"
+            if was_running:                          # stop first so the bot can't rewrite config.json on exit
+                stop(inst)
+                time.sleep(0.5)
+            try:
+                port = set_viewer(inst, cfg, on=on, control=control)
+            except ValueError as e:
+                if was_running:
+                    start(inst)
+                return self._json({"error": str(e)}, 400)
+            if was_running:
+                start(inst)
+            return self._json({"ok": True, "enabled": on, "control": control if on else False,
+                               "port": port, "status": instance_status(inst)})
 
         # bulk proxy assignment (round-robin / same) across many instances
         if path == "/api/proxies/bulk":
@@ -7315,6 +7468,8 @@ def main():
     p.add_argument("--cpu", default=None, help="optional CPU cap, percent of one core")
     p.add_argument("--no-autostart", dest="no_autostart", action="store_true",
                    help="don't relaunch this bot on VPS reboot (autostart is on by default)")
+    p.add_argument("--no-viewer", dest="no_viewer", action="store_true",
+                   help="don't enable the live map / control plane by default (AquariusProxy only)")
 
     p = sub.add_parser("adopt")
     p.add_argument("session", help="existing tmux session name")
@@ -7601,7 +7756,8 @@ def main():
         lim = {"memory": args.memory, "cpu": args.cpu} if (args.memory or args.cpu) else None
         try:
             deploy_proxy(args.config, args.name, args.dir, args.source,
-                         owner_repo=args.repo, limits=lim, autostart=not args.no_autostart)
+                         owner_repo=args.repo, limits=lim, autostart=not args.no_autostart,
+                         viewer=not args.no_viewer)
         except ValueError as e:
             die(str(e))
         seen = 0                       # stream the background job's log to stdout
@@ -8832,7 +8988,10 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     </div>
     <div id="vwWrap" style="position:relative;width:100%;max-width:600px;margin:0 auto;aspect-ratio:1;background:#06090c;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:grab;touch-action:none">
       <canvas id="vwCanvas" width="600" height="600" style="position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated"></canvas>
-      <div id="vwOff" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">Viewer offline.<br>AquariusProxy: enable <code>server.viewer.enabled</code>.<br>ZenithProxy: install the <code>zenith-abm-bridge</code> plugin, then <code>abmBridge on</code>.<br>(port auto-detected)</div>
+      <div id="vwOff" style="position:absolute;inset:0;display:flex;flex-direction:column;gap:.8rem;align-items:center;justify-content:center;text-align:center;color:var(--dim);font-family:var(--mono);font-size:.78rem;padding:1rem;line-height:1.6">
+        <div id="vwOffMsg">Viewer offline.</div>
+        <button id="vwEnableBtn" class="cap-config" onclick="vwEnableViewer()" style="display:none;font-family:inherit;font-size:.8rem;padding:.5rem .9rem;border:1px solid var(--acc-dim);background:var(--panel);color:var(--acc);font-weight:700;border-radius:9px;cursor:pointer">⚡ Enable viewer + control plane</button>
+      </div>
       <div style="position:absolute;top:.4rem;left:.5rem;font-family:var(--mono);font-size:.6rem;color:#cdd9e2cc;text-shadow:0 1px 2px #000">N ↑</div>
     </div>
     <div id="vwControlWrap" class="vw-ctl" style="display:none">
@@ -8841,6 +9000,8 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
         <button class="vw-qbtn" onclick="vwOpenFullControl()"
           style="border-color:var(--acc-dim);color:var(--acc);font-weight:700">⛶ Open full control surface</button>
         <span style="font-size:.64rem;color:var(--dim)">live Mission Control — every module, the world map, vitals &amp; a command palette on one page</span>
+        <button class="vw-qbtn cap-config" onclick="vwDisableViewer()" title="Turn the viewer + control plane off for this bot"
+          style="margin-left:auto;border-color:var(--line);color:var(--dim)">⏻ Disable viewer</button>
       </div>
       <div class="vw-card"><div id="vwVitals" class="vw-vitals"></div></div>
       <div class="vw-card">
@@ -9251,6 +9412,40 @@ let vwTab='map', vwCam3rd=false, vwGL=null, vwBox=null, vwChunkBusy=false, vwChu
 function vwLerpAng(a,b,k){ let d=((b-a+540)%360)-180; return a+d*k; }
 function vwUpdMode(){ const m=$('vwMode'); if(m) m.textContent = vwFollow?'FOLLOW':'FREE'; }
 function vwOnlineSet(on){ const o=$('vwOff'); if(o) o.style.display = on?'none':'flex'; }
+// Populate the offline overlay for the open bot: AquariusProxy gets a one-click enable button
+// (we can flip server.viewer for it); ZenithProxy gets the bridge-plugin instructions instead.
+function vwSetupOffline(name){
+  const inst=(typeof INSTMAP!=='undefined'&&INSTMAP)?INSTMAP[name]:null;
+  const fork=inst&&inst.proxy?inst.proxy.fork:null;
+  const msg=$('vwOffMsg'), btn=$('vwEnableBtn');
+  if(!msg||!btn) return;
+  if(fork==='ZenithProxy'){
+    msg.innerHTML='Viewer offline.<br>ZenithProxy: install the <code>zenith-abm-bridge</code> plugin, then <code>abmBridge on</code>.';
+    btn.style.display='none';
+  } else {
+    msg.innerHTML='Viewer &amp; control plane are <b>off</b> for this bot.';
+    btn.disabled=false; btn.innerHTML='⚡ Enable viewer + control plane'; btn.style.display='';
+  }
+}
+async function vwEnableViewer(){
+  if(!VW) return;
+  const btn=$('vwEnableBtn'); const o=btn.innerHTML;
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Enabling…';
+  const d=await api('/api/instances/'+encodeURIComponent(VW)+'/viewer','POST',{enable:true,control:true});
+  if(d&&d.error){ alert('✗ '+d.error); btn.disabled=false; btn.innerHTML=o; return; }
+  btn.style.display='none';
+  $('vwOffMsg').innerHTML='✓ Enabled on port '+(d.port||'?')+' — bot restarting; the live feed comes online in a few seconds…';
+  setTimeout(()=>{ if(VW) vwTickState(); }, 3500);   // nudge the poll; it flips online once the bot is back
+  refresh();
+}
+async function vwDisableViewer(){
+  if(!VW) return;
+  if(!confirm('Turn the viewer + control plane OFF for "'+VW+'"?\nThe bot will restart to apply it.')) return;
+  const d=await api('/api/instances/'+encodeURIComponent(VW)+'/viewer','POST',{enable:false});
+  if(d&&d.error){ alert('✗ '+d.error); return; }
+  vwSetTab('map'); vwOnlineSet(false); vwSetupOffline(VW);
+  refresh();
+}
 function openViewer(name){
   VW=name; $('vwName').textContent=name;
   vwSamples=[]; vwRender={x:0,y:0,z:0,yaw:0,pitch:0,has:false};
@@ -9259,7 +9454,7 @@ function openViewer(name){
   if(vwGL){ vwGL.count=0; }   // drop the old mesh; context is reused on reopen
   vwInvData=null; vwModData=null; vwCmdData=null; vwCmdLoaded=false;   // fresh control data per bot
   vwZoom=$('vwCanvas').width/220;          // ~220 blocks across by default
-  vwUpdMode(); vwOnlineSet(false); vwSetTab('map'); vwSetCam('1st');
+  vwUpdMode(); vwOnlineSet(false); vwSetupOffline(name); vwSetTab('map'); vwSetCam('1st');
   $('vwScrim').classList.add('open');
   vwInitHandlers(); vwTickState();
   clearInterval(vwStateT); vwStateT=setInterval(vwTickState,100);
