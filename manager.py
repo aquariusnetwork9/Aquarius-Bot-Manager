@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.14.0"
+__version__ = "3.14.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5532,6 +5532,9 @@ class Handler(BaseHTTPRequestHandler):
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # never let the browser serve a stale dashboard — the inline JS ships with the page, so a
+        # cached copy silently runs old code (e.g. a missing/older "Enable viewer" handler).
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -9429,10 +9432,20 @@ function vwSetupOffline(name){
 }
 async function vwEnableViewer(){
   if(!VW) return;
+  if(!confirm('Enable the live map + control plane for "'+VW+'"?\n\nThis restarts the bot to bind the viewer — it will disconnect and reconnect (re-entering the 2b2t queue once). After that the control plane stays on across reconnects.')) return;
   const btn=$('vwEnableBtn'); const o=btn.innerHTML;
   btn.disabled=true; btn.innerHTML='<span class="spin"></span> Enabling…';
-  const d=await api('/api/instances/'+encodeURIComponent(VW)+'/viewer','POST',{enable:true,control:true});
-  if(d&&d.error){ alert('✗ '+d.error); btn.disabled=false; btn.innerHTML=o; return; }
+  let d;
+  try{
+    d=await api('/api/instances/'+encodeURIComponent(VW)+'/viewer','POST',{enable:true,control:true});
+  }catch(e){
+    alert('✗ Could not reach the server to enable the viewer:\n'+e);
+    btn.disabled=false; btn.innerHTML=o; return;
+  }
+  if(!d || d.error){
+    alert('✗ '+((d&&d.error)||'unknown error enabling the viewer'));
+    btn.disabled=false; btn.innerHTML=o; return;
+  }
   btn.style.display='none';
   $('vwOffMsg').innerHTML='✓ Enabled on port '+(d.port||'?')+' — bot restarting; the live feed comes online in a few seconds…';
   setTimeout(()=>{ if(VW) vwTickState(); }, 3500);   // nudge the poll; it flips online once the bot is back
@@ -9440,9 +9453,12 @@ async function vwEnableViewer(){
 }
 async function vwDisableViewer(){
   if(!VW) return;
-  if(!confirm('Turn the viewer + control plane OFF for "'+VW+'"?\nThe bot will restart to apply it.')) return;
-  const d=await api('/api/instances/'+encodeURIComponent(VW)+'/viewer','POST',{enable:false});
-  if(d&&d.error){ alert('✗ '+d.error); return; }
+  if(!confirm('Turn the viewer + control plane OFF for "'+VW+'"?\nThe bot will restart to apply it (one reconnect).')) return;
+  let d;
+  try{
+    d=await api('/api/instances/'+encodeURIComponent(VW)+'/viewer','POST',{enable:false});
+  }catch(e){ alert('✗ Could not reach the server:\n'+e); return; }
+  if(!d || d.error){ alert('✗ '+((d&&d.error)||'unknown error disabling the viewer')); return; }
   vwSetTab('map'); vwOnlineSet(false); vwSetupOffline(VW);
   refresh();
 }
@@ -9624,6 +9640,9 @@ function vwInitHandlers(){
     vwZoom=Math.max(W/512, Math.min(W/24, vwZoom*f));
   },{passive:false});
   wrap.addEventListener('pointerdown',(e)=>{
+    // don't start a map-drag (which captures the pointer) when the press lands on the offline
+    // overlay or its buttons — defensive so the enable button always gets its click.
+    if(e.target.closest('#vwOff')) return;
     wrap.setPointerCapture(e.pointerId);
     if(vwFollow){ vwFollow=false; vwCam.x=vwRender.x; vwCam.z=vwRender.z; vwUpdMode(); }
     vwDrag={sx:e.clientX, sy:e.clientY, cx:vwCam.x, cz:vwCam.z};
