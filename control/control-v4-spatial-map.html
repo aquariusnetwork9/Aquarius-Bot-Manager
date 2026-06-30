@@ -1,8 +1,9 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ABM · Live Map</title>
+<link rel="stylesheet" href="/control/leaflet.css">
 <style>
 :root{ --bg:#070a0f; --txt:#e3ebf3; --dim:#7e90a3; --line:#ffffff1f; --acc:#3ddc97; --acc2:#5cc8ff;
-  --amber:#ffb454; --crash:#ff5d5d; --glass:rgba(13,19,28,.78);
+  --amber:#ffb454; --crash:#ff5d5d; --glass:rgba(13,19,28,.82);
   --mono:ui-monospace,'Space Mono',monospace; --sans:'Sora',system-ui,sans-serif; }
 *{box-sizing:border-box}
 body{margin:0;height:100vh;overflow:hidden;color:var(--txt);font-family:var(--sans);background:var(--bg)}
@@ -11,60 +12,71 @@ button,a.btn{font-family:var(--sans);cursor:pointer;border:1px solid var(--line)
 button:hover,a.btn:hover{border-color:var(--acc)}
 button.go{border-color:#1f7a55;color:var(--acc);background:#3ddc9714}
 .stage{position:relative;height:100vh;width:100vw}
-.map{position:absolute;inset:0;background:#070a0f;background-size:cover;background-position:center;image-rendering:pixelated;overflow:hidden}
-.grid{position:absolute;inset:0;pointer-events:none;background:
-  repeating-linear-gradient(0deg,#13202e22 0 1px,transparent 1px 48px),
-  repeating-linear-gradient(90deg,#13202e22 0 1px,transparent 1px 48px)}
-.vig{position:absolute;inset:0;box-shadow:inset 0 0 240px #000a;pointer-events:none}
-.bot{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:4;pointer-events:none}
-.bot .core{width:13px;height:13px;border-radius:50%;background:var(--acc);box-shadow:0 0 16px var(--acc)}
-.bot .ring{position:absolute;inset:-9px;border:1.5px solid #3ddc9766;border-radius:50%;animation:rg 2.4s ease-out infinite}
-@keyframes rg{0%{transform:scale(.6);opacity:.9}100%{transform:scale(1.8);opacity:0}}
-.bot .nm{position:absolute;left:18px;top:-6px;font-family:var(--mono);font-size:.62rem;color:var(--acc);white-space:nowrap;text-shadow:0 1px 3px #000}
-.ent{position:absolute;border-radius:50%;transform:translate(-50%,-50%);border:1px solid #0b1018;z-index:3;pointer-events:none}
-.ent.player{width:10px;height:10px;background:var(--acc2);box-shadow:0 0 8px var(--acc2)}
-.ent.mobH{width:9px;height:9px;background:var(--crash);box-shadow:0 0 7px var(--crash)}
-.ent.mobP{width:8px;height:8px;background:#9fe089}
-.ent.item{width:6px;height:6px;background:var(--amber)}
-.dest{position:absolute;width:16px;height:16px;border:2px solid var(--acc);border-radius:50%;transform:translate(-50%,-50%);z-index:5;box-shadow:0 0 10px var(--acc);display:none}
-.dest::after{content:"";position:absolute;inset:5px;border-radius:50%;background:var(--acc)}
-.topbar{position:absolute;left:14px;top:14px;right:14px;z-index:10;display:flex;align-items:center;gap:.55rem;flex-wrap:wrap}
+#map{position:absolute;inset:0;background:#05080d;cursor:crosshair}
+/* leaflet dark-theme overrides */
+.leaflet-container{background:#05080d;font-family:var(--sans);outline:none}
+.leaflet-bar{border:1px solid var(--line);box-shadow:0 6px 24px #0008}
+.leaflet-bar a{background:var(--glass);color:var(--txt);border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}
+.leaflet-bar a:hover{background:#1a2533;color:var(--acc)}
+.leaflet-control-zoom{margin-top:64px!important}
+.leaflet-tile{image-rendering:pixelated}
+/* bot + entity markers */
+.botmk{position:relative}
+.botmk .core{position:absolute;left:50%;top:50%;width:13px;height:13px;margin:-6.5px 0 0 -6.5px;border-radius:50%;background:var(--acc);box-shadow:0 0 16px var(--acc)}
+.botmk .ring{position:absolute;left:50%;top:50%;width:13px;height:13px;margin:-6.5px 0 0 -6.5px;border:1.5px solid #3ddc9766;border-radius:50%;animation:rg 2.4s ease-out infinite}
+.botmk .nm{position:absolute;left:14px;top:-7px;font-family:var(--mono);font-size:.62rem;color:var(--acc);white-space:nowrap;text-shadow:0 1px 3px #000}
+@keyframes rg{0%{transform:scale(.6);opacity:.9}100%{transform:scale(2.4);opacity:0}}
+.destmk{width:16px;height:16px;border:2px solid var(--acc);border-radius:50%;box-shadow:0 0 10px var(--acc);background:#3ddc9733}
+.topbar{position:absolute;left:14px;top:14px;right:14px;z-index:600;display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;pointer-events:none}
+.topbar>*{pointer-events:auto}
 .brand{display:flex;align-items:center;gap:.5rem;font-weight:800;font-size:.86rem;background:var(--glass);border:1px solid var(--line);border-radius:12px;padding:.4rem .7rem;backdrop-filter:blur(12px)}
 .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--crash);box-shadow:0 0 10px var(--crash)}
 .brand .dot.on{background:var(--acc);box-shadow:0 0 10px var(--acc)}
 .vchip{display:inline-flex;align-items:center;gap:.6rem;font-family:var(--mono);font-size:.68rem;color:var(--dim);background:var(--glass);
   border:1px solid var(--line);border-radius:11px;padding:.4rem .65rem;backdrop-filter:blur(12px)}
 .vchip .hp{color:var(--crash)} .vchip .fd{color:var(--amber)} .vchip .ps{color:var(--acc2)}
-.zoom{display:inline-flex;gap:.3rem;margin-left:auto}
-.coordlbl{position:absolute;left:14px;bottom:12px;z-index:6;font-family:var(--mono);font-size:.66rem;color:var(--dim);background:var(--glass);
+.layers{position:absolute;right:14px;top:60px;z-index:600;background:var(--glass);border:1px solid var(--line);border-radius:12px;
+  padding:.55rem .7rem;backdrop-filter:blur(12px);min-width:166px;font-size:.76rem;box-shadow:0 10px 30px #0007}
+.layers h4{margin:.1rem 0 .5rem;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);font-weight:700}
+.layers label{display:flex;align-items:center;gap:.5rem;padding:.2rem 0;cursor:pointer;user-select:none}
+.layers label:hover{color:var(--acc)}
+.layers input{accent-color:var(--acc);width:14px;height:14px;cursor:pointer}
+.layers .sep{height:1px;background:var(--line);margin:.4rem 0}
+.layers .sw{display:inline-block;width:11px;height:11px;border-radius:3px;flex:0 0 auto}
+.coordlbl{position:absolute;left:14px;bottom:12px;z-index:600;font-family:var(--mono);font-size:.66rem;color:var(--dim);background:var(--glass);
   border:1px solid var(--line);border-radius:9px;padding:.4rem .65rem;backdrop-filter:blur(10px)}
-.readout{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:8;max-width:min(680px,calc(100vw - 28px));
+.coordlbl b{color:var(--acc2)}
+.recenter{position:absolute;right:14px;bottom:12px;z-index:600}
+.readout{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:600;max-width:min(680px,calc(100vw - 28px));
   font-family:var(--mono);font-size:.7rem;color:var(--txt);background:var(--glass);border:1px solid var(--line);border-radius:11px;
   padding:.5rem .8rem;backdrop-filter:blur(12px);display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;justify-content:center}
 .readout b{color:var(--acc)} .readout .mono{font-family:var(--mono);color:var(--acc2)}
 .readout button{padding:.28rem .55rem;font-size:.72rem}
-.offline{position:absolute;inset:0;z-index:9;display:none;align-items:center;justify-content:center;text-align:center;
-  color:var(--dim);font-family:var(--mono);font-size:.8rem;line-height:1.7;padding:1.4rem;background:#070a0fcc}
-.offline code{color:var(--amber)}
-@media(max-width:640px){ .vchip{display:none} }
+@media(max-width:640px){ .vchip{display:none} .layers{top:54px} }
 </style></head>
 <body><div class="stage">
-  <div class="map" id="map">
-    <div class="grid"></div>
-    <div class="vig"></div>
-    <div id="ents"></div>
-    <div class="bot" id="bot"><div class="ring"></div><div class="core"></div><div class="nm" id="botnm">—</div></div>
-    <div class="dest" id="dest"></div>
-    <div class="coordlbl" id="coordlbl">connecting…</div>
-  </div>
+  <div id="map"></div>
   <div class="topbar">
     <a class="brand btn" id="backlink" href="#" title="Back to control surface"><span class="dot" id="conn"></span><span id="brandname">ABM</span></a>
     <span class="vchip" id="vitals">—</span>
-    <span class="zoom"><button id="zoomout" title="Zoom out">−</button><button id="zoomin" title="Zoom in">+</button></span>
   </div>
+  <div class="layers" id="layers">
+    <h4>Layers</h4>
+    <label><input type="checkbox" id="ly_sat" checked><span class="sw" style="background:#3a5a78"></span>Satellite</label>
+    <label><input type="checkbox" id="ly_obs"><span class="sw" style="background:#6a4bbd"></span>Obsidian</label>
+    <label><input type="checkbox" id="ly_new"><span class="sw" style="background:#ff3b3b"></span>New chunks</label>
+    <label><input type="checkbox" id="ly_live"><span class="sw" style="background:#3ddc97"></span>Live render</label>
+    <div class="sep"></div>
+    <label><input type="checkbox" id="ly_grid"><span class="sw" style="background:#9fb3c8"></span>Grid</label>
+    <label><input type="checkbox" id="ly_hwy" checked><span class="sw" style="background:#ffd24a"></span>Highways</label>
+    <div class="sep"></div>
+    <label><input type="checkbox" id="ly_follow" checked><span class="sw" style="background:#5cc8ff"></span>Follow bot</label>
+  </div>
+  <div class="coordlbl" id="coordlbl">connecting…</div>
+  <button class="btn recenter" id="recenter" title="Recenter on bot">⌖ Recenter</button>
   <div class="readout" id="readout">Click the map to set an Elytra destination.</div>
-  <div class="offline" id="offline">Live map unavailable.<br>The bot must be <b>in-game</b> with its viewer enabled.<br>AquariusProxy: <code>abm viewer &lt;bot&gt; on</code>.</div>
 </div>
+<script src="/control/leaflet.js"></script>
 <script>
 (function(){
   'use strict';
@@ -73,11 +85,24 @@ button.go{border-color:#1f7a55;color:var(--acc);background:#3ddc9714}
   var MOCK=Q.get('mock');
   var DIRECT=Q.get('direct')==='1'||Q.get('direct')==='true';
   var STYLE=Q.get('style')||'';
+  var TILESRC=(Q.get('tilesrc')||'proxy').toLowerCase();      // proxy (default, cached on VPS) | direct (browser→2b2t.place)
+  var DIRECT_HOST='https://2b2t.place';
   var BASE = MOCK ? MOCK.replace(/\/+$/,'') : DIRECT ? '' : ('/api/instances/'+encodeURIComponent(INST));
+  var TILEBASE = location.origin + '/api/map/tile';           // global, non-instance-scoped proxy
   function api(p){ return BASE+p; }
-  var SIZES=[128,256,512], zi=2;                      // map span (blocks); bot caps at 512
-  function span(){ return SIZES[zi]; }
-  var state=null, mapOk=false;
+
+  /* ---- world<->latlng projection (CRS.Simple scaled by 2^MAXLOD) ----
+     lat = world Z, lng = world X.  A tile at native zoom z covers 512·2^(MAXLOD-z) blocks,
+     so leaflet zoom z maps to the site's LOD = MAXLOD - z, and tile (x,y) == their (tx,ty). */
+  var MAXLOD=10, SCALE_DEN=1<<MAXLOD;           // 1024
+  var HWY_MAX=5000000;                          // highway half-length (blocks) — well past the snapshot
+  function w2ll(x,z){ return L.latLng(z, x); }
+  function ll2w(ll){ return { x: Math.round(ll.lng), z: Math.round(ll.lat) }; }
+  var crs = L.extend({}, L.CRS.Simple, { transformation: new L.Transformation(1/SCALE_DEN, 0, 1/SCALE_DEN, 0) });
+
+  var DIM=0;                                    // 0 overworld · 1 nether · 2 end (driven by the bot)
+  function dimId(d){ d=(d||'').toLowerCase(); return d.indexOf('nether')>=0?1:d.indexOf('end')>=0?2:0; }
+  function prettyDim(d){ return d===1?'Nether':d===2?'The End':'Overworld'; }
 
   document.title='ABM · Live Map · '+(INST||'bot');
   document.getElementById('brandname').textContent=INST||'bot';
@@ -89,91 +114,187 @@ button.go{border-color:#1f7a55;color:var(--acc);background:#3ddc9714}
   if(DIRECT) bu.searchParams.set('direct','1');
   back.href=bu.toString();
 
-  function fnum(v,d){ v=parseFloat(v); return isFinite(v)?v:(d||0); }
-  function prettyDim(d){ d=(d||'').toLowerCase(); return d.indexOf('nether')>=0?'Nether':d.indexOf('end')>=0?'The End':'Overworld'; }
-  function hostile(t){ return /ZOMBIE|SKELET|CREEPER|WITHER|BLAZE|PIGLIN|HOGLIN|GHAST|ENDERMAN|SPIDER|SLIME|MAGMA|VEX|VINDICATOR|PILLAGER|RAVAGER|WARDEN|PHANTOM|DROWNED|HUSK|STRAY|GUARDIAN|SHULKER|WITCH/i.test(t||''); }
-  function entClass(t){ t=(t||'').toUpperCase(); if(t.indexOf('PLAYER')>=0)return'player'; if(t.indexOf('ITEM')>=0)return'item'; return hostile(t)?'mobH':'mobP'; }
+  /* ---------------- map ---------------- */
+  var map = L.map('map', {
+    crs: crs, center: w2ll(0,0), zoom: 2,
+    minZoom: 0, maxZoom: 13, zoomSnap: 0, zoomDelta: 0.6, wheelPxPerZoomLevel: 90,
+    zoomControl: true, attributionControl: false, preferCanvas: true, inertia: true,
+    worldCopyJump: false, fadeAnimation: false
+  });
+  // explicit pane stacking: tiles(200) < live render(350) < grid(405) < highways(410) < markers(600)
+  map.createPane('liverender'); map.getPane('liverender').style.zIndex=350; map.getPane('liverender').style.pointerEvents='none';
+  map.createPane('grid');       map.getPane('grid').style.zIndex=405;       map.getPane('grid').style.pointerEvents='none';
+  map.createPane('highways');   map.getPane('highways').style.zIndex=410;   map.getPane('highways').style.pointerEvents='none';
+  map.createPane('entities');   map.getPane('entities').style.zIndex=500;   map.getPane('entities').style.pointerEvents='none';
 
-  /* ---- map background (bot-centred tile, refreshed) ---- */
-  var mapEl=document.getElementById('map');
-  function refreshMap(){
-    var img=new Image();
-    img.onload=function(){ mapEl.style.backgroundImage="url('"+img.src+"')"; mapOk=true; document.getElementById('offline').style.display='none'; };
-    img.onerror=function(){ mapOk=false; if(!state){ document.getElementById('offline').style.display='flex'; } };
-    img.src=api('/viewer/map.png?size='+span())+'&t='+Date.now();
+  /* ---- satellite / obsidian / new-chunks tile layers (2b2t.place pyramid) ---- */
+  function trunc(n){ return n<0 ? Math.ceil(n) : Math.floor(n); }
+  function makeTileLayer(layerName, zidx){
+    var Cls = L.TileLayer.extend({
+      getTileUrl: function(c){
+        var lod = Math.max(0, Math.min(10, MAXLOD - c.z));
+        var tx=c.x, ty=c.y;
+        if(TILESRC==='direct')
+          return DIRECT_HOST+'/tiles/'+layerName+'/'+lod+'/'+DIM+'/'+trunc(tx/32)+'/'+trunc(ty/32)+'/t.'+tx+'.'+ty+'.webp';
+        return TILEBASE+'/'+layerName+'/'+lod+'/'+DIM+'/'+tx+'/'+ty;
+      }
+    });
+    return new Cls(null, { tileSize:512, minNativeZoom:0, maxNativeZoom:10, noWrap:true,
+                           zIndex:zidx, keepBuffer:2, updateWhenZooming:false, crossOrigin:false });
+  }
+  var satLayer = makeTileLayer('base', 1);
+  var obsLayer = makeTileLayer('overlay', 2);
+  var newLayer = makeTileLayer('newchunks', 3);
+  satLayer.addTo(map);
+
+  /* ---- highways (the 8 nether roads: axes + x=±z diagonals from origin) ---- */
+  var hwyRenderer = L.canvas({ pane:'highways' });
+  var AX={color:'#ffd24a',weight:1.4,opacity:.85,interactive:false,renderer:hwyRenderer};
+  var DG={color:'#ff9e4a',weight:1.2,opacity:.7,interactive:false,renderer:hwyRenderer};
+  var hwyGroup = L.layerGroup([
+    L.polyline([w2ll(-HWY_MAX,0), w2ll(HWY_MAX,0)], AX),     // X axis  (z=0)
+    L.polyline([w2ll(0,-HWY_MAX), w2ll(0,HWY_MAX)], AX),     // Z axis  (x=0)
+    L.polyline([w2ll(-HWY_MAX,-HWY_MAX), w2ll(HWY_MAX,HWY_MAX)], DG),  // x=z
+    L.polyline([w2ll(-HWY_MAX,HWY_MAX), w2ll(HWY_MAX,-HWY_MAX)], DG)   // x=-z
+  ]);
+  hwyGroup.addTo(map);
+
+  /* ---- world-aligned grid (adaptive spacing, Xaero-style) ---- */
+  var gridRenderer = L.canvas({ pane:'grid' });
+  var gridGroup = L.layerGroup();
+  var GRID_STEPS=[16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,524288];
+  function rebuildGrid(){
+    if(!map.hasLayer(gridGroup)) return;
+    gridGroup.clearLayers();
+    var b=map.getBounds(), w0=ll2w(b.getNorthWest()), w1=ll2w(b.getSouthEast());
+    var minX=Math.min(w0.x,w1.x), maxX=Math.max(w0.x,w1.x);
+    var minZ=Math.min(w0.z,w1.z), maxZ=Math.max(w0.z,w1.z);
+    // pick a step so lines sit ~70px apart on screen
+    var ppb=(map.project(w2ll(1,0),map.getZoom()).x - map.project(w2ll(0,0),map.getZoom()).x);
+    var step=GRID_STEPS[GRID_STEPS.length-1];
+    for(var i=0;i<GRID_STEPS.length;i++){ if(GRID_STEPS[i]*ppb>=70){ step=GRID_STEPS[i]; break; } }
+    var sub={color:'#9fb3c8',weight:.5,opacity:.22,interactive:false,renderer:gridRenderer};
+    var x0=Math.floor(minX/step)*step, z0=Math.floor(minZ/step)*step;
+    for(var x=x0; x<=maxX; x+=step){
+      var st = (x===0)?{color:'#ffffff',weight:1.1,opacity:.55,interactive:false,renderer:gridRenderer}:sub;
+      gridGroup.addLayer(L.polyline([w2ll(x,minZ), w2ll(x,maxZ)], st));
+    }
+    for(var z=z0; z<=maxZ; z+=step){
+      var st2 = (z===0)?{color:'#ffffff',weight:1.1,opacity:.55,interactive:false,renderer:gridRenderer}:sub;
+      gridGroup.addLayer(L.polyline([w2ll(minX,z), w2ll(maxX,z)], st2));
+    }
+  }
+  map.on('moveend zoomend', rebuildGrid);
+
+  /* ---- live bot render (the bot's own freshly-rendered chunks, /viewer/map.png) ---- */
+  var liveOverlay=null, liveSpan=256;
+  function refreshLive(){
+    if(!document.getElementById('ly_live').checked || !state) return;
+    var x=state.x, z=state.z, h=liveSpan/2;
+    var bounds=[ w2ll(x-h, z-h), w2ll(x+h, z+h) ];
+    var url=api('/viewer/map?size='+liveSpan)+'&t='+Date.now();
+    if(!liveOverlay){ liveOverlay=L.imageOverlay(url, bounds, {pane:'liverender', opacity:.92, interactive:false}); liveOverlay.addTo(map); }
+    else { liveOverlay.setBounds(bounds); liveOverlay.setUrl(url); }
   }
 
-  /* ---- SSE telemetry ---- */
-  var es=null;
+  /* ---- bot + entity markers ---- */
+  var entRenderer=L.canvas({pane:'entities', padding:.5});
+  var entGroup=L.layerGroup().addTo(map);
+  var botIcon=L.divIcon({className:'', html:'<div class="botmk"><div class="ring"></div><div class="core"></div><div class="nm" id="botnm">—</div></div>', iconSize:[0,0]});
+  var botMarker=L.marker(w2ll(0,0), {icon:botIcon, interactive:false, keyboard:false, zIndexOffset:1000});
+  var destMarker=null;
+  function hostile(t){ return /ZOMBIE|SKELET|CREEPER|WITHER|BLAZE|PIGLIN|HOGLIN|GHAST|ENDERMAN|SPIDER|SLIME|MAGMA|VEX|VINDICATOR|PILLAGER|RAVAGER|WARDEN|PHANTOM|DROWNED|HUSK|STRAY|GUARDIAN|SHULKER|WITCH/i.test(t||''); }
+  function entStyle(t){ t=(t||'').toUpperCase();
+    if(t.indexOf('PLAYER')>=0) return {r:5,color:'#0b1018',weight:1,fillColor:'#5cc8ff',fillOpacity:1};
+    if(t.indexOf('ITEM')>=0)   return {r:3,color:'#0b1018',weight:1,fillColor:'#ffb454',fillOpacity:.9};
+    return hostile(t) ? {r:4,color:'#0b1018',weight:1,fillColor:'#ff5d5d',fillOpacity:1}
+                      : {r:4,color:'#0b1018',weight:1,fillColor:'#9fe089',fillOpacity:.95}; }
+  function drawEntities(s){
+    entGroup.clearLayers();
+    (s.entities||[]).forEach(function(e){
+      var st=entStyle(e.type);
+      var m=L.circleMarker(w2ll(e.x, e.z), {renderer:entRenderer, radius:st.r, color:st.color, weight:st.weight, fillColor:st.fillColor, fillOpacity:st.fillOpacity, interactive:false});
+      entGroup.addLayer(m);
+    });
+  }
+
+  /* ---------------- telemetry (SSE) ---------------- */
+  var state=null, follow=true, didInitView=false, es=null;
+  function setConn(on){ document.getElementById('conn').classList.toggle('on', !!on); }
   function startStream(){
     try{ es=new EventSource(api('/viewer/stream')); }catch(e){ return; }
     es.onmessage=function(ev){ try{ onState(JSON.parse(ev.data)); }catch(e){} };
     es.onerror=function(){ setConn(false); };
   }
-  function setConn(on){ document.getElementById('conn').classList.toggle('on', !!on); }
   function onState(s){
     state=s; setConn(true);
-    document.getElementById('offline').style.display='none';
-    document.getElementById('botnm').textContent=(INST||'bot')+' · '+Math.round(s.x)+', '+Math.round(s.y)+', '+Math.round(s.z);
-    document.getElementById('coordlbl').textContent=prettyDim(s.dimension)+' · ● live · '+(s.entities&&s.entities.length||0)+' nearby';
-    updateVitals(s);
-    drawEntities(s);
-  }
-  function updateVitals(s){
+    var nd=dimId(s.dimension);
+    if(nd!==DIM){ DIM=nd; satLayer.redraw(); obsLayer.redraw(); newLayer.redraw(); didInitView=false; }
+    var ll=w2ll(s.x, s.z);
+    botMarker.setLatLng(ll); if(!map.hasLayer(botMarker)) botMarker.addTo(map);
+    var bn=document.getElementById('botnm'); if(bn) bn.textContent=(INST||'bot')+' · '+Math.round(s.x)+', '+Math.round(s.y)+', '+Math.round(s.z);
     document.getElementById('vitals').innerHTML=
       '<span class="hp">♥ '+Math.round(s.health||0)+'</span>'+
       '<span class="fd">🍗 '+Math.round(s.food||0)+'</span>'+
       '<span class="ps">⌖ '+Math.round(s.x)+', '+Math.round(s.y)+', '+Math.round(s.z)+'</span>'+
-      '<span>'+prettyDim(s.dimension)+'</span>';
-  }
-  function drawEntities(s){
-    var box=document.getElementById('ents'); box.innerHTML='';
-    if(!s.entities) return;
-    var sp=span(), frag=document.createDocumentFragment();
-    s.entities.forEach(function(e){
-      var px=50+((e.x-s.x)/sp)*100, py=50+((e.z-s.z)/sp)*100;
-      if(px<-2||px>102||py<-2||py>102) return;
-      var d=document.createElement('div'); d.className='ent '+entClass(e.type);
-      d.style.left=px+'%'; d.style.top=py+'%'; d.title=e.type||''; frag.appendChild(d);
-    });
-    box.appendChild(frag);
+      '<span>'+prettyDim(DIM)+'</span>';
+    drawEntities(s);
+    if(!didInitView){ didInitView=true; map.setView(ll, Math.max(map.getZoom(), 9), {animate:false}); }
+    else if(follow){ map.panTo(ll, {animate:true, duration:.5}); }
   }
 
-  /* ---- click → Elytra destination ---- */
-  mapEl.addEventListener('click', function(ev){
+  /* ---------------- coordinate readout + click-to-fly ---------------- */
+  var coordlbl=document.getElementById('coordlbl');
+  map.on('mousemove', function(ev){
+    var w=ll2w(ev.latlng);
+    var live = state ? ' · ● live · '+((state.entities&&state.entities.length)||0)+' nearby' : ' · ○ no bot feed';
+    coordlbl.innerHTML='<b>'+w.x+', '+w.z+'</b> · '+prettyDim(DIM)+live;
+  });
+  map.on('click', function(ev){
     if(!state){ return; }
-    var r=mapEl.getBoundingClientRect();
-    var fx=(ev.clientX-r.left)/r.width, fy=(ev.clientY-r.top)/r.height;
-    var sp=span();
-    var wx=Math.round(state.x+(fx-.5)*sp), wz=Math.round(state.z+(fy-.5)*sp);
-    var d=document.getElementById('dest'); d.style.display='block'; d.style.left=(fx*100)+'%'; d.style.top=(fy*100)+'%';
-    var dim=(state.dimension||'').toLowerCase();
-    var dd=dim.indexOf('nether')>=0?'nether':dim.indexOf('end')>=0?'end':'overworld';
+    var w=ll2w(ev.latlng);
+    if(!destMarker){ destMarker=L.marker(ev.latlng, {icon:L.divIcon({className:'destmk', iconSize:[16,16]}), interactive:false}).addTo(map); }
+    else destMarker.setLatLng(ev.latlng);
+    var dd = DIM===1?'nether':DIM===2?'end':'overworld';
     var ro=document.getElementById('readout');
-    ro.innerHTML='<b>Destination</b> <span class="mono">'+wx+', ~'+Math.round(state.y)+', '+wz+'</span> '+
+    ro.innerHTML='<b>Destination</b> <span class="mono">'+w.x+', ~'+Math.round(state.y)+', '+w.z+'</span> '+
       '<button class="go" id="send">▶ Send to Elytra</button><button id="clr">clear</button>';
     document.getElementById('send').onclick=function(){
-      runCommand('fly trip '+dd+' '+wx+' '+wz).then(function(){
-        ro.innerHTML='✅ Sent to Elytra Autopilot — flying to '+wx+', '+wz+' ('+dd+').';
+      runCommand('fly trip '+dd+' '+w.x+' '+w.z).then(function(){
+        ro.innerHTML='✅ Sent to Elytra Autopilot — flying to '+w.x+', '+w.z+' ('+dd+').';
       }).catch(function(e){ ro.innerHTML='⚠ '+(e.message||'failed to send'); });
     };
-    document.getElementById('clr').onclick=function(){ d.style.display='none'; ro.textContent='Click the map to set an Elytra destination.'; };
+    document.getElementById('clr').onclick=function(){ if(destMarker){ map.removeLayer(destMarker); destMarker=null; } ro.textContent='Click the map to set an Elytra destination.'; };
   });
   function runCommand(cmd){
     return fetch(api('/control/command'), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd})})
       .then(function(r){ if(r.status===403) throw new Error('control disabled on this bot'); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
   }
 
-  /* ---- zoom ---- */
-  document.getElementById('zoomin').onclick=function(){ if(zi>0){ zi--; refreshMap(); if(state) drawEntities(state); } };
-  document.getElementById('zoomout').onclick=function(){ if(zi<SIZES.length-1){ zi++; refreshMap(); if(state) drawEntities(state); } };
+  /* ---------------- follow / recenter ---------------- */
+  map.on('dragstart', function(){ follow=false; document.getElementById('ly_follow').checked=false; });
+  document.getElementById('recenter').onclick=function(){
+    follow=true; document.getElementById('ly_follow').checked=true;
+    if(state) map.setView(w2ll(state.x,state.z), Math.max(map.getZoom(),9), {animate:true});
+  };
 
-  /* ---- boot ---- */
-  if(!INST && !MOCK && !DIRECT){ document.getElementById('coordlbl').textContent='no bot selected (missing ?inst=)'; }
-  refreshMap(); setInterval(refreshMap, 2000);
+  /* ---------------- layer toggles ---------------- */
+  function bindLayer(id, layer){
+    var cb=document.getElementById(id);
+    cb.onchange=function(){ if(cb.checked) layer.addTo(map); else map.removeLayer(layer); if(id==='ly_grid'&&cb.checked) rebuildGrid(); };
+  }
+  bindLayer('ly_sat', satLayer);
+  bindLayer('ly_obs', obsLayer);
+  bindLayer('ly_new', newLayer);
+  bindLayer('ly_hwy', hwyGroup);
+  document.getElementById('ly_grid').onchange=function(){ if(this.checked){ gridGroup.addTo(map); rebuildGrid(); } else map.removeLayer(gridGroup); };
+  document.getElementById('ly_live').onchange=function(){ if(this.checked){ refreshLive(); } else if(liveOverlay){ map.removeLayer(liveOverlay); liveOverlay=null; } };
+  document.getElementById('ly_follow').onchange=function(){ follow=this.checked; if(follow&&state) map.setView(w2ll(state.x,state.z), Math.max(map.getZoom(),9), {animate:true}); };
+
+  /* ---------------- boot ---------------- */
+  if(!INST && !MOCK && !DIRECT){ coordlbl.textContent='no bot selected (missing ?inst=)'; }
   startStream();
-  // if nothing arrives shortly, surface the offline hint
-  setTimeout(function(){ if(!state && !mapOk) document.getElementById('offline').style.display='flex'; }, 4000);
+  setInterval(refreshLive, 2000);
 })();
 </script>
 </body></html>

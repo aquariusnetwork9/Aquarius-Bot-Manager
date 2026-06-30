@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.18.2"
+__version__ = "3.19.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3288,6 +3288,64 @@ def redeem_invite(cfg, token, username, password):
 # settings.public_share and feeds its URL to share_base_url(). Secrets in the
 # per-provider config are b64-obfuscated at rest (same as the Webshare token).
 _AQ_DIR = os.path.join(os.path.expanduser("~"), ".aquarius")
+
+# ---- 2b2t.place satellite-tile proxy (bounded on-demand cache) --------------
+# The fullscreen control map pulls its zoom-out "satellite" base from 2b2t.place's
+# public tile pyramid (their /tiles/<layer>/<lod>/<dim>/<sx>/<sy>/t.<tx>.<ty>.webp).
+# We deliberately NEVER mirror the ~24 TB dataset: a tile is fetched on demand the
+# first time it scrolls into view, then kept in a hard-capped LRU on disk so panning
+# an area twice is cheap without the cache ever growing unbounded. Tune/disable with
+# ABM_TILECACHE_MB (0 = pure pass-through, nothing written to disk).
+MAP_TILE_HOST = os.environ.get("ABM_TILE_HOST", "https://2b2t.place").rstrip("/")
+MAP_TILE_LAYERS = ("base", "overlay", "newchunks")
+MAP_TILE_CACHE_DIR = os.path.join(_AQ_DIR, "map-tile-cache")
+try:
+    MAP_TILE_CACHE_MB = max(0, int(os.environ.get("ABM_TILECACHE_MB", "64")))
+except ValueError:
+    MAP_TILE_CACHE_MB = 64
+MAP_TILE_MAX_FILES = 24000          # also cap inode count (void region = many 0-byte misses)
+MAP_TILE_MISS_TTL = 3600            # re-check "void" tiles at most hourly
+MAP_TILE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+# 1x1 transparent PNG — served for void/missing tiles so the browser <img> loads
+# cleanly (no console errors) and shows nothing rather than a broken-image icon.
+_MAP_TILE_BLANK = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+_MAP_TILE_LOCK = threading.Lock()
+
+
+def _map_tile_evict():
+    """Trim the on-disk tile cache to MAP_TILE_CACHE_MB / MAP_TILE_MAX_FILES (LRU by mtime).
+    A cheap single dir scan, run under _MAP_TILE_LOCK after a miss writes a new tile."""
+    cap = MAP_TILE_CACHE_MB * 1024 * 1024
+    try:
+        entries, total = [], 0
+        with os.scandir(MAP_TILE_CACHE_DIR) as it:
+            for e in it:
+                try:
+                    if not e.is_file():
+                        continue
+                    st = e.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, e.path))
+                total += st.st_size
+        if total <= cap and len(entries) <= MAP_TILE_MAX_FILES:
+            return
+        entries.sort()                                   # oldest first
+        i = 0
+        while i < len(entries) and (total > cap or (len(entries) - i) > MAP_TILE_MAX_FILES):
+            mt, sz, p = entries[i]
+            try:
+                os.remove(p)
+                total -= sz
+            except OSError:
+                pass
+            i += 1
+    except FileNotFoundError:
+        pass
+
+
 _CF_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 _CF_DL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 _CF_BIN = ("/usr/local/bin/cloudflared", "/usr/bin/cloudflared")
@@ -5491,6 +5549,8 @@ class Handler(BaseHTTPRequestHandler):
             return ("inst", name, "view") if name else None
         if path.startswith("/control/"):        # static js/html asset, no bot data
             return ("open",)
+        if path.startswith("/api/map/"):         # public satellite tiles, no bot data
+            return ("open",)
         m = self._INST_RE.match(path)
         if m:
             tier = self._inst_tier(m.group(2), method)
@@ -5814,7 +5874,8 @@ class Handler(BaseHTTPRequestHandler):
     CONTROL_STYLES = {"v1": "index.html", "v2": "v2.html", "v3": "v3.html"}
     CONTROL_ASSETS = {"abm-control-data.js", "abm-item-catalog.js", "control-live.js",
                       "index.html", "v2.html", "v3.html",
-                      "control-v4-spatial-map.html"}
+                      "control-v4-spatial-map.html",
+                      "leaflet.js", "leaflet.css"}
 
     def _control_dir(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "control")
@@ -5851,6 +5912,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "not found"}, 404)
         ctype = ("application/javascript; charset=utf-8" if rel.endswith(".js")
                  else "text/html; charset=utf-8" if rel.endswith(".html")
+                 else "text/css; charset=utf-8" if rel.endswith(".css")
                  else "application/octet-stream")
         try:
             with open(fp, "rb") as f:
@@ -5925,6 +5987,115 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _tile_blank(self, max_age=600):
+        """Serve the 1x1 transparent PNG for void/missing tiles."""
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(_MAP_TILE_BLANK)))
+        self.send_header("Cache-Control", "public, max-age=%d" % max_age)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(_MAP_TILE_BLANK)
+
+    def _map_tile_proxy(self, path):
+        """Serve a 2b2t.place satellite tile through the bounded on-demand cache (see MAP_TILE_*).
+        Path: /api/map/tile/<layer>/<lod>/<dim>/<tx>/<ty>. Every component is strictly bounded and the
+        super-tile folder is recomputed here, so the upstream URL is never attacker-shaped (no SSRF)."""
+        parts = path.split("/")
+        # ['', 'api', 'map', 'tile', layer, lod, dim, tx, ty]
+        if len(parts) != 9:
+            return self._json({"error": "not found"}, 404)
+        layer = parts[4]
+        if layer not in MAP_TILE_LAYERS:
+            return self._json({"error": "bad layer"}, 400)
+        try:
+            lod, dim, tx, ty = int(parts[5]), int(parts[6]), int(parts[7]), int(parts[8])
+        except (ValueError, TypeError):
+            return self._json({"error": "bad tile coords"}, 400)
+        if not (0 <= lod <= 10 and 0 <= dim <= 2 and abs(tx) < (1 << 25) and abs(ty) < (1 << 25)):
+            return self._json({"error": "tile out of range"}, 400)
+        # super-tile folder: truncate toward zero to match the site's `(t/32)>>0`
+        sx, sy = int(tx / 32), int(ty / 32)
+        rel = "%s/%d/%d/%d/%d/t.%d.%d.webp" % (layer, lod, dim, sx, sy, tx, ty)
+        upstream = "%s/tiles/%s" % (MAP_TILE_HOST, rel)
+        key = hashlib.sha1(rel.encode()).hexdigest()
+        cpath = os.path.join(MAP_TILE_CACHE_DIR, key + ".webp")
+        mpath = cpath + ".miss"
+
+        body = None
+        if MAP_TILE_CACHE_MB > 0:
+            try:
+                with open(cpath, "rb") as f:
+                    body = f.read()
+                os.utime(cpath, None)                     # bump LRU mtime
+            except OSError:
+                body = None
+            if body is None:
+                try:
+                    if time.time() - os.path.getmtime(mpath) < MAP_TILE_MISS_TTL:
+                        return self._tile_blank()          # fresh negative cache → void
+                except OSError:
+                    pass
+
+        if body is None:                                   # cache miss → fetch upstream
+            try:
+                req = urllib.request.Request(
+                    upstream, headers={"User-Agent": MAP_TILE_UA, "Accept": "image/webp,image/*,*/*"})
+                resp = urllib.request.urlopen(req, timeout=8)
+                data = resp.read()
+                ctype = resp.headers.get("Content-Type", "")
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 404, 204, 410):
+                    self._tile_mark_miss(mpath)
+                    return self._tile_blank()
+                self.send_response(502); self.send_header("Content-Length", "0"); self.end_headers()
+                return
+            except Exception:
+                self.send_response(502); self.send_header("Content-Length", "0"); self.end_headers()
+                return
+            if not data or "image" not in ctype:
+                self._tile_mark_miss(mpath)
+                return self._tile_blank()
+            body = data
+            if MAP_TILE_CACHE_MB > 0:
+                self._tile_store(cpath, mpath, body)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/webp")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _tile_mark_miss(self, mpath):
+        if MAP_TILE_CACHE_MB <= 0:
+            return
+        try:
+            os.makedirs(MAP_TILE_CACHE_DIR, exist_ok=True)
+            with open(mpath, "wb"):
+                pass                                       # 0-byte marker, mtime = now
+            with _MAP_TILE_LOCK:
+                _map_tile_evict()
+        except OSError:
+            pass
+
+    def _tile_store(self, cpath, mpath, body):
+        try:
+            os.makedirs(MAP_TILE_CACHE_DIR, exist_ok=True)
+            tmp = "%s.tmp-%d" % (cpath, threading.get_ident())
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.replace(tmp, cpath)
+            try:
+                os.remove(mpath)                           # clear any stale negative marker
+            except OSError:
+                pass
+        except OSError:
+            return
+        with _MAP_TILE_LOCK:
+            _map_tile_evict()
 
     def _control_post_allowed(self, princ, sub, data, name):
         """Fine-grained authorization for a named user's control POST (toggles / free-form commands /
@@ -6120,6 +6291,10 @@ class Handler(BaseHTTPRequestHandler):
         # let _viewer_stream pick its upstream (the selected box's manager, else the local bot).
         if path.startswith("/api/instances/") and path.endswith("/viewer/stream"):
             return self._viewer_stream(path, q, node)
+        # Satellite tiles are global public map data (no bot/node context): serve them from
+        # whichever box the browser is already talking to, never hop to a selected node.
+        if path.startswith("/api/map/tile/"):
+            return self._map_tile_proxy(path)
         if node is not None and not self._is_switcher_path(path):
             return self._proxy_to_node(node)
 
