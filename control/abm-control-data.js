@@ -761,7 +761,11 @@ const ABMTrade = {
     if(f==='get'){ const e=this._entries({prof:this.state.prof,give1:this.state.give1,get:v})[0]; if(e) this.state.give2=this._g2(e); }
     this._repair(); this._render(); },
   load(ref){ this.state={prof:ref.prof,give1:ref.give1,give2:ref.give2||'__none',get:ref.get,bookEnch:ref.ench||'Mending'}; this._repair(); this._render(); },
-  _render(){ const el=document.getElementById('tradeBox'); if(el) el.innerHTML=this.html(); },
+  /* Re-render EVERY #tradeBox, not just the first. The trader page renders a builder card (builder:'trade')
+     AND the "New/Edit trade" modal renders another — two elements share id "tradeBox". getElementById returns
+     only the first (the page card), so changing the villager in the MODAL updated state but left the modal's
+     dropdowns frozen on the librarian default. Updating all keeps whichever one you're using in sync. */
+  _render(){ const h=this.html(); const els=document.querySelectorAll('#tradeBox'); for(let i=0;i<els.length;i++) els[i].innerHTML=h; },
   box(){ return `<div id="tradeBox">${this.html()}</div>`; },
   _ico(id){ return (id&&id!=='__none') ? icon(id,id,22) : `<span class="ii" style="opacity:.35;font-size:.7rem">∅</span>`; },
   _outIco(name){ const e=TRADE_CATALOG.find(x=>this.outName(x)===name); return e?icon(e.o[0],name,22):this._ico('__none'); },
