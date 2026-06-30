@@ -365,7 +365,7 @@ const MODULES = [
   ]},
 { id:'actionlimiter', name:'Action Limiter', raw:'ActionLimiter', icon:'⛔', cat:'connection',
   tag:'Locks down what the account may do (movement, interactions, illegal items)', status:'idle', sdot:'warn', enabled:false,
-  metric:'Disabled · 13 illegal items listed · movement ≤ 1000 from home',
+  metric:'Disabled · no illegal items listed · movement ≤ 1000 from home',
   actions:[['','💾 Save']],
   groups:[
     {title:'Limiter', open:true, rows:[T('Enabled','toggle',false),T('Exempt the proxy account','toggle',false)]},
@@ -847,7 +847,10 @@ function mkPicker(name, catalog, sel, label){ return { name:name, catalog:catalo
       '</div>'+(avail.length?add:'')+'</div>';
   } }; }
 const ABMPickers = {
-  illegals: mkPicker('illegals', ILLEGAL_ITEMS, ['command_block','chain_command_block','repeating_command_block','command_block_minecart','barrier','structure_block','jigsaw','light','spawner','bedrock','end_portal_frame','debug_stick','knowledge_book'], '+ add illegal item…'),
+  // Default to NO illegal items: 2b2t (anarchy) allows basically any item, so the limiter
+  // shouldn't pre-block command blocks/barriers/spawners/etc. The ILLEGAL_ITEMS catalog stays
+  // available in the "+ add" dropdown for anyone who deliberately wants to restrict an item.
+  illegals: mkPicker('illegals', ILLEGAL_ITEMS, [], '+ add illegal item…'),
   foods:    mkPicker('foods', FOOD_ITEMS, ['golden_carrot','cooked_beef','bread'], '+ add food…'),
   dropjunk: mkPicker('dropjunk', JUNK_ITEMS, ['cobblestone','dirt','gravel','netherrack','rotten_flesh'], '+ add junk item…'),
   ores:     mkPicker('ores', ORE_TARGETS, ORE_TARGETS.slice(), '+ add ore target…'),

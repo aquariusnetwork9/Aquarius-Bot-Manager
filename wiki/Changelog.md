@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.19.0 — *latest*
+## v3.19.1 — *latest*
+
+- **Action Limiter no longer pre-lists "illegal" items.** The module's illegal-items picker shipped with 13 items (command blocks, barrier, spawner, bedrock, debug stick, …) pre-selected — but 2b2t (anarchy) allows basically any item, and the bot's real blacklist defaults empty. The card now starts with **no illegal items listed**; the catalog stays in the **+ add illegal item** dropdown for anyone who deliberately wants to restrict one.
+
+## v3.19.0
 
 - **Fullscreen world map, rebuilt as a live satellite map.** The ⛶ Fullscreen map is now a full Leaflet slippy-map with a **"satellite" base layer** rendered from the [2b2t.place](https://2b2t.place) tile snapshot of the greater-spawn region — pan and **zoom out to Xaero World-Map scale** (the whole ±500k spawn area) or in to ~1 block/pixel. A **Layers** panel toggles **Satellite** terrain, an **Obsidian** overlay, **New chunks**, the bot's own **Live render**, a world-aligned **Grid**, and **Highways** (Xaero-style vector lines for the 8 nether roads — axes + diagonals from origin). The map **follows the bot** (unlocks on drag; ⌖ Recenter re-locks), keeps the live entity overlay + click-to-set-an-Elytra-destination, and switches dimension with the bot (Overworld / Nether / End).
   - **The ~24 TB snapshot is never stored on your VPS.** Tiles are fetched on demand the first time they scroll into view and kept in a **hard-capped LRU disk cache** (default 64 MB via `ABM_TILECACHE_MB`; `0` = pure pass-through) — so a panned-over area is instant, the cache can't grow unbounded, and void tiles are negative-cached. The tile proxy (`/api/map/tile/…`) is SSRF-guarded and served by whichever box your browser is on; `?tilesrc=direct` bypasses the VPS and pulls tiles straight to the browser.
