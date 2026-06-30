@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.14.1"
+__version__ = "3.14.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -9770,7 +9770,11 @@ function vwBuildMesh(buf){
   const pos=[], col=[];
   for(let y=0;y<sy;y++) for(let z=0;z<sz;z++) for(let x=0;x<sx;x++){
     const id=vox[(y*sz+z)*sx+x]; if(!id) continue;
-    const pr=pal[id*3], pg=pal[id*3+1], pb=pal[id*3+2], wx=ox+x, wy=oy+y, wz=oz+z;
+    // vertices are LOCAL to the box origin (0..96), not world coords. At a far-out 2b2t base the
+    // world coords are in the millions; baking them into float32 vertices + the view matrix blows
+    // past float precision (and mediump in the fragment stage), which garbles the whole POV. We add
+    // the origin back on the camera side instead (see vwPovRender), keeping every GPU value small.
+    const pr=pal[id*3], pg=pal[id*3+1], pb=pal[id*3+2], wx=x, wy=y, wz=z;
     for(const f of VW_FACES){
       const fx=x+f.n[0], fy=y+f.n[1], fz=z+f.n[2];
       if(at(fx,fy,fz)) continue;                 // face hidden by a neighbour
@@ -9796,12 +9800,15 @@ function vwBuildMesh(buf){
   gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufPos); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, vwGL.bufCol); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(col), gl.STATIC_DRAW);
   vwGL.count=pos.length/3;
-  vwBox={cx:ox+sx/2, cz:oz+sz/2, sx:sx};
+  vwBox={cx:ox+sx/2, cz:oz+sz/2, sx:sx, ox:ox, oy:oy, oz:oz};   // ox/oy/oz: origin to rebase the camera onto
 }
 function vwPovRender(){
   if(!vwGL) return;
   const gl=vwGL.gl, cv=$('vwPov');
-  const ex=vwRender.x+0.5, ey=vwRender.y+1.62, ez=vwRender.z+0.5;
+  // rebase the camera into the mesh's LOCAL space (origin = vwBox.ox/oy/oz) so we never feed
+  // million-scale world coords to the GPU — that's what garbles the POV at a far-out base.
+  const bx=vwBox?vwBox.ox:0, by=vwBox?vwBox.oy:0, bz=vwBox?vwBox.oz:0;
+  const ex=(vwRender.x-bx)+0.5, ey=(vwRender.y-by)+1.62, ez=(vwRender.z-bz)+0.5;
   const yaw=vwRender.yaw*Math.PI/180, pit=vwRender.pitch*Math.PI/180;
   const lx=-Math.sin(yaw)*Math.cos(pit), ly=-Math.sin(pit), lz=Math.cos(yaw)*Math.cos(pit);
   let eye, ctr;
