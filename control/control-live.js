@@ -527,6 +527,36 @@
       .catch(function(e){ if(el) el.classList.remove('lcBusy'); toast(path.split('.').pop()+': '+e.message,'err',4200); });
   }
 
+  /* ---- live list/set pickers (chip + dropdown) wired to the bot's real config ----
+     The Action Limiter illegal-items, Auto Eat foods, Auto Miner ore targets, and Auto Drop
+     list are populated mockup pickers; lockConfig() freezes them as a read-only overview.
+     Here we bind each to its REAL config field: show the bot's live list and persist every
+     add/remove through the config op API. Needs AquariusProxy 5.12.2+ (string set add/remove +
+     list remove-by-value); on older bots / unmapped fields the picker stays read-only. */
+  var PICKER_PATHS = {
+    ores:     'client.extra.aquariusMiner.oreTargets',     // List<String>
+    dropjunk: 'client.extra.autoDrop.items',               // List<String>
+    foods:    'client.extra.autoEat.foods',                // Set<String>
+    illegals: 'client.extra.actionLimiter.itemsBlacklist'  // Set<String>
+  };
+  function wireLivePickers(){
+    if(!LIVE.config || typeof ABMPickers==='undefined') return;
+    var canCfg=moduleConfig(cur);
+    Object.keys(PICKER_PATHS).forEach(function(name){
+      var host=document.getElementById('pick_'+name); if(!host) return;   // this picker isn't on the current page
+      var pk=ABMPickers[name]; if(!pk) return;
+      var arr=getPath(LIVE.config, PICKER_PATHS[name]);
+      if(!Array.isArray(arr)) return;                                      // bot doesn't expose this field — leave read-only
+      pk.sel=arr.slice();                                                  // show the bot's REAL list
+      pk.onChange = canCfg ? (function(p){ return function(op,id){ leMutate(op, p, { value:id }).catch(function(){}); }; })(PICKER_PATHS[name]) : null;
+      pk._render();                                                        // redraw: live data + a fresh, enabled dropdown
+      if(!canCfg){                                                         // no config grant: read-only, but still show live data
+        var s=host.querySelector('select'); if(s){ s.setAttribute('disabled','disabled'); s.style.opacity='.65'; }
+        [].forEach.call(host.querySelectorAll('.ilchip .x'), function(x){ x.style.pointerEvents='none'; x.style.opacity='.65'; });
+      }
+    });
+  }
+
   function injectLiveConfigCss(){
     if($('#lcCss')) return;
     var s=document.createElement('style'); s.id='lcCss';
@@ -1602,6 +1632,7 @@
     wireActions();
     lockConfig();
     buildLiveConfig();
+    wireLivePickers();                                             // make the chip+dropdown pickers live + persistent
     if(cur==='trader'){ buildListEditor(); buildGroupsPanel(); }   // trader: trades editor (right) + groups (left)
     else if(cur==='kitmaker'){ buildKitMaker(); }                 // kit maker: live grid (left) + setup/status (right)
     else if(LIST_EDITORS[cur]){ buildLeftLiveList(LIST_EDITORS[cur]); }  // elytra/pearl: live list in the nice left panel

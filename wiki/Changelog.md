@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.19.1 — *latest*
+## v3.20.0 — *latest*
+
+- **The item-list pickers are now live and editable.** The populated chip + dropdown pickers on **Action Limiter** (illegal items), **Auto Eat** (food list), **Auto Miner** (ore targets), and **Auto Drop** (drop list) were a read-only mockup — the "+ add item" dropdown did nothing. They now bind to the bot's **real config field**: each shows the bot's actual list and **adding/removing an item persists immediately** to the running bot (gated by the per-module **config** permission; read-only without it). Requires **AquariusProxy 5.12.2+** — its `/control/config` op API now handles string **Set** fields (`itemsBlacklist`, `foods`) and list **remove-by-value**, which it previously couldn't edit at all. Older bots / unmapped fields stay read-only.
+
+## v3.19.1
 
 - **Action Limiter no longer pre-lists "illegal" items.** The module's illegal-items picker shipped with 13 items (command blocks, barrier, spawner, bedrock, debug stick, …) pre-selected — but 2b2t (anarchy) allows basically any item, and the bot's real blacklist defaults empty. The card now starts with **no illegal items listed**; the catalog stays in the **+ add illegal item** dropdown for anyone who deliberately wants to restrict one.
 

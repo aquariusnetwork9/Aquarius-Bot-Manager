@@ -834,8 +834,10 @@ const RISKY_FOODS = ['rotten_flesh','spider_eye','poisonous_potato','pufferfish'
 function mkPicker(name, catalog, sel, label){ return { name:name, catalog:catalog, sel:sel.slice(), label:label||'+ add item…',
   box(){ return '<div id="pick_'+this.name+'">'+this.html()+'</div>'; },
   _render(){ var el=document.getElementById('pick_'+this.name); if(el) el.innerHTML=this.html(); },
-  add(id){ if(id && this.sel.indexOf(id)<0) this.sel.push(id); this._render(); },
-  remove(id){ this.sel=this.sel.filter(function(x){return x!==id;}); this._render(); },
+  // onChange(op,id) — set by the live brain (control-live.js) to persist a real add/remove to the
+  // bot's config; unset = mockup-only (visual). Only fires on an actual change.
+  add(id){ if(id && this.sel.indexOf(id)<0){ this.sel.push(id); this._render(); if(this.onChange) this.onChange('add', id); } },
+  remove(id){ if(this.sel.indexOf(id)<0) return; this.sel=this.sel.filter(function(x){return x!==id;}); this._render(); if(this.onChange) this.onChange('remove', id); },
   html(){ var n=this.name, self=this;
     var chips=this.sel.map(function(id){ return '<span class="ilchip">'+icon(id,id,18)+pretty(id)+
       '<span class="x" onclick="ABMPickers[\''+n+'\'].remove(\''+id+'\')">×</span></span>'; }).join('');
