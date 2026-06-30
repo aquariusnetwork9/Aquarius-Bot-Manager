@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.15.1"
+__version__ = "3.18.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -774,8 +774,8 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
     ptype: if set, write proxy.type (e.g. 'HTTP'/'SOCKS5').
     clear_auth: wipe user/password on each target (IP-authorization mode).
     Returns a list of per-target result dicts."""
-    if mode not in ("roundrobin", "same", "random"):
-        raise ValueError("mode must be 'roundrobin', 'same', or 'random'")
+    if mode not in ("roundrobin", "same", "random", "random_unique"):
+        raise ValueError("mode must be 'roundrobin', 'same', 'random', or 'random_unique'")
     parsed = [_parse_proxy_entry(p) for p in (proxies or [])]
     if not parsed:
         raise ValueError("no proxies provided")
@@ -802,10 +802,45 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
         # unique sampling when the pool is large enough, else random with replacement
         chosen = (random.sample(parsed, len(insts)) if len(parsed) >= len(insts)
                   else [random.choice(parsed) for _ in range(len(insts))])
+    elif mode == "random_unique":
+        # Globally-unique: each target gets a DISTINCT IP that no OTHER bot (outside this batch)
+        # currently holds, and prefer an IP different from the target's own current one. If the free
+        # pool runs out, the remaining targets get None → reported as a clear failure (never a dup).
+        target_set = {ins["name"] for ins in insts}
+        taken, current = set(), {}
+        for other in cfg["instances"]:
+            pr = get_proxy(other)
+            h = str(pr["host"]) if pr.get("found") and pr.get("host") else None
+            if not h:
+                continue
+            if other["name"] in target_set:
+                current[other["name"]] = h          # freed, but used to prefer a NEW ip
+            else:
+                taken.add(h)                          # held by a bot we're not touching → off-limits
+        seen, avail = set(), []                       # dedup the pool by IP, drop taken IPs
+        for e in parsed:
+            h = e[0]
+            if h in taken or h in seen:
+                continue
+            seen.add(h); avail.append(e)
+        random.shuffle(avail)
+        chosen, used = [], set()
+        for ins in insts:
+            cur = current.get(ins["name"])
+            pick = next((e for e in avail if e[0] not in used and e[0] != cur), None)  # prefer a new IP
+            if pick is None:
+                pick = next((e for e in avail if e[0] not in used), None)              # else any free IP
+            if pick is not None:
+                used.add(pick[0])
+            chosen.append(pick)                       # may be None when the free pool is exhausted
     else:  # roundrobin
         chosen = [parsed[i % len(parsed)] for i in range(len(insts))]
     results = []
     for idx, inst in enumerate(insts):
+        if chosen[idx] is None:                       # random_unique ran out of free, unique IPs
+            results.append({"name": inst["name"], "ok": False,
+                            "error": "no free proxy left in the pool (every unique IP is already in use)"})
+            continue
         host, port, user, password = chosen[idx]
         if clear_auth:
             user = password = ""        # wipe stale creds for IP-auth proxies
@@ -857,6 +892,16 @@ def _webshare_token(cfg, token=None):
 
 def save_webshare_token(cfg, token):
     cfg["raw"].setdefault("settings", {}).setdefault("webshare", {})["token"] = _enc_token(token)
+    save_config(cfg)
+
+
+def get_proxy_pool(cfg):
+    """The remembered proxy pool (one host:port per line) used by the Proxies page's bulk/random tools."""
+    return (cfg["raw"].get("settings", {}) or {}).get("proxy_pool", "") or ""
+
+
+def save_proxy_pool(cfg, text):
+    cfg["raw"].setdefault("settings", {})["proxy_pool"] = (text or "").strip()
     save_config(cfg)
 
 
@@ -2813,6 +2858,8 @@ def audit_guest(entry):
 # request, so role/scope edits, disable, and delete take effect instantly.
 
 USER_ROLES = ("view", "operate", "config", "admin")
+# Roles assignable PER BOT (admin is account-wide only — it makes a second owner, not a per-bot grant).
+BOT_ROLES = ("view", "operate", "config")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,31}$")
 
 
@@ -2820,6 +2867,50 @@ def role_capability(role):
     """Map a role to its guest-style capability tier. Admin is owner-equivalent (handled separately);
     we report 'config' for completeness."""
     return "config" if role == "admin" else role
+
+
+def sanitize_targets(targets, default_role="view"):
+    """Coerce incoming targets into [{node, name, role}], one per bot, with a valid per-bot role.
+    Each bot the user is granted carries its OWN role (view/operate/config); missing/invalid roles
+    fall back to the account default. De-dupes by (node, name)."""
+    out, seen = [], set()
+    dr = default_role if default_role in BOT_ROLES else "view"
+    for t in (targets or []):
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name", "")).strip()
+        if not name:
+            continue
+        node = t.get("node") or None
+        key = (node, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        role = t.get("role")
+        out.append({"node": node, "name": name, "role": role if role in BOT_ROLES else dr})
+    return out
+
+
+def effective_role_for(u, node, name):
+    """The role a user actually has on one bot. Admin → 'admin' (full). Otherwise: the per-bot role of a
+    matching target (matched by name; node honored when both are set), else the account default role if the
+    user has `all`, else None (no access). Accepts a user record OR a principal scope dict (role/all/targets)."""
+    if u is None:
+        return None
+    if u.get("role") == "admin":
+        return "admin"
+    default = u.get("role") if u.get("role") in BOT_ROLES else "view"
+    for t in (u.get("targets") or []):
+        if t.get("name") != name:
+            continue
+        tn = t.get("node") or None
+        if tn is not None and node is not None and tn != node:
+            continue
+        r = t.get("role")
+        return r if r in BOT_ROLES else default
+    if u.get("all"):
+        return default
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3004,7 +3095,7 @@ def new_user(cfg, username, password, role, all_, targets):
         "hash": _hash_password(password, salt),
         "role": role,
         "all": True if role == "admin" else bool(all_),
-        "targets": [] if role == "admin" else (targets or []),
+        "targets": [] if role == "admin" else sanitize_targets(targets, role),
         "pwgen": 0,
         "disabled": False,
         "created": time.time(),
@@ -3050,7 +3141,7 @@ def update_user(cfg, uid, role=None, all_=None, targets=None, disabled=None, per
     if all_ is not None and u["role"] != "admin":
         u["all"] = bool(all_)
     if targets is not None and u["role"] != "admin":
-        u["targets"] = targets
+        u["targets"] = sanitize_targets(targets, u["role"])
     if disabled is not None:
         u["disabled"] = bool(disabled)
     if perms != "__keep__":
@@ -3101,7 +3192,7 @@ def new_invite(cfg, label, role, all_, targets, username, ttl_days):
         "label": (label or "").strip()[:80] or "Invite",
         "role": role,
         "all": True if role == "admin" else bool(all_),
-        "targets": [] if role == "admin" else (targets or []),
+        "targets": [] if role == "admin" else sanitize_targets(targets, role),
         "username": un or None,
         "created": now,
         "expires": (now + float(ttl_days) * 86400) if ttl_days else None,
@@ -5269,6 +5360,7 @@ class Handler(BaseHTTPRequestHandler):
                     role = u.get("role", "view")
                     return {"type": "user", "uid": u["id"], "username": u.get("username", ""),
                             "role": role, "perms": resolve_perms(role, u.get("perms")),
+                            "perms_raw": u.get("perms"),   # account-wide module grants; tier applied per-bot
                             "scope": {"targets": u.get("targets", []),
                                       "all": bool(u.get("all")) or role == "admin",
                                       "capability": role_capability(role)}}
@@ -5297,12 +5389,37 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return princ.get("type") == "user" and princ.get("role") == "admin"
 
-    def _cap_ok(self, princ, level):
+    def _user_scope(self, princ):
+        """A user principal as an effective_role_for-shaped dict (role default + all + per-bot targets)."""
+        sc = princ.get("scope") or {}
+        return {"role": princ.get("role"), "all": sc.get("all"), "targets": sc.get("targets")}
+
+    def _role_for(self, princ, name):
+        """The user's effective role on bot `name` (per-bot), or None. Owners → 'admin'."""
+        if self._is_owner(princ):
+            return "admin"
+        if princ and princ.get("type") == "user" and name:
+            return effective_role_for(self._user_scope(princ), None, name)
+        return None
+
+    def _perms_for(self, princ, name):
+        """Effective control perms on bot `name`: account-wide module grants resolved against THIS bot's role
+        tier. Owners/admins → full. Used for fine-grained config/console/lifecycle checks + the browser."""
+        if self._is_owner(princ):
+            return resolve_perms("admin", None)
+        r = self._role_for(princ, name) or "view"
+        return resolve_perms(r, princ.get("perms_raw"))
+
+    def _cap_ok(self, princ, level, name=None):
         if princ is None:
             return False
         if self._is_owner(princ):
             return True
-        return CAP_RANK.get(princ["scope"].get("capability"), -1) >= CAP_RANK.get(level, 99)
+        cap = (princ.get("scope") or {}).get("capability")
+        if name and princ.get("type") == "user":
+            r = self._role_for(princ, name)          # per-bot role drives the capability tier for this bot
+            cap = role_capability(r) if r else None
+        return CAP_RANK.get(cap, -1) >= CAP_RANK.get(level, 99)
 
     def _guest_target(self, princ, name):
         """For a guest, is `name` in scope and on which node? Returns (in_scope, node|None)."""
@@ -5320,8 +5437,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "forbidden"}, 403)
         return False
 
-    def _guard_cap(self, princ, level):
-        if self._cap_ok(princ, level):
+    def _guard_cap(self, princ, level, name=None):
+        if self._cap_ok(princ, level, name):
             return True
         self._json({"error": "forbidden"}, 403)
         return False
@@ -5398,12 +5515,12 @@ class Handler(BaseHTTPRequestHandler):
             ok, gnode = self._guard_target(princ, name)
             if not ok:
                 return False, None                  # 404 sent
-            if not self._guard_cap(princ, tier):
-                return False, None                  # 403 sent
+            if not self._guard_cap(princ, tier, name):
+                return False, None                  # 403 sent (per-bot role drives the tier)
             # fine-grained: a named user without the lifecycle grant can't start/stop/restart bots
             if princ.get("type") == "user":
                 action = path.rsplit("/", 1)[-1]
-                if action in ("start", "stop", "restart") and not (princ.get("perms") or {}).get("lifecycle"):
+                if action in ("start", "stop", "restart") and not self._perms_for(princ, name).get("lifecycle"):
                     self._json({"error": "forbidden"}, 403)
                     return False, None
             if method == "POST":                     # audit scoped mutations (best-effort)
@@ -5473,7 +5590,7 @@ class Handler(BaseHTTPRequestHandler):
                 .replace("__PRESET_USER__", inv.get("username") or ""))
         return self._html(html)
 
-    def _authstatus(self, cfg):
+    def _authstatus(self, cfg, inst=None):
         princ = self._principal(cfg)
         out = {"required": self._auth_required(cfg),
                "authed": princ is not None,
@@ -5488,12 +5605,19 @@ class Handler(BaseHTTPRequestHandler):
             out["username"] = princ.get("username")
             out["role"] = princ.get("role")
             out["is_admin"] = princ.get("role") == "admin"
-            out["capability"] = sc.get("capability")
             out["targets"] = sc.get("targets", [])
             out["all"] = sc.get("all", False)
-            # effective control permissions (control-live.js hides what isn't granted; server enforces)
             _u = find_user_by_id(cfg, princ.get("uid"))
-            out["perms"] = perms_public(princ.get("role"), _u.get("perms") if _u else None)
+            # When asked about a specific bot (the control plane passes ?inst=), report the user's effective
+            # role/capability/perms ON THAT BOT (per-bot roles). Otherwise report the account default.
+            if inst:
+                bot_role = effective_role_for(_u, None, inst) if _u else None
+                out["role"] = bot_role or princ.get("role")
+                out["capability"] = role_capability(bot_role) if bot_role else None
+                out["perms"] = perms_public(bot_role or "view", _u.get("perms") if _u else None)
+            else:
+                out["capability"] = sc.get("capability")
+                out["perms"] = perms_public(princ.get("role"), _u.get("perms") if _u else None)
         else:
             sc = princ["scope"]
             out["principal"] = "guest"
@@ -5688,7 +5812,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- live control surface (Mission Control) ----
     CONTROL_STYLES = {"v1": "index.html", "v2": "v2.html", "v3": "v3.html"}
-    CONTROL_ASSETS = {"abm-control-data.js", "control-live.js",
+    CONTROL_ASSETS = {"abm-control-data.js", "abm-item-catalog.js", "control-live.js",
                       "index.html", "v2.html", "v3.html",
                       "control-v4-spatial-map.html"}
 
@@ -5802,11 +5926,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _control_post_allowed(self, princ, sub, data):
+    def _control_post_allowed(self, princ, sub, data, name):
         """Fine-grained authorization for a named user's control POST (toggles / free-form commands /
         config writes). Owners/admins resolve to all-true perms so they pass. Guests never reach here as
-        'user'. Deny-by-default: a non-console user may only send an exact `<allowed-module> on|off`."""
-        perms = princ.get("perms") or {}
+        'user'. Deny-by-default: a non-console user may only send an exact `<allowed-module> on|off`.
+        Perms are resolved against the user's role ON THIS BOT (`name`), so per-bot roles apply."""
+        perms = self._perms_for(princ, name)
         can_use = perms.get("can_use") or (lambda _i: False)
         can_config = perms.get("can_config") or (lambda _i: False)
         try:
@@ -5856,7 +5981,7 @@ class Handler(BaseHTTPRequestHandler):
         data = self._read_body() if (is_post and self.command == "POST") else b"{}"
         if is_post and self.command == "POST":
             princ = self._principal(self._cfg())
-            if princ and princ.get("type") == "user" and not self._control_post_allowed(princ, sub, data):
+            if princ and princ.get("type") == "user" and not self._control_post_allowed(princ, sub, data, name):
                 return self._json({"error": "forbidden"}, 403)
         try:
             if is_post:
@@ -5958,7 +6083,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # whether auth is on, expose it so the login page can decide what to show
         if path == "/api/authstatus":
-            return self._authstatus(cfg)
+            return self._authstatus(cfg, (q.get("inst", [""])[0] or "").strip() or None)
 
         # share-link redemption: mints a scoped guest session (before the auth gate)
         msh = self._SHARE_RE.match(path)
@@ -6030,7 +6155,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"sessions": scan(self._cfg())})
 
         if path == "/api/proxies":
-            return self._json({"proxies": list_proxies(self._cfg())})
+            c = self._cfg()
+            return self._json({"proxies": list_proxies(c), "pool": get_proxy_pool(c)})
 
         if path == "/api/files":
             try:
@@ -6981,9 +7107,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/proxies/bulk":
             try:
                 p = json.loads(self._read_body() or b"{}")
+                pls = p.get("proxies") or []
                 res = set_proxies_bulk(
-                    cfg, p.get("targets") or [], p.get("proxies") or [],
+                    cfg, p.get("targets") or [], pls,
                     mode=p.get("mode", "roundrobin"), do_restart=bool(p.get("restart")))
+                if p.get("save_pool") and pls:                # remember the pool for next time
+                    try:
+                        save_proxy_pool(cfg, "\n".join(str(x) for x in pls))
+                    except Exception:
+                        pass
                 return self._json({"ok": True, "results": res})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
@@ -8438,8 +8570,11 @@ table.tbl tr:hover td{background:#ffffff05}
 body.guest .owner-only{display:none!important}
 /* hide per-card controls above the guest's tier (server enforces regardless) */
 body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap-config{display:none!important}
-.shbots{display:flex;flex-wrap:wrap;gap:.3rem .8rem;max-height:150px;overflow:auto}
-.shbot{display:flex;align-items:center;gap:.35rem;color:var(--txt);font-weight:400;font-size:.82rem}
+.shbots{display:flex;flex-direction:column;gap:.1rem;max-height:230px;overflow:auto;border:1px solid var(--line);border-radius:9px;padding:.3rem;background:#06090c}
+.shbot{display:flex;align-items:center;gap:.5rem;padding:.32rem .45rem;border-radius:7px;color:var(--txt);font-weight:400;font-size:.82rem;cursor:pointer}
+.shbot:hover{background:rgba(255,255,255,.05)}
+.shbot>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shbot .botrole{flex:none}
 .shrow{display:flex;align-items:center;gap:.6rem;border:1px solid var(--line);border-radius:8px;padding:.4rem .55rem}
 .rrow{display:flex;flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400}
 .shurl{border:1px solid var(--acc);border-radius:8px;padding:.5rem .6rem;background:color-mix(in srgb,var(--acc) 8%,transparent)}
@@ -8579,6 +8714,15 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     </div>
   </div>
 </div>
+<div class="scrim" id="eaScrim" onclick="closeEditAccess(event)">
+  <div class="modal" style="width:min(560px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead" id="eaTitle">Edit access</div>
+    <div class="hint" style="margin:-.3rem 0 .6rem">Change which bots this user can reach and their role on each. Admin = full control (a second owner); otherwise pick bots and set a role per bot.</div>
+    <div id="eaRole"></div>
+    <div id="eaScope"></div>
+    <div class="mbar" style="margin-top:.6rem"><span class="msg" id="eaMsg" style="flex:1;color:var(--dim)"></span><button class="go" onclick="saveEditAccess(this)">Save access</button></div>
+  </div>
+</div>
 <div class="scrim" id="permsScrim" onclick="closePerms(event)">
   <div class="modal" style="width:min(620px,94vw)" onclick="event.stopPropagation()">
     <div class="mhead" id="permsTitle">Permissions</div>
@@ -8591,7 +8735,8 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 </div>
 <div class="scrim" id="connScrim" onclick="closeConnection(event)">
   <div class="modal" style="width:min(560px,94vw)" onclick="event.stopPropagation()">
-    <div class="mhead">Connect / Reconnect</div>
+    <div class="mhead" id="connHead">Connect / Reconnect</div>
+    <div id="connForUser" style="display:none;font-size:.82rem;background:#3ddc970d;border:1px solid var(--acc-dim,#1f7a55);border-radius:9px;padding:.5rem .7rem;margin:-.1rem 0 .5rem"></div>
     <div class="hint" style="margin:-.3rem 0 .6rem">Your bots and this dashboard run on the VPS and keep going if you close the browser, restart your PC, or drop offline. To get back in, just reopen the bookmark below — re-logging in only if your session has expired.</div>
 
     <label style="color:var(--dim);font-size:.8rem">Bookmark this dashboard
@@ -8763,15 +8908,18 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
         <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="roundrobin" checked style="width:auto"> Round-robin</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="random" style="width:auto"> Random</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400" title="Each bot gets a distinct IP no other bot holds — never doubles up"><input type="radio" name="bulkmode" value="random_unique" style="width:auto"> Random · unique IP</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="bulkmode" value="same" style="width:auto"> Same to all</label>
           <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400;margin-left:auto"><input type="checkbox" id="bulkRestart" style="width:auto"> Restart after</label>
         </div>
+        <div class="hint"><b>Random · unique IP</b> gives every selected bot a fresh IP from the pool that no other bot is using — an IP can never land on two bots. If the free pool is smaller than the bot count, the extras are skipped (never doubled). The pool is remembered between visits.</div>
         <div class="hint">Targets <span id="bulkCount"></span></div>
         <div id="bulkTargets" style="display:flex;gap:.4rem;flex-wrap:wrap"></div>
         <div class="mbar"><span class="msg" id="bulkMsg" style="color:var(--dim);flex:1"></span>
           <button onclick="bulkSelectAll(true)">All</button>
           <button onclick="bulkSelectAll(false)">None</button>
           <button onclick="bulkSelectErrored(this)" title="select only bots with proxy errors">Errored</button>
+          <button onclick="randomizeUnique(this)" title="Give every selected bot a fresh, unique IP from the pool">🎲 Randomize unique</button>
           <button class="go" onclick="applyBulkProxies(this)">Apply</button></div>
       </div>
     </div>
@@ -10875,6 +11023,8 @@ function copyText(t,btn){
 }
 async function openConnection(){
   $('connScrim').classList.add('open'); $('connMsg').textContent='';
+  if($('connHead')) $('connHead').textContent='Connect / Reconnect';
+  if($('connForUser')) $('connForUser').style.display='none';
   $('connUrl').value=location.origin;
   try{ CONN=await api('/api/connection'); }catch(e){}
   const localish=['localhost','127.0.0.1','::1','[::1]'].includes(location.hostname);
@@ -10884,6 +11034,13 @@ async function openConnection(){
   try{ const nd=await api('/api/nodes'); if($('connMulti'))$('connMulti').style.display=(localish&&nd&&nd.nodes&&nd.nodes.length)?'block':'none'; }catch(e){}
 }
 function closeConnection(e){ if(e&&e.target!==$('connScrim'))return; $('connScrim').classList.remove('open'); }
+/* per-user connect/re-auth info — same modal as the owner's Connect/Reconnect, with a banner naming the user */
+async function userConnInfo(name){
+  await openConnection();
+  if($('connHead')) $('connHead').textContent='Connect info — '+name;
+  const b=$('connForUser'); if(b){ b.style.display='block';
+    b.innerHTML='Give <b>'+esc(name)+'</b> this so they can reach their dashboard. They sign in with their username <b>'+esc(name)+'</b> and the password you set (or their invite link). Their bots + this dashboard run on the VPS and keep going — they just reopen the bookmark below, logging in only if their session expired.'; }
+}
 
 // ---- Boxes (multi-VPS controller) ----
 // Rename a box: the controller's name lives in settings.box_name; a node's is a
@@ -11098,6 +11255,7 @@ async function loadProxies(){
   $('proxMsg').textContent='';
   const d=await api('/api/proxies');
   PROXROWS=d.proxies||[];
+  if(d.pool && $('bulkList') && !$('bulkList').value.trim()) $('bulkList').value=d.pool;   // prefill the remembered pool
   renderProxyList();
   renderBulkTargets();
 }
@@ -11211,12 +11369,30 @@ async function applyBulkProxies(btn){
   const mode=document.querySelector('input[name=bulkmode]:checked').value;
   const restart=$('bulkRestart').checked;
   btn.disabled=true; $('bulkMsg').style.color='var(--dim)'; $('bulkMsg').textContent=restart?'applying + restarting…':'applying…';
-  const d=await api('/api/proxies/bulk','POST',{targets,proxies,mode,restart});
+  const d=await api('/api/proxies/bulk','POST',{targets,proxies,mode,restart,save_pool:true});
   btn.disabled=false;
   if(d.error){ $('bulkMsg').style.color='var(--crash)'; $('bulkMsg').textContent='✗ '+d.error; return; }
   const ok=d.results.filter(r=>r.ok).length, fail=d.results.length-ok;
   $('bulkMsg').style.color=fail?'var(--warn)':'var(--dim)';
   $('bulkMsg').textContent=`✓ ${ok} updated`+(fail?` · ${fail} failed`:'')+(restart?' · restarted':'');
+  loadProxies(); if(restart)refresh();
+}
+// one-click: give every selected bot a fresh, globally-unique IP from the pool
+async function randomizeUnique(btn){
+  const targets=[...BULKSEL];
+  const proxies=$('bulkList').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  $('bulkMsg').style.color='var(--crash)';
+  if(!targets.length){ $('bulkMsg').textContent='select at least one target'; return; }
+  if(!proxies.length){ $('bulkMsg').textContent='paste a proxy pool (one host:port per line) first'; return; }
+  const restart=$('bulkRestart').checked;
+  btn.disabled=true; $('bulkMsg').style.color='var(--dim)';
+  $('bulkMsg').textContent=restart?'assigning unique IPs + restarting…':'assigning unique IPs…';
+  const d=await api('/api/proxies/bulk','POST',{targets,proxies,mode:'random_unique',restart,save_pool:true});
+  btn.disabled=false;
+  if(d.error){ $('bulkMsg').style.color='var(--crash)'; $('bulkMsg').textContent='✗ '+d.error; return; }
+  const ok=d.results.filter(r=>r.ok).length, fail=d.results.length-ok;
+  $('bulkMsg').style.color=fail?'var(--warn)':'var(--dim)';
+  $('bulkMsg').textContent=`🎲 ${ok} bot${ok===1?'':'s'} got a unique IP`+(fail?` · ${fail} skipped (pool exhausted)`:'')+(restart?' · restarted':'');
   loadProxies(); if(restart)refresh();
 }
 
@@ -11900,7 +12076,7 @@ let _usrBots=[];
 function roleRadiosHtml(grp){
   return '<div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;font-size:.82rem"><span class="hint">Role</span>'+
     ROLES.map(r=>'<label class="rrow"><input type="radio" name="'+grp+'" value="'+r[0]+'"'+(r[0]==='view'?' checked':'')+' style="width:auto" onchange="syncRole(\''+grp+'\')"> '+r[1]+'</label>').join('')+
-    '<span class="hint" style="flex-basis:100%;margin:.1rem 0 0">Admin = full control (a second owner). View/Operate/Config are scoped to the bots you pick.</span></div>';
+    '<span class="hint" style="flex-basis:100%;margin:.1rem 0 0">Admin = full control (a second owner). Otherwise pick bots below — each bot gets its OWN role. This is the default for "All bots" and the starting role for each bot you check.</span></div>';
 }
 function scopeHtml(idp){
   return '<div id="'+idp+'Wrap"><label class="rrow"><input type="checkbox" id="'+idp+'All" style="width:auto" onchange="syncScope(\''+idp+'\')"> All bots (current + future)</label>'+
@@ -11908,15 +12084,25 @@ function scopeHtml(idp){
 }
 function getRole(grp){ const el=document.querySelector('input[name='+grp+']:checked'); return el?el.value:'view'; }
 function syncRole(grp){
-  const idp = grp==='roleA'?'usA':'usI';
+  const idp = grp==='roleA'?'usA':grp==='roleE'?'usE':'usI';
   const admin = getRole(grp)==='admin';
   const all=$(idp+'All'); if(all){ if(admin) all.checked=true; all.disabled=admin; $(idp+'Wrap').style.opacity=admin?.55:1; syncScope(idp); }
 }
 function syncScope(idp){ const on=$(idp+'All').checked; const w=$(idp+'BotsWrap'); if(w){ w.style.opacity=on?.4:1; w.style.pointerEvents=on?'none':'auto'; } }
 function gatherScope(idp){
-  return {all:$(idp+'All').checked, targets:[...$(idp+'Bots').querySelectorAll('input:checked')].map(c=>({node:c.dataset.node||null,name:c.value}))};
+  return {all:$(idp+'All').checked, targets:[...$(idp+'Bots').querySelectorAll('input[type=checkbox]:checked')].map(c=>({
+    node:c.dataset.node||null, name:c.value,
+    role:(c.closest('.shbot').querySelector('.botrole')||{}).value||'view' }))};
 }
-function botCheckboxes(){ return _usrBots.map(i=>'<label class="shbot"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto"> '+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</label>').join('')||'<span class="hint">No bots.</span>'; }
+const BOT_ROLE_OPTS=[['view','View'],['operate','Operate'],['config','Config']];
+function botRoleSel(){ return '<select class="botrole" disabled style="width:auto;font-size:.74rem;margin-left:auto" onclick="event.preventDefault()">'+
+  BOT_ROLE_OPTS.map(r=>'<option value="'+r[0]+'">'+r[1]+'</option>').join('')+'</select>'; }
+function onBotCheck(cb){
+  const sel=cb.closest('.shbot').querySelector('.botrole'); if(!sel) return;
+  sel.disabled=!cb.checked;
+  if(cb.checked){ const inv=!!cb.closest('#usIBots'); const dr=getRole(inv?'roleI':'roleA'); if(dr!=='admin') sel.value=dr; }
+}
+function botCheckboxes(){ return _usrBots.map(i=>'<label class="shbot" style="display:flex;align-items:center;gap:.45rem"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto" onchange="onBotCheck(this)"> <span>'+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</span>'+botRoleSel()+'</label>').join('')||'<span class="hint">No bots.</span>'; }
 async function openUsers(){
   $('usersScrim').classList.add('open'); $('usrMsg').textContent=''; $('invMsg').textContent=''; $('invResult').style.display='none';
   $('usrRole_add').innerHTML=roleRadiosHtml('roleA'); $('usrScope_add').innerHTML=scopeHtml('usA');
@@ -11953,7 +12139,9 @@ async function createInvite(btn){
   r.innerHTML='<div class="shurl"><div style="font-size:.74rem;color:var(--dim);margin-bottom:.3rem">One-time invite link — copy it now, it won\'t be shown again:</div><div style="display:flex;gap:.4rem"><input readonly value="'+esc(d.url)+'" style="flex:1;font-family:var(--mono);font-size:.74rem"><button onclick="copyText(\''+jsq(d.url)+'\',this)">Copy</button></div>'+warn+'</div>';
   loadUsers();
 }
-function scopeSummary(u){ return u.all?'all bots':((u.targets||[]).map(t=>t.name).join(', ')||'no bots'); }
+function scopeSummary(u){ if(u.role==='admin') return 'all bots (admin)';
+  if(u.all) return 'all bots ['+(u.role||'view')+']';
+  return (u.targets||[]).map(t=>t.name+' ['+(t.role||u.role||'view')+']').join(', ')||'no bots'; }
 let _usersData={users:[],modules:[]};
 async function loadUsers(){
   let d; try{ d=await (await fetch('/api/users')).json(); }catch(e){ return; }
@@ -11968,7 +12156,9 @@ async function loadUsers(){
     return '<div class="shrow" style="flex-wrap:wrap;gap:.4rem"><b style="min-width:6rem">'+esc(u.username)+'</b>'+
       '<select onchange="changeRole(\''+u.id+'\',this.value)" style="width:auto">'+opts+'</select>'+
       '<span class="hint" style="flex:1;min-width:8rem">'+esc(scopeSummary(u))+' · '+dis+last+restricted+'</span>'+
+      (u.role!=='admin'?'<button onclick="openEditAccess(\''+u.id+'\')">Edit access</button>':'')+
       permsBtn+
+      '<button onclick="userConnInfo(\''+jsq(u.username)+'\')">Connect info</button>'+
       '<button onclick="resetPw(\''+u.id+'\',\''+jsq(u.username)+'\')">Reset pw</button>'+
       '<button onclick="toggleDisable(\''+u.id+'\','+(u.disabled?'false':'true')+')">'+(u.disabled?'Enable':'Disable')+'</button>'+
       '<button class="danger" onclick="delUser(\''+u.id+'\',\''+jsq(u.username)+'\')">Delete</button></div>';
@@ -11984,6 +12174,34 @@ async function toggleDisable(id,dis){ const d=await api('/api/users/'+id,'POST',
 async function delUser(id,name){ if(!confirm('Delete user "'+name+'"? They lose access immediately.'))return; const d=await api('/api/users/'+id+'/delete','POST',{}); if(d&&d.error)alert(d.error); loadUsers(); }
 async function resetPw(id,name){ const pw=prompt('New password for "'+name+'" (min 6 chars):'); if(!pw)return; const d=await api('/api/users/'+id+'/password','POST',{password:pw}); if(d&&d.error)alert(d.error); else alert('Password reset — their other sessions were signed out.'); }
 async function revokeInvite(id){ const d=await api('/api/invites/'+id+'/revoke','POST',{}); if(d&&d.error)alert(d.error); loadUsers(); }
+/* ---- edit an existing user's bots + per-bot roles ---- */
+let _editUid=null;
+async function openEditAccess(uid){
+  const u=(_usersData.users||[]).find(x=>x.id===uid); if(!u) return;
+  if(!_usrBots.length) await loadUserBots();
+  _editUid=uid; $('eaMsg').textContent='';
+  $('eaTitle').textContent='Edit access — '+u.username;
+  $('eaRole').innerHTML=roleRadiosHtml('roleE'); $('eaScope').innerHTML=scopeHtml('usE');
+  const rr=document.querySelector('input[name=roleE][value="'+(u.role||'view')+'"]'); if(rr) rr.checked=true;
+  $('usEBots').innerHTML=botCheckboxes();
+  (u.targets||[]).forEach(t=>{
+    const cb=[...$('usEBots').querySelectorAll('input[type=checkbox]')].find(c=>c.value===t.name && (c.dataset.node||null)===(t.node||null));
+    if(cb){ cb.checked=true; const sel=cb.closest('.shbot').querySelector('.botrole'); if(sel){ sel.disabled=false; sel.value=t.role||u.role||'view'; } }
+  });
+  if($('usEAll')) $('usEAll').checked=!!u.all;
+  syncRole('roleE'); syncScope('usE');
+  $('eaScrim').classList.add('open');
+}
+function closeEditAccess(e){ if(!e||e.target.id==='eaScrim') $('eaScrim').classList.remove('open'); }
+async function saveEditAccess(btn){
+  const role=getRole('roleE'), sc=gatherScope('usE');
+  if(role!=='admin' && !sc.all && !sc.targets.length){ $('eaMsg').textContent='pick at least one bot, or All'; return; }
+  btn.disabled=true; $('eaMsg').textContent='Saving…';
+  const d=await api('/api/users/'+_editUid,'POST',{role,all:sc.all,targets:sc.targets});
+  btn.disabled=false;
+  if(d&&d.error){ $('eaMsg').innerHTML='<span style="color:var(--crash)">'+esc(d.error)+'</span>'; return; }
+  $('eaScrim').classList.remove('open'); loadUsers();
+}
 
 /* ---- per-user permissions editor ---- */
 const CAT_LABELS={control:'Control & automation',combat:'Combat',survival:'Survival',connection:'Connection & queue',privacy:'Privacy & safety',automation:'Automation',diagnostics:'Diagnostics'};
