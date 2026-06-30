@@ -579,11 +579,25 @@
       '<button type="button" class="leLook" data-le-look="'+prefix+'" title="Use the block the bot is looking at">📍</button></span></div>'; }
   function leSub(t){ return '<div class="leFormSub">'+esc(t)+'</div>'; }
   function leHint(t){ return '<div class="leHint">'+esc(t)+'</div>'; }
+  function leSelectRow(label,name,opts,sel){
+    var o=opts.map(function(p){ var v=p[0],t=p[1]||p[0]; return '<option value="'+esc(v)+'"'+(v===sel?' selected':'')+'>'+esc(t)+'</option>'; }).join('');
+    return '<div class="leRow"><label>'+esc(label)+'</label><select data-le="'+esc(name)+'">'+o+'</select></div>'; }
+  /* coord reader that tolerates a fully-empty triple (returns 0,0,0) — for optional chests */
+  function leCoordOpt(ov,prefix,label){
+    var X=$le(ov,prefix+'x'),Y=$le(ov,prefix+'y'),Z=$le(ov,prefix+'z');
+    var xs=X?String(X.value).trim():'',ys=Y?String(Y.value).trim():'',zs=Z?String(Z.value).trim():'';
+    if(!xs&&!ys&&!zs) return {x:0,y:0,z:0};
+    return leCoord(ov,prefix,label); }
 
   /* ---- forms (return HTML; collectors build the config entry + return the POST promise, or throw to show inline) ---- */
   var TRADER_PATH='client.extra.villagerTrader.trades',
+      GROUPS_PATH='client.extra.villagerTrader.groups',
       ELYTRA_PATH='client.extra.elytraPilot.tripRoutes',
       PEARL_PATH ='client.extra.pearlLoader.pearls';
+  var SELECTED_GROUP=null;   // left-panel selection, highlights member trades on the right
+  /* group keys + an emerald-earner check shared by the trade form/collector */
+  function groupKeys(){ return mapRows(getPath(LIVE.config, GROUPS_PATH)).map(function(e){ return e[0]; }); }
+  function tradeIsEarner(){ var m=(typeof ABMTrade!=='undefined')?ABMTrade.match():null; return !!(m && m.o && mcStrip(m.o[0])==='emerald'); }
 
   function tradeFormHtml(val,key,mode){
     var ro = mode==='edit';
@@ -597,21 +611,45 @@
       try{ ABMTrade.load({prof:'Librarian',give1:'minecraft:emerald',give2:'minecraft:book',get:'Enchanted Book',ench:'Mending'}); }catch(e){}
     }
     var v=val||{};
+    var gopts=[['__none','(no group — own resupply)']].concat(groupKeys().map(function(k){ return [k,k]; }));
     return leHint(ro?'Adjust the offer or chests, then Save.':'Pick a real villager offer, name it, then point it at the chests at your trade hall.')+
       ABMTrade.box()+
       leTextRow('Trade name','leKey','e.g. mending-books', key||'', ro)+
-      leSub('Chests  ·  x y z  —  📍 uses the block the bot is looking at')+
-      leCoordRow('Give-1 supply chest','c1', v.inputItem1Chest)+
-      leCoordRow('Give-2 supply chest (if second input)','c2', v.inputItem2Chest)+
+      leSelectRow('Group','leGroup', gopts, (v.group&&v.group!=='')?v.group:'__none')+
+      '<div class="leHint" data-le-note="group" style="display:none"></div>'+
+      leSub('Output  ·  always per-trade (each enchant to its own chest)')+
       leCoordRow('Output chest','co', v.outputChest)+
-      leSub('Restock & limits')+
-      leNumRow('Restock stacks (give-1)','rs1', v.inputItem1RestockStacks!=null?v.inputItem1RestockStacks:4)+
-      leNumRow('Restock when below (give-1)','rt1', v.inputItem1RestockCountThreshold!=null?v.inputItem1RestockCountThreshold:64)+
-      leNumRow('Restock stacks (give-2)','rs2', v.inputItem2RestockStacks!=null?v.inputItem2RestockStacks:4)+
-      leNumRow('Restock when below (give-2)','rt2', v.inputItem2RestockCountThreshold!=null?v.inputItem2RestockCountThreshold:64)+
       leNumRow('Store output when above','st', v.outputItemStoreCountThreshold!=null?v.outputItemStoreCountThreshold:64)+
       leNumRow('Max give-1 per trade','mx1', v.maxInput1PerTrade!=null?v.maxInput1PerTrade:99)+
-      leNumRow('Max give-2 per trade','mx2', v.maxInput2PerTrade!=null?v.maxInput2PerTrade:99);
+      leNumRow('Max give-2 per trade','mx2', v.maxInput2PerTrade!=null?v.maxInput2PerTrade:99)+
+      '<div id="leSupply">'+
+        leSub('Supply  ·  x y z  —  📍 uses the block the bot is looking at')+
+        leCoordRow('Give-1 supply chest','c1', v.inputItem1Chest)+
+        leCoordRow('Give-2 supply chest (if second input)','c2', v.inputItem2Chest)+
+        leNumRow('Restock stacks (give-1)','rs1', v.inputItem1RestockStacks!=null?v.inputItem1RestockStacks:4)+
+        leNumRow('Restock when below (give-1)','rt1', v.inputItem1RestockCountThreshold!=null?v.inputItem1RestockCountThreshold:64)+
+        leNumRow('Restock stacks (give-2)','rs2', v.inputItem2RestockStacks!=null?v.inputItem2RestockStacks:4)+
+        leNumRow('Restock when below (give-2)','rt2', v.inputItem2RestockCountThreshold!=null?v.inputItem2RestockCountThreshold:64)+
+      '</div>';
+  }
+  /* show/hide the shared supply block: a grouped SPENDER inherits it; earners + ungrouped keep their own */
+  function tradeWire(ov){
+    function apply(){
+      var sel=leVal(ov,'leGroup'), grouped=(sel&&sel!=='__none');
+      var earner=tradeIsEarner();
+      var sup=ov.querySelector('#leSupply'), note=ov.querySelector('[data-le-note="group"]');
+      var inherit = grouped && !earner;
+      if(sup) sup.style.display = inherit ? 'none' : '';
+      if(note){
+        if(grouped && earner){ note.style.display=''; note.textContent='Earner: keeps its OWN give-1 chest (the sell-item source); its emeralds fund group “'+sel+'”.'; }
+        else if(inherit){ note.style.display=''; note.textContent='Supply (give chests + restock) inherited from group “'+sel+'”. Output stays per-trade above.'; }
+        else { note.style.display='none'; note.textContent=''; }
+      }
+    }
+    var g=$le(ov,'leGroup'); if(g) g.addEventListener('change', apply);
+    // re-evaluate when the offer builder changes (earner status can flip)
+    [].forEach.call(ov.querySelectorAll('select,[data-le]'), function(e){ e.addEventListener('change', apply); });
+    apply();
   }
   function tradeCollect(ov,ctx){
     var m=(typeof ABMTrade!=='undefined')?ABMTrade.match():null;
@@ -620,12 +658,17 @@
     var key = ctx.mode==='edit' ? ctx.key : leVal(ov,'leKey').trim();
     if(!key) throw new Error('Give the trade a name.');
     if(ctx.mode==='add' && existingKeys(TRADER_PATH).indexOf(key)>=0) throw new Error('A trade named “'+key+'” already exists.');
+    var base = ctx.orig || {};                       // preserve fields the form doesn't expose (carry caps, etc.)
     var has2 = s.give2 && s.give2!=='__none';
-    var c1=leCoord(ov,'c1','the give-1 supply chest');
+    var grp = leVal(ov,'leGroup'); var grouped = grp && grp!=='__none';
+    var earner = mcStrip(m.o[0])==='emerald';
+    var own = !grouped || earner;                    // grouped SPENDER inherits give chests; else use the form's
     var co=leCoord(ov,'co','the output chest');
-    var c2= has2 ? leCoord(ov,'c2','the give-2 supply chest') : {x:0,y:0,z:0};
-    var value={
-      enabled:true,
+    var c1 = own ? leCoord(ov,'c1','the give-1 supply chest') : (base.inputItem1Chest||{x:0,y:0,z:0});
+    var c2 = (own && has2) ? leCoord(ov,'c2','the give-2 supply chest') : (base.inputItem2Chest||{x:0,y:0,z:0});
+    var value=Object.assign({}, base, {
+      enabled: (base.enabled!=null?base.enabled:true),
+      group: grouped ? grp : '',
       villagerProfession: s.prof.toUpperCase(),
       inputItem1: mcStrip(s.give1),
       inputItem2: has2 ? mcStrip(s.give2) : 'air',
@@ -638,10 +681,8 @@
       outputItemStoreCountThreshold: leNum(ov,'st',64),
       maxInput1PerTrade: leNum(ov,'mx1',99),
       maxInput2PerTrade: leNum(ov,'mx2',99),
-      postTradeStoreMode:'NONE',
-      overflowChestPos:{x:0,y:0,z:0},
       outputItemEnchantments: (ABMTrade.isBook() ? enchMap(s.bookEnch) : {})
-    };
+    });
     return leMutate('put', TRADER_PATH, { key:key, value:value });
   }
 
@@ -678,11 +719,57 @@
     return leMutate('add', PEARL_PATH, { value:value });
   }
 
+  /* ---- trade GROUPS: a shared supply profile for a set of trades (give chests + restock + caps + self-refill) ---- */
+  function groupFormHtml(val,key,mode){ var ro=mode==='edit', v=val||{};
+    return leHint('A group shares ONE emerald (+book) supply across its member trades — configure the give chests + restock once here; every member keeps its own OUTPUT chest. Add an emerald-earning trade (sells items → emeralds) to the group and the bot self-refills before it runs dry; once supply is gone it parks instead of wandering.')+
+      leTextRow('Group name','leKey','e.g. book-hall', key||'', ro)+
+      leToggleRow('Enabled','gEnabled', v.enabled!==false)+
+      leSub('Shared supply chests  ·  x y z  —  📍 uses the block the bot is looking at')+
+      leCoordRow('Give-1 (e.g. emerald) chest','gc1', v.inputItem1Chest)+
+      leCoordRow('Give-2 (e.g. book) chest','gc2', v.inputItem2Chest)+
+      leSub('Restock, carry caps & self-refill')+
+      leNumRow('Restock stacks (give-1)','grs1', v.inputItem1RestockStacks!=null?v.inputItem1RestockStacks:4)+
+      leNumRow('Restock when below (give-1)','grt1', v.inputItem1RestockCountThreshold!=null?v.inputItem1RestockCountThreshold:64)+
+      leNumRow('Restock stacks (give-2)','grs2', v.inputItem2RestockStacks!=null?v.inputItem2RestockStacks:4)+
+      leNumRow('Restock when below (give-2)','grt2', v.inputItem2RestockCountThreshold!=null?v.inputItem2RestockCountThreshold:64)+
+      leNumRow('Carry cap give-1 stacks (0 = none)','gmc1', v.inputItem1MaxCarryStacks!=null?v.inputItem1MaxCarryStacks:0)+
+      leNumRow('Carry cap give-2 stacks (0 = none)','gmc2', v.inputItem2MaxCarryStacks!=null?v.inputItem2MaxCarryStacks:2)+
+      leNumRow('Min emeralds before self-refill (0 = passive)','gmin', v.minEmeralds!=null?v.minEmeralds:0)+
+      leSub('Post-trade leftovers')+
+      leSelectRow('After each trade','gpost', [['NONE','Keep (none)'],['TO_RESTOCK','Back to supply chests'],['TO_OVERFLOW','To overflow chest']], v.postTradeStoreMode||'NONE')+
+      leCoordRow('Overflow chest (if To overflow)','gco', v.overflowChestPos);
+  }
+  function groupCollect(ov,ctx){
+    var base = ctx.orig || {};
+    var key = ctx.mode==='edit' ? ctx.key : leVal(ov,'leKey').trim();
+    if(!key) throw new Error('Give the group a name.');
+    if(ctx.mode==='add' && existingKeys(GROUPS_PATH).indexOf(key)>=0) throw new Error('A group named “'+key+'” already exists.');
+    var post=leVal(ov,'gpost')||'NONE';
+    var value=Object.assign({}, base, {
+      enabled: leChecked(ov,'gEnabled'),
+      inputItem1Chest: leCoord(ov,'gc1','the give-1 chest'),
+      inputItem2Chest: leCoordOpt(ov,'gc2','the give-2 chest'),
+      inputItem1RestockStacks: leNum(ov,'grs1',4),
+      inputItem1RestockCountThreshold: leNum(ov,'grt1',64),
+      inputItem2RestockStacks: leNum(ov,'grs2',4),
+      inputItem2RestockCountThreshold: leNum(ov,'grt2',64),
+      inputItem1MaxCarryStacks: leNum(ov,'gmc1',0),
+      inputItem2MaxCarryStacks: leNum(ov,'gmc2',2),
+      minEmeralds: leNum(ov,'gmin',0),
+      postTradeStoreMode: post,
+      overflowChestPos: (post==='TO_OVERFLOW') ? leCoord(ov,'gco','the overflow chest') : leCoordOpt(ov,'gco','the overflow chest')
+    });
+    return leMutate('put', GROUPS_PATH, { key:key, value:value });
+  }
+  var GROUP_SPEC={ title:'Trade Groups', addLabel:'New group', noun:'group', kind:'map', path:GROUPS_PATH, form:groupFormHtml, collect:groupCollect };
+
   var LIST_EDITORS = {
     trader: { title:'Trades', addLabel:'New trade', noun:'trade', kind:'map', path:TRADER_PATH,
       rowText:function(k,t){ var has2=t.inputItem2&&t.inputItem2!=='air';
-        return { title:k, sub:capWords(t.villagerProfession)+' · '+pretty(mcStrip(t.inputItem1))+(has2?' + '+pretty(mcStrip(t.inputItem2)):'')+' → '+pretty(mcStrip(t.outputItem)) }; },
-      form:tradeFormHtml, collect:tradeCollect },
+        var sub=capWords(t.villagerProfession)+' · '+pretty(mcStrip(t.inputItem1))+(has2?' + '+pretty(mcStrip(t.inputItem2)):'')+' → '+pretty(mcStrip(t.outputItem));
+        if(t.group) sub+='  ·  ⬡ '+t.group;
+        return { title:k, sub:sub, group:(t.group||'') }; },
+      form:tradeFormHtml, collect:tradeCollect, wire:tradeWire },
     elytra: { title:'Saved trips', addLabel:'New trip', noun:'trip', kind:'map', path:ELYTRA_PATH,
       rowText:function(k,r){ var n=(r.legs&&r.legs.length)||0;
         return { title:k, sub:(r.endInNether?'Nether':'Overworld')+' → '+r.destX+', '+r.destY+', '+r.destZ+' · '+n+' leg'+(n===1?'':'s') }; },
@@ -730,7 +817,7 @@
 
   function openForm(spec, mode, rowKey, val){
     closeLeModal();
-    var ctx={ mode:mode, key: spec.kind==='map' ? rowKey : null, index: spec.kind==='list' ? rowKey : null };
+    var ctx={ mode:mode, key: spec.kind==='map' ? rowKey : null, index: spec.kind==='list' ? rowKey : null, orig: val||null };
     var title = mode==='edit' ? ('Edit '+esc(spec.noun)) : ('＋ '+esc(spec.addLabel));
     var ov=document.createElement('div'); ov.id='leModal'; ov.className='leOv';
     ov.innerHTML='<div class="leCard"><div class="leTitle">'+title+'<span class="leClose">×</span></div>'+
@@ -742,6 +829,7 @@
     ov.querySelector('.leCancel').onclick=closeLeModal;
     ov.addEventListener('click', function(e){ if(e.target===ov) closeLeModal(); });
     wireLookButtons(ov);
+    if(typeof spec.wire==='function'){ try{ spec.wire(ov, val, mode); }catch(e){} }
     ov.querySelector('.leSaveBtn').onclick=function(){
       var p; try{ p=spec.collect(ov, ctx); }catch(err){ leShowErr(ov, err.message); return; }
       var btn=this; btn.disabled=true; btn.textContent='Saving…';
@@ -762,7 +850,8 @@
       var rt=spec.rowText(e[0], e[1]);
       var acts = canEdit ? '<button class="leEdit" title="Edit" data-k="'+esc(String(e[0]))+'">✎</button>'+
                            '<button class="leDel" title="Delete" data-k="'+esc(String(e[0]))+'" data-lbl="'+esc(String(rt.title))+'">🗑</button>' : '';
-      return '<div class="leItem"><div class="leItemMain"><div class="leItemT">'+esc(rt.title)+'</div><div class="leItemS">'+esc(rt.sub)+'</div></div>'+acts+'</div>';
+      var gAttr = rt.group ? ' data-group="'+esc(rt.group)+'"' : '';
+      return '<div class="leItem"'+gAttr+'><div class="leItemMain"><div class="leItemT">'+esc(rt.title)+'</div><div class="leItemS">'+esc(rt.sub)+'</div></div>'+acts+'</div>';
     }).join('');
     var panel=document.createElement('div'); panel.id='leEditor'; panel.className='lePanel';
     panel.innerHTML='<div class="leHead">'+esc(spec.title)+' <span class="leCount">'+entries.length+'</span>'+
@@ -788,6 +877,56 @@
         leMutate('remove', spec.path, body);
       };
     });
+  }
+
+  /* highlight the trades that belong to the selected group, over in the right-hand list editor */
+  function highlightGroupMembers(name){
+    var cont=$(LO.cfg); if(!cont) return;
+    [].forEach.call(cont.querySelectorAll('#leEditor .leItem'), function(it){
+      it.classList.toggle('grpMember', !!name && it.getAttribute('data-group')===name);
+    });
+  }
+  function selectGroup(name){
+    SELECTED_GROUP = (SELECTED_GROUP===name) ? null : name;   // click again to clear
+    var pane=document.getElementById('listPane');
+    if(pane) [].forEach.call(pane.querySelectorAll('.grpItem'), function(it){
+      it.classList.toggle('sel', it.getAttribute('data-gsel')===SELECTED_GROUP);
+    });
+    highlightGroupMembers(SELECTED_GROUP);
+  }
+
+  /* Repurpose the v1 left "Trades" panel (#listPane) into a live Trade Groups manager.
+     The right column keeps the live trade list (#leEditor); selecting a group highlights its members there. */
+  function buildGroupsPanel(){
+    if(cur!=='trader') return;
+    var pane=document.getElementById('listPane'); if(!pane) return;   // only the v1 (Mission Control) layout has it
+    if(!LIVE.config) return;                                          // leave the mockup preview until config loads
+    var groups=mapRows(getPath(LIVE.config, GROUPS_PATH));
+    var trades=mapRows(getPath(LIVE.config, TRADER_PATH));
+    var canEdit=moduleConfig('trader');
+    function members(name){ var n=0; trades.forEach(function(e){ if(e[1] && e[1].group===name) n++; }); return n; }
+    var rows=groups.map(function(e){
+      var name=e[0], g=e[1]||{}, mc=members(name), off=(g.enabled===false);
+      var sub=mc+' trade'+(mc===1?'':'s')+' · restock '+(g.inputItem1RestockStacks!=null?g.inputItem1RestockStacks:'?')+'/'+(g.inputItem2RestockStacks!=null?g.inputItem2RestockStacks:'?')+(g.minEmeralds?(' · refill <'+g.minEmeralds+'⬡'):'');
+      var acts=canEdit?'<button class="leEdit" title="Edit" data-gk="'+esc(name)+'">✎</button><button class="leDel" title="Delete" data-gk="'+esc(name)+'">🗑</button>':'';
+      return '<div class="leItem grpItem'+(name===SELECTED_GROUP?' sel':'')+(off?' grpOff':'')+'" data-gsel="'+esc(name)+'">'+
+        '<div class="leItemMain"><div class="leItemT">'+esc(name)+(off?' (off)':'')+'</div><div class="leItemS">'+esc(sub)+'</div></div>'+acts+'</div>';
+    }).join('');
+    pane.innerHTML='<h3>Trade Groups <span class="sub">'+groups.length+'</span></h3>'+
+      '<div class="list grpList">'+(rows||'<div class="leEmpty">No groups yet. Group the trades that share an emerald supply, then set that supply once.</div>')+'</div>'+
+      (canEdit?'<div class="addrow grpAddRow">＋ New group</div>':'')+
+      '<div class="grpFoot">A group shares its give chests + restock + carry caps across its members; each trade keeps its own output chest. Add an emerald-earning trade and the bot self-refills, then parks instead of wandering when supply is gone. Click a group to highlight its trades →</div>';
+    if(canEdit){
+      var add=pane.querySelector('.grpAddRow'); if(add){ add.style.cursor='pointer'; add.onclick=function(){ openForm(GROUP_SPEC,'add',null,null); }; }
+      [].forEach.call(pane.querySelectorAll('.grpItem .leEdit'), function(b){ b.onclick=function(ev){ ev.stopPropagation();
+        var k=this.dataset.gk, c=getPath(LIVE.config,GROUPS_PATH), val=c?c[k]:null;
+        if(val==null){ toast('group not found — refresh','err'); return; } openForm(GROUP_SPEC,'edit',k,val); }; });
+      [].forEach.call(pane.querySelectorAll('.grpItem .leDel'), function(b){ b.onclick=function(ev){ ev.stopPropagation();
+        var k=this.dataset.gk; if(!window.confirm('Delete group “'+k+'”? Member trades fall back to their own resupply.')) return;
+        leMutate('remove', GROUPS_PATH, { key:k }); }; });
+    }
+    [].forEach.call(pane.querySelectorAll('.grpItem'), function(it){ it.onclick=function(){ selectGroup(this.getAttribute('data-gsel')); }; });
+    highlightGroupMembers(SELECTED_GROUP);
   }
 
   /* the mockup's dead "＋ New …" buttons (v1 left list panel) — open the same form */
@@ -825,7 +964,7 @@
       '.leEmpty{font-family:var(--mono,monospace);font-size:.66rem;color:var(--dim,#7b8a98);padding:.3rem .1rem}'+
       /* modal */
       '.leOv{position:fixed;inset:0;z-index:10000;background:rgba(4,7,10,.66);backdrop-filter:blur(3px);display:flex;align-items:flex-start;justify-content:center;padding:5vh 1rem;overflow:auto}'+
-      '.leCard{width:min(460px,100%);background:var(--panel,#11171e);border:1px solid var(--line,#1d2730);border-radius:14px;box-shadow:0 24px 64px #000a;overflow:hidden}'+
+      '.leCard{width:min(720px,96vw);background:var(--panel,#11171e);border:1px solid var(--line,#1d2730);border-radius:14px;box-shadow:0 24px 64px #000a;overflow:hidden}'+
       '.leTitle{display:flex;align-items:center;font-weight:700;font-size:.92rem;padding:.7rem .85rem;border-bottom:1px solid var(--line,#1d2730)}'+
       '.leClose{margin-left:auto;cursor:pointer;font-size:1.1rem;color:var(--dim,#7b8a98);line-height:1}.leClose:hover{color:#fff}'+
       '.leBody{padding:.7rem .85rem;display:flex;flex-direction:column;gap:.4rem;max-height:64vh;overflow:auto}'+
@@ -842,7 +981,17 @@
       '.leErr:not([style*="none"]){padding:.2rem .85rem .1rem}'+
       '.leFoot{display:flex;justify-content:flex-end;gap:.5rem;padding:.65rem .85rem;border-top:1px solid var(--line,#1d2730)}'+
       '.leBtn{font-family:var(--sans,sans-serif);font-size:.78rem;border-radius:8px;padding:.4rem .8rem;cursor:pointer;border:1px solid var(--line,#1d2730);background:#0b0f14;color:var(--dim,#cdd9e2)}'+
-      '.leSaveBtn{font-weight:700;color:var(--acc,#3ddc97);border-color:var(--acc-dim,#1f7a55)}.leSaveBtn:hover{background:#3ddc9718}.leBtn:disabled{opacity:.6;cursor:default}';
+      '.leSaveBtn{font-weight:700;color:var(--acc,#3ddc97);border-color:var(--acc-dim,#1f7a55)}.leSaveBtn:hover{background:#3ddc9718}.leBtn:disabled{opacity:.6;cursor:default}'+
+      /* trade-groups left panel + member highlight */
+      '.grpList{display:flex;flex-direction:column;gap:.3rem}'+
+      '.grpItem{cursor:pointer;transition:.12s}'+
+      '.grpItem:hover{border-color:var(--acc-dim,#1f7a55)}'+
+      '.grpItem.sel{border-color:var(--acc,#3ddc97);background:#3ddc9722}'+
+      '.grpItem.grpOff{opacity:.55}'+
+      '.leItem.grpMember{border-color:var(--acc,#3ddc97);box-shadow:inset 3px 0 0 var(--acc,#3ddc97)}'+
+      '.grpAddRow{margin-top:.5rem;cursor:pointer}'+
+      '.grpFoot{font-family:var(--mono,monospace);font-size:.58rem;color:var(--dim,#7b8a98);margin-top:.55rem;line-height:1.45}'+
+      '.leSelectRowSel,.leRow select{font-family:var(--mono,monospace);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line,#1d2730);border-radius:7px;padding:.32rem .45rem}';
     document.head.appendChild(s);
   }
 
@@ -854,6 +1003,7 @@
     lockConfig();
     buildLiveConfig();
     buildListEditor();
+    buildGroupsPanel();
     wireAddRows();
     if(MAP[cur] && MAP[cur].signature==='liveMap') bindMap();
     refreshHeaderStatus();

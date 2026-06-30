@@ -743,7 +743,10 @@ const ABMTrade = {
   opts(field){ const s=this.state;
     if(field==='give1') return this._uniq(this._entries({prof:s.prof}).map(e=>e.g[0][0]));
     if(field==='give2') return this._uniq(this._entries({prof:s.prof,give1:s.give1}).map(e=>this._g2(e)));
-    if(field==='get')   return this._uniq(this._entries({prof:s.prof,give1:s.give1,give2:s.give2}).map(e=>this.outName(e)));
+    // "item to receive" is scoped by profession + give-1 only (NOT give-2), so every output the give buys is
+    // directly pickable — e.g. a Librarian's bookshelf/lantern/glass alongside enchanted books. Picking one
+    // auto-resolves give-2 (see set()).
+    if(field==='get')   return this._uniq(this._entries({prof:s.prof,give1:s.give1}).map(e=>this.outName(e)));
     return []; },
   match(){ return this._entries(this.state)[0]||null; },
   valid(){ return !!this.match(); },
@@ -752,7 +755,11 @@ const ABMTrade = {
     o=this.opts('give1'); if(!o.includes(s.give1)) s.give1=o[0];
     o=this.opts('give2'); if(!o.includes(s.give2)) s.give2=o[0];
     o=this.opts('get');   if(!o.includes(s.get))   s.get=o[0]; },
-  set(f,v){ this.state[f]=v; this._repair(); this._render(); },
+  set(f,v){ this.state[f]=v;
+    // when the user picks an output, snap give-2 to whatever that catalog entry actually needs
+    // (book → enchanted_book, nothing → bookshelf/lantern/…), so the receive list isn't gated behind give-2.
+    if(f==='get'){ const e=this._entries({prof:this.state.prof,give1:this.state.give1,get:v})[0]; if(e) this.state.give2=this._g2(e); }
+    this._repair(); this._render(); },
   load(ref){ this.state={prof:ref.prof,give1:ref.give1,give2:ref.give2||'__none',get:ref.get,bookEnch:ref.ench||'Mending'}; this._repair(); this._render(); },
   _render(){ const el=document.getElementById('tradeBox'); if(el) el.innerHTML=this.html(); },
   box(){ return `<div id="tradeBox">${this.html()}</div>`; },
