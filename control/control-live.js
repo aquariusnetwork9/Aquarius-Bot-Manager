@@ -720,10 +720,33 @@
   }
 
   /* ---- trade GROUPS: a shared supply profile for a set of trades (give chests + restock + caps + self-refill) ---- */
+  /* POST a single config mutation WITHOUT toast/refresh — for batching several writes behind one refresh. */
+  function lePostRaw(op, path, body){
+    var payload={ op:op, path:path }; for(var k in body) payload[k]=body[k];
+    return fetch(api('/control/config'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(function(r){ if(r.status===403) throw new Error('control disabled, or you lack permission'); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(d){ if(d && d.ok===false) throw new Error(d.error||'change failed'); return d; });
+  }
+  /* checklist of every existing trade — checked = belongs to group `key`; lets you pull existing trades in/out in bulk */
+  function grpMemberRows(key){
+    var trades=mapRows(getPath(LIVE.config, TRADER_PATH));
+    if(!trades.length) return '<div class="leEmpty">No trades yet — add trades first, then group them here.</div>';
+    return trades.map(function(e){
+      var tk=e[0], t=e[1]||{};
+      var inThis = !!key && t.group===key;
+      var has2=t.inputItem2&&t.inputItem2!=='air';
+      var elsewhere = (t.group && t.group!==key) ? (' · in “'+t.group+'”') : '';
+      var sub=capWords(t.villagerProfession)+' · '+pretty(mcStrip(t.inputItem1))+(has2?'+'+pretty(mcStrip(t.inputItem2)):'')+' → '+pretty(mcStrip(t.outputItem))+elsewhere;
+      return '<label class="grpMem"><input type="checkbox" data-grpmember="'+esc(tk)+'"'+(inThis?' checked':'')+'>'+
+        '<span class="grpMemBd"><span class="grpMemT">'+esc(tk)+'</span><span class="grpMemS">'+esc(sub)+'</span></span></label>';
+    }).join('');
+  }
   function groupFormHtml(val,key,mode){ var ro=mode==='edit', v=val||{};
     return leHint('A group shares ONE emerald (+book) supply across its member trades — configure the give chests + restock once here; every member keeps its own OUTPUT chest. Add an emerald-earning trade (sells items → emeralds) to the group and the bot self-refills before it runs dry; once supply is gone it parks instead of wandering.')+
       leTextRow('Group name','leKey','e.g. book-hall', key||'', ro)+
       leToggleRow('Enabled','gEnabled', v.enabled!==false)+
+      leSub('Member trades  ·  check existing trades to pull them into this group (uncheck to remove)')+
+      '<div class="grpMembers">'+grpMemberRows(key)+'</div>'+
       leSub('Shared supply chests  ·  x y z  —  📍 uses the block the bot is looking at')+
       leCoordRow('Give-1 (e.g. emerald) chest','gc1', v.inputItem1Chest)+
       leCoordRow('Give-2 (e.g. book) chest','gc2', v.inputItem2Chest)+
@@ -759,7 +782,22 @@
       postTradeStoreMode: post,
       overflowChestPos: (post==='TO_OVERFLOW') ? leCoord(ov,'gco','the overflow chest') : leCoordOpt(ov,'gco','the overflow chest')
     });
-    return leMutate('put', GROUPS_PATH, { key:key, value:value });
+    // membership: diff the checklist against current trade.group, building one put per changed trade
+    var checked={};
+    [].forEach.call(ov.querySelectorAll('[data-grpmember]'), function(cb){ checked[cb.getAttribute('data-grpmember')]=cb.checked; });
+    var tradePuts=[];
+    mapRows(getPath(LIVE.config, TRADER_PATH)).forEach(function(e){
+      var tk=e[0], t=e[1]||{}, want=!!checked[tk], isMember=(t.group===key);
+      if(want && !isMember) tradePuts.push({ key:tk, value:Object.assign({}, t, {group:key}) });
+      else if(!want && isMember) tradePuts.push({ key:tk, value:Object.assign({}, t, {group:''}) });
+    });
+    // write the group first, then each membership change, behind a single refresh
+    var chain=lePostRaw('put', GROUPS_PATH, { key:key, value:value });
+    tradePuts.forEach(function(tp){ chain=chain.then(function(){ return lePostRaw('put', TRADER_PATH, { key:tp.key, value:tp.value }); }); });
+    return chain.then(function(){
+      toast('saved group'+(tradePuts.length?(' · '+tradePuts.length+' trade'+(tradePuts.length===1?'':'s')+' updated'):''),'ok');
+      return refreshAfterMutate();
+    }).catch(function(err){ toast(err.message,'err',4200); throw err; });
   }
   var GROUP_SPEC={ title:'Trade Groups', addLabel:'New group', noun:'group', kind:'map', path:GROUPS_PATH, form:groupFormHtml, collect:groupCollect };
 
@@ -991,6 +1029,13 @@
       '.leItem.grpMember{border-color:var(--acc,#3ddc97);box-shadow:inset 3px 0 0 var(--acc,#3ddc97)}'+
       '.grpAddRow{margin-top:.5rem;cursor:pointer}'+
       '.grpFoot{font-family:var(--mono,monospace);font-size:.58rem;color:var(--dim,#7b8a98);margin-top:.55rem;line-height:1.45}'+
+      '.grpMembers{display:flex;flex-direction:column;gap:.25rem;max-height:200px;overflow:auto;border:1px solid var(--line,#1d2730);border-radius:9px;padding:.35rem}'+
+      '.grpMem{display:flex;align-items:center;gap:.55rem;padding:.28rem .35rem;border-radius:7px;cursor:pointer}'+
+      '.grpMem:hover{background:#3ddc970d}'+
+      '.grpMem input{flex:none;width:15px;height:15px;cursor:pointer}'+
+      '.grpMemBd{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2}'+
+      '.grpMemT{font-size:.78rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
+      '.grpMemS{font-family:var(--mono,monospace);font-size:.62rem;color:var(--dim,#7b8a98);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
       '.leSelectRowSel,.leRow select{font-family:var(--mono,monospace);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line,#1d2730);border-radius:7px;padding:.32rem .45rem}';
     document.head.appendChild(s);
   }
