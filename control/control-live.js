@@ -691,6 +691,10 @@
       leNumRow('Store output when above','st', v.outputItemStoreCountThreshold!=null?v.outputItemStoreCountThreshold:64)+
       leNumRow('Max give-1 per trade','mx1', v.maxInput1PerTrade!=null?v.maxInput1PerTrade:99)+
       leNumRow('Max give-2 per trade','mx2', v.maxInput2PerTrade!=null?v.maxInput2PerTrade:99)+
+      '<div id="leCooldown">'+
+        leNumRow('Wait after this trade’s sweep (s, 0-1200; 0 = none)','ccd', v.cycleCooldownSeconds!=null?v.cycleCooldownSeconds:0)+
+        '<div class="leHint" data-le-note="cooldown" style="display:none"></div>'+
+      '</div>'+
       '<div id="leSupply">'+
         leSub('Supply  ·  x y z  —  📍 uses the block the bot is looking at')+
         leCoordRow('Give-1 supply chest','c1', v.inputItem1Chest)+
@@ -713,6 +717,14 @@
         if(grouped && earner){ note.style.display=''; note.textContent='Earner: keeps its OWN give-1 chest (the sell-item source); its emeralds fund group “'+sel+'”.'; }
         else if(inherit){ note.style.display=''; note.textContent='Supply (give chests + restock) inherited from group “'+sel+'”. Output stays per-trade above.'; }
         else { note.style.display='none'; note.textContent=''; }
+      }
+      // cooldown is inherited by EVERY grouped member (earners too, unlike the give-chest supply): hide the per-trade
+      // input and explain, so the value the bot uses (the group's) is never contradicted by a stale field here.
+      var cdRow=ov.querySelector('#leCooldown .leRow'), cdNote=ov.querySelector('[data-le-note="cooldown"]');
+      if(cdRow) cdRow.style.display = grouped ? 'none' : '';
+      if(cdNote){
+        if(grouped){ cdNote.style.display=''; cdNote.textContent='Cycle cooldown inherited from group “'+sel+'”.'; }
+        else { cdNote.style.display='none'; cdNote.textContent=''; }
       }
     }
     var g=$le(ov,'leGroup'); if(g) g.addEventListener('change', apply);
@@ -750,6 +762,7 @@
       outputItemStoreCountThreshold: leNum(ov,'st',64),
       maxInput1PerTrade: leNum(ov,'mx1',99),
       maxInput2PerTrade: leNum(ov,'mx2',99),
+      cycleCooldownSeconds: grouped ? (base.cycleCooldownSeconds!=null?base.cycleCooldownSeconds:0) : leNum(ov,'ccd',0),
       outputItemEnchantments: (ABMTrade.isBook() ? enchMap(s.bookEnch) : {})
     });
     return leMutate('put', TRADER_PATH, { key:key, value:value });
@@ -814,6 +827,8 @@
     return leHint('A group buckets EXISTING trades under one shared emerald/book supply. Just name it and tick the trades below — you do NOT need to create a trade. The shared supply is optional here: open “Shared supply” to set it now, or leave it and set it later (before you run the group).')+
       leTextRow('Group name','leKey','e.g. book-hall', key||'', ro)+
       leToggleRow('Enabled','gEnabled', v.enabled!==false)+
+      leNumRow('Wait after each full cycle (s, 0-1200)','gcd', v.cycleCooldownSeconds!=null?v.cycleCooldownSeconds:60)+
+      '<div class="leHint">All member trades inherit this — after the group finishes its run the bot idles this long so the villagers can restock.</div>'+
       leSub('Member trades  ·  tick existing trades to include (uncheck to remove)')+
       '<div class="grpMembers">'+grpMemberRows(key)+'</div>'+
       '<details class="grpSupply"'+(mode==='edit'?' open':'')+'>'+
@@ -851,6 +866,7 @@
       inputItem1MaxCarryStacks: leNum(ov,'gmc1',0),
       inputItem2MaxCarryStacks: leNum(ov,'gmc2',2),
       minEmeralds: leNum(ov,'gmin',0),
+      cycleCooldownSeconds: leNum(ov,'gcd',60),
       postTradeStoreMode: post,
       overflowChestPos: (post==='TO_OVERFLOW') ? leCoord(ov,'gco','the overflow chest') : leCoordOpt(ov,'gco','the overflow chest')
     });
@@ -1121,6 +1137,17 @@
   function kitStatus(){ return (LIVE.modStatus && LIVE.modStatus.kitmaker) || null; }
   var KM_MATCHES=[['Auto','Auto (global match mode)'],['ByType','By type only'],['ByEnchants','By enchantments'],['Exact','Exact components']];
 
+  /* ---- bundle mode: per-kit fillMode ("shulker" | "bundle") + weight budget ---- */
+  function kmKitDefRaw(name){ var kits=kitsMap(); return (name && kits[name]) ? kits[name] : null; }
+  /* a kit's container mode; legacy template + auto-detect are shulker-only */
+  function kmFillMode(name){ if(name===AUTO_KIT || name==='') return 'shulker'; var kd=kmKitDefRaw(name); return (kd && kd.fillMode==='bundle') ? 'bundle' : 'shulker'; }
+  function kmIsShulkerItem(id){ id=mcStrip(id); return id==='shulker_box' || /(_|^)shulker_box$/.test(id); }
+  /* a bundle holds one stack-equivalent: weight = Σ count/maxStack, capacity 1.0 (== 64 sixty-fourths) */
+  function kmBundleWeight(slots){ var w=0; slots=asMap(slots); Object.keys(slots).forEach(function(k){ var s=slots[k]; if(s&&s.item){ var mx=kmStack(s.item)||64; w += (s.count||1)/Math.max(1,mx); } }); return w; }
+  function kmBundleUsed64(slots){ return Math.round(kmBundleWeight(slots)*64); }   // items-equiv out of 64
+  /* centralised kit write — ALWAYS carries fillMode so a slot edit never resets a bundle kit back to shulker */
+  function kmPutKit(name, slots, fillMode){ return lePostRaw('put', KITS_PATH, {key:name, value:{slots:asMap(slots), fillMode:(fillMode==='bundle'?'bundle':'shulker')}}); }
+
   function kitIcon(id,size){ id=mcStrip(id);
     return '<img class="kmImg" data-id="'+esc(id)+'" alt="" loading="lazy" src="https://mc.nerothe.com/img/1.21/minecraft_'+esc(id)+'.png" style="width:'+size+'px;height:'+size+'px;image-rendering:pixelated">'; }
   function wireKitIcons(root){ [].forEach.call((root||document).querySelectorAll('img.kmImg'), function(im){
@@ -1144,18 +1171,21 @@
 
   function renderKitGrid(panel, canEditModule){
     var name=kmActiveName(), slots=kmActiveSlots(name), editable=kmEditable(name) && canEditModule;
+    var bundle=kmFillMode(name)==='bundle';
     var defined=Object.keys(slots).length, cells='';
     for(var i=0;i<27;i++){ var s=slots[String(i)]; var has=!!(s&&s.item);
       var inner = has ? (kitIcon(s.item,30)
         + ((s.count>1)?'<span class="kmCt">'+s.count+'</span>':'')
         + ((s.match==='ByEnchants'&&s.enchants&&s.enchants.length)?'<span class="kmEn" title="'+esc(s.enchants.map(kmPretty).join(', '))+'">✦</span>':'')) : '';
-      var tip = 'Slot '+(i+1)+(has?(' · '+kmPretty(s.item)+' ×'+s.count):' · empty');
+      var tip = (bundle?'Item ':'Slot ')+(i+1)+(has?(' · '+kmPretty(s.item)+' ×'+s.count):' · empty');
       cells+='<div class="kmSlot'+(has?' filled':'')+(editable?'':' kmRO')+'" data-i="'+i+'" title="'+esc(tip)+'">'+inner+'</div>';
     }
-    panel.innerHTML='<h3>Kit Builder <span class="sub">'+defined+' / 27 slots</span></h3>'+
+    var sub = bundle ? (defined+' item'+(defined===1?'':'s')+' · '+kmBundleUsed64(slots)+'/64') : (defined+' / 27 slots');
+    panel.innerHTML='<h3>Kit Builder <span class="sub">'+sub+'</span></h3>'+
       kmKitBarHtml(name, canEditModule)+
+      (bundle?kmCapMeterHtml(slots):'')+
       '<div class="kitgrid kmGrid">'+cells+'</div>'+
-      '<div class="kmGridHint">'+kmGridHint(name, editable)+'</div>';
+      '<div class="kmGridHint">'+kmGridHint(name, editable, bundle)+'</div>';
     makeCollapsible(panel, panel.querySelector('h3'), 'km:grid', false);
     wireKitIcons(panel);
     wireKitBar(panel, name, canEditModule);
@@ -1164,6 +1194,15 @@
     } else if(name===AUTO_KIT){
       [].forEach.call(panel.querySelectorAll('.kmSlot'), function(sl){ sl.onclick=function(){ kmImportDetected(); }; });
     }
+  }
+  /* bundle capacity meter: coloured load bar + "N/64 · P%", over-capacity turns red */
+  function kmCapMeterHtml(slots){
+    var w=kmBundleWeight(slots), pct=Math.round(w*100), used=Math.round(w*64), over=w>1.0001;
+    var cls=over?'kmCapOver':(pct>=85?'kmCapWarn':'kmCapOk');
+    var barPct=Math.min(100,pct);
+    return '<div class="kmCap '+cls+'"><div class="kmCapBar"><i style="width:'+barPct+'%"></i></div>'+
+      '<div class="kmCapTxt"><b>'+used+' / 64</b> bundle load · '+pct+'%'+
+      (over?(' — <b>over capacity</b>, trim items to ≤ 100% or the bot won’t run it'):(pct>=85?' — nearly full':''))+'</div></div>';
   }
 
   /* ---- kit library bar (selector + new/dup/rename/delete/import/clear) ---- */
@@ -1176,32 +1215,46 @@
     var nCap=Object.keys(capturedMap()).length;
     opts+='<option value="'+AUTO_KIT+'"'+(name===AUTO_KIT?' selected':'')+'>🛰 Auto-detect (physical)'+(nCap?(' · '+nCap+' captured'):'')+'</option>';
     var btns = canEdit ? (
-      '<button class="kmKB" data-kb="new" title="New empty kit">＋</button>'+
+      '<button class="kmKB" data-kb="new" title="New empty shulker kit">＋</button>'+
+      '<button class="kmKB kmKBbun" data-kb="newb" title="New bundle kit (prefilled example)">＋🎒</button>'+
       '<button class="kmKB" data-kb="dup" title="Duplicate / save current as a new kit">⧉</button>'+
       '<button class="kmKB" data-kb="ren" title="Rename this kit">✎</button>'+
       '<button class="kmKB kmKBdel" data-kb="del" title="Delete this kit">🗑</button>'+
       '<button class="kmKB kmKBimp" data-kb="imp" title="Import the bot’s auto-detected kit">⤓ import</button>'+
       '<button class="kmKB kmKBdel" data-kb="clr" title="Clear all slots in this kit">clear</button>'
     ) : '';
+    // per-kit container mode selector (saved, editable kits only)
+    var isSaved = !!(name && name!==AUTO_KIT && kits[name]);
+    var mode = kmFillMode(name);
+    var modeSel = (canEdit && isSaved) ? (
+      '<span class="kmModeWrap"><span class="kmKBl">Container</span><select class="kmModeSel" title="Shulker box (place+fill+break) or bundle (in-inventory fill)">'+
+        '<option value="shulker"'+(mode==='shulker'?' selected':'')+'>Shulker box</option>'+
+        '<option value="bundle"'+(mode==='bundle'?' selected':'')+'>🎒 Bundle</option>'+
+      '</select></span>') : '';
     return '<div class="kmKitBar"><span class="kmKBl">Kit</span><select class="kmKitSel">'+opts+'</select>'+btns+'</div>'+
+      (modeSel?('<div class="kmKitBar kmModeBar">'+modeSel+'</div>'):'')+
       '<div class="kmKitNote">'+kmKitNote(name)+'</div>';
   }
   function kmKitNote(name){
     if(name===AUTO_KIT) return 'The bot builds a physically auto-detected example shulker (no saved design). After a run it captures what it found — ⤓ import to edit &amp; save it.';
     if(name==='') return 'Unsaved single template (legacy). Use ⧉ to save it as a named kit.';
-    return 'The bot builds this kit. Slot edits save instantly (overwrite).';
+    if(kmFillMode(name)==='bundle') return '🎒 Bundle kit — the bot pulls an empty bundle and fills it in-inventory (no place/break). A bundle holds one stack-equivalent (Σ count ÷ max stack ≤ 100%); the meter below shows the load. Full source stacks are trimmed to the exact counts you set.';
+    return 'The bot builds this kit into a shulker box. Slot edits save instantly (overwrite).';
   }
-  function kmGridHint(name, editable){
+  function kmGridHint(name, editable, bundle){
     if(name===AUTO_KIT) return 'Auto-detect preview (read-only). Click any slot or ⤓ import to copy it into an editable kit.';
-    return editable ? 'Click a slot to set its item, count &amp; matching. Same item can fill several slots (e.g. 4×16 rockets).'
-                     : 'Read-only — your access doesn’t include editing this module.';
+    if(!editable) return 'Read-only — your access doesn’t include editing this module.';
+    if(bundle) return 'Click a cell to add an item + count to the bundle. Order doesn’t matter; keep the load ≤ 64/64 (100%). Shulker boxes can’t go in bundles.';
+    return 'Click a slot to set its item, count &amp; matching. Same item can fill several slots (e.g. 4×16 rockets).';
   }
   function wireKitBar(panel, name, canEdit){
     var sel=panel.querySelector('.kmKitSel'); if(sel) sel.onchange=function(){ kmSetActive(this.value); };
     if(!canEdit) return;
+    var msel=panel.querySelector('.kmModeSel'); if(msel) msel.onchange=function(){ kmSetFillMode(name, this.value); };
     [].forEach.call(panel.querySelectorAll('.kmKB'), function(b){ b.onclick=function(ev){ ev.stopPropagation();
       var a=this.dataset.kb;
       if(a==='new') kmNewKit();
+      else if(a==='newb') kmNewBundleKit();
       else if(a==='dup') kmDuplicateKit(name);
       else if(a==='ren') kmRenameKit(name);
       else if(a==='del') kmDeleteKit(name);
@@ -1221,22 +1274,41 @@
   function kmNewKit(){
     var n=kmValidName(window.prompt('New kit name:','')); if(!n) return;
     if(kitsMap()[n]){ toast('a kit named “'+n+'” already exists','err',3500); return; }
-    lePostRaw('put', KITS_PATH, {key:n, value:{slots:{}}}).then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
+    kmPutKit(n, {}, 'shulker').then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
+  }
+  /* new BUNDLE kit, prefilled with a valid demo template (a "pearl-stasis"-style travel bundle, ≤ one bundle) */
+  function kmNewBundleKit(){
+    var n=kmValidName(window.prompt('New bundle kit name:','travel-bundle')); if(!n) return;
+    if(kitsMap()[n]){ toast('a kit named “'+n+'” already exists','err',3500); return; }
+    // a valid pearl-stasis-style travel bundle within one bundle: pearls .5 + apples .25 + soul sand .125 = 87.5%
+    var demo={ '0':{item:'ender_pearl',count:8,match:'Auto',enchants:[]},
+               '1':{item:'golden_apple',count:16,match:'Auto',enchants:[]},
+               '2':{item:'soul_sand',count:8,match:'Auto',enchants:[]} };
+    kmPutKit(n, demo, 'bundle').then(function(){ return kmSetActive(n); })
+      .then(function(){ toast('bundle kit “'+n+'” created — edit its items below','ok',4200); })
+      .catch(function(e){ toast(e.message,'err',4000); });
   }
   function kmDuplicateKit(name){
     var src=kmActiveSlots(name), base=(name&&name!==AUTO_KIT)?name:'kit';
     var n=kmValidName(window.prompt('Save current slots as a new kit named:', base+'-copy')); if(!n) return;
     if(kitsMap()[n]){ toast('a kit named “'+n+'” already exists','err',3500); return; }
-    lePostRaw('put', KITS_PATH, {key:n, value:{slots:JSON.parse(JSON.stringify(src))}}).then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
+    kmPutKit(n, JSON.parse(JSON.stringify(src)), kmFillMode(name)).then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
   }
   function kmRenameKit(name){
     if(!name || name===AUTO_KIT){ toast('select a saved kit to rename','err',3000); return; }
     var n=kmValidName(window.prompt('Rename “'+name+'” to:', name)); if(!n||n===name) return;
     if(kitsMap()[n]){ toast('a kit named “'+n+'” already exists','err',3500); return; }
-    var slots=kmActiveSlots(name);
-    lePostRaw('put', KITS_PATH, {key:n, value:{slots:JSON.parse(JSON.stringify(slots))}})
+    var slots=kmActiveSlots(name), fm=kmFillMode(name);
+    kmPutKit(n, JSON.parse(JSON.stringify(slots)), fm)
       .then(function(){ return lePostRaw('remove', KITS_PATH, {key:name}); })
       .then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
+  }
+  function kmSetFillMode(name, mode){
+    if(!name || name===AUTO_KIT){ toast('select a saved kit first','err',3000); return; }
+    var slots=kmActiveSlots(name);
+    if(mode==='bundle'){ var over=kmBundleWeight(slots)>1.0001;
+      if(over && !window.confirm('This kit is over one bundle’s capacity ('+Math.round(kmBundleWeight(slots)*100)+'%). Switch anyway? The bot won’t run it until you trim it under 100%.')) return; }
+    kmPutKit(name, slots, mode).then(function(){ toast('container: '+(mode==='bundle'?'🎒 bundle':'shulker'),'ok'); return refreshAfterMutate(); }).catch(function(e){ toast(e.message,'err',4000); });
   }
   function kmDeleteKit(name){
     if(!name || name===AUTO_KIT){ toast('select a saved kit to delete','err',3000); return; }
@@ -1250,30 +1322,30 @@
     var name=kmActiveName();
     if(name && name!==AUTO_KIT){
       if(!window.confirm('Overwrite “'+name+'” with the '+Object.keys(cap).length+' auto-detected slots?')) return;
-      lePostRaw('put', KITS_PATH, {key:name, value:{slots:JSON.parse(JSON.stringify(cap))}})
+      kmPutKit(name, JSON.parse(JSON.stringify(cap)), kmFillMode(name))
         .then(function(){ toast('imported detected kit into “'+name+'”','ok'); return refreshAfterMutate(); }).catch(function(e){ toast(e.message,'err',4000); });
     } else {
       var n=kmValidName(window.prompt('Import detected kit as a new kit named:','detected')); if(!n) return;
       if(kitsMap()[n]){ toast('a kit named “'+n+'” already exists','err',3500); return; }
-      lePostRaw('put', KITS_PATH, {key:n, value:{slots:JSON.parse(JSON.stringify(cap))}}).then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
+      kmPutKit(n, JSON.parse(JSON.stringify(cap)), 'shulker').then(function(){ return kmSetActive(n); }).catch(function(e){ toast(e.message,'err',4000); });
     }
   }
-  /* slot writes dispatch to the active named kit (whole-kit put) or the legacy template (per-slot) */
+  /* slot writes dispatch to the active named kit (whole-kit put, fillMode preserved) or the legacy template (per-slot) */
   function kmWriteSlot(i, val){
     var name=kmActiveName();
     if(name && name!==AUTO_KIT){ var kits=kitsMap(); var slots=Object.assign({}, asMap((kits[name]||{}).slots)); slots[String(i)]=val;
-      return lePostRaw('put', KITS_PATH, {key:name, value:{slots:slots}}); }
+      return kmPutKit(name, slots, kmFillMode(name)); }
     return lePostRaw('put', KIT_PATH, {key:String(i), value:val});
   }
   function kmDeleteSlotCfg(i){
     var name=kmActiveName();
     if(name && name!==AUTO_KIT){ var kits=kitsMap(); var slots=Object.assign({}, asMap((kits[name]||{}).slots)); delete slots[String(i)];
-      return lePostRaw('put', KITS_PATH, {key:name, value:{slots:slots}}); }
+      return kmPutKit(name, slots, kmFillMode(name)); }
     return lePostRaw('remove', KIT_PATH, {key:String(i)});
   }
   function kmClearActive(){
     var name=kmActiveName();
-    if(name && name!==AUTO_KIT){ lePostRaw('put', KITS_PATH, {key:name, value:{slots:{}}}).then(function(){ toast('kit cleared','ok'); return refreshAfterMutate(); }).catch(function(e){ toast(e.message,'err',4000); }); return; }
+    if(name && name!==AUTO_KIT){ kmPutKit(name, {}, kmFillMode(name)).then(function(){ toast('kit cleared','ok'); return refreshAfterMutate(); }).catch(function(e){ toast(e.message,'err',4000); }); return; }
     var keys=Object.keys(kitTemplate()); if(!keys.length) return;
     var chain=Promise.resolve(); keys.forEach(function(k){ chain=chain.then(function(){ return lePostRaw('remove', KIT_PATH, {key:k}); }); });
     chain.then(function(){ toast('template cleared','ok'); return refreshAfterMutate(); }).catch(function(e){ toast(e.message,'err',4000); });
@@ -1282,18 +1354,22 @@
   function renderKitSetup(cont){
     var cfg=getPath(LIVE.config,'client.extra.kitMaker')||{}, st=kitStatus();
     var name=kmActiveName(), slots=kmActiveSlots(name), nSaved=Object.keys(kitsMap()).length;
+    var bundle=kmFillMode(name)==='bundle';
     var buildLabel = name===AUTO_KIT ? 'auto-detect' : (name || 'unsaved template');
     function card(k,v,sub){ return '<div class="kmCard"><span class="kmK">'+esc(k)+'</span><span class="kmV">'+v+'</span>'+(sub?'<span class="kmCSub">'+esc(sub)+'</span>':'')+'</div>'; }
     var detected=function(ok){ return ok?'<span class="kmOk">detected ✓</span>':'<span class="kmDimt">scan to detect</span>'; };
     var cards=[
-      card('Building', '<span class="kmOk">'+esc(buildLabel)+'</span>', Object.keys(slots).length+' slots · '+nSaved+' saved kit'+(nSaved===1?'':'s')),
-      card('Shulker source', st?detected(st.shulkerSrcOk):'<span class="kmDimt">—</span>', 'auto-classified'),
+      card('Building', '<span class="kmOk">'+esc(buildLabel)+'</span>', Object.keys(slots).length+(bundle?' items':' slots')+' · '+nSaved+' saved kit'+(nSaved===1?'':'s')),
+      card('Container', bundle?'🎒 bundle':'shulker box', bundle?'in-inventory fill':'place · fill · break'),
+      card((bundle?'Bundle source':'Shulker source'), st?detected(st.shulkerSrcOk):'<span class="kmDimt">—</span>', 'chest of empty '+(bundle?'bundles':'shulkers')),
       card('Item supply', (st&&st.itemSrcs)?(st.itemSrcs+' chest'+(st.itemSrcs===1?'':'s')+' detected'):'floor chests', 'auto · radius '+(cfg.scanRadius!=null?cfg.scanRadius:20)),
       card('Deposit (kit chest)', st?detected(st.depositOk):'<span class="kmDimt">—</span>', 'auto-classified'),
       card('Max kits', (cfg.maxKits&&cfg.maxKits>0)?String(cfg.maxKits):'∞'),
       card('Match mode', esc(cfg.matchMode||'Smart'), cfg.ignoreEnchantLevels?'enchant levels ignored':'levels matter'),
       card('Allow partial', cfg.allowPartial?'<span class="kmOk">on</span>':'<span class="kmDimt">off</span>')
     ];
+    if(bundle){ var w=kmBundleWeight(slots), over=w>1.0001;
+      cards.splice(2,0, card('Bundle load', '<span class="'+(over?'kmBad':'kmOk')+'">'+Math.round(w*64)+' / 64</span>', Math.round(w*100)+'%'+(over?' · over capacity':''))); }
     var old=document.getElementById('kmSetup'); if(old) old.remove();
     var p=document.createElement('div'); p.className='panel kmPanel'; p.id='kmSetup';
     p.innerHTML='<h3>Setup <span class="sub">live · auto-detected at base</span></h3><div class="kmCards">'+cards.join('')+'</div>'+
@@ -1313,8 +1389,8 @@
 
   function kmProg(done,total){ var pct=total>0?Math.min(100,Math.round(done/total*100)):0; return '<div class="kmProg"><i style="width:'+pct+'%"></i></div>'; }
   function kmErrCards(st){
-    var k=st.lastErrorKind, msg=esc(st.lastError||'');
-    if(k==='shulkerEmpty') return '<div class="kmErr">⚠ <div><b>Shulker source empty.</b> '+msg+'. Refill the empty-shulker chest, then ▶ Make kit.</div></div>';
+    var k=st.lastErrorKind, msg=esc(st.lastError||''), unit=(st.fillMode==='bundle')?'bundle':'shulker';
+    if(k==='shulkerEmpty') return '<div class="kmErr">⚠ <div><b>'+(unit==='bundle'?'Bundle':'Shulker')+' source empty.</b> '+msg+'. Refill the empty-'+unit+' chest, then ▶ Make kit.</div></div>';
     if(k==='depositFull')  return '<div class="kmErr">⚠ <div><b>Kit chest full.</b> '+msg+'. Empty the deposit chest to continue.</div></div>';
     if(k==='missingSupply'){
       var sf=st.shortfalls||[];
@@ -1335,7 +1411,9 @@
        : complete ? 'Done — '+kits+' kit'+(kits===1?'':'s')+' made'
        : 'Idle'+(kits?(' — '+kits+' kit'+(kits===1?'':'s')+' made'):''))+'</div>';
     var prog = (running && st.maxKits>0) ? kmProg(kits, st.maxKits) : '';
-    var meta = '<div class="kmMeta">template '+(st.templateSlots||0)+' slots · shulker '+(st.shulkerSrcOk?'✓':'–')+' · sources '+(st.itemSrcs||0)+' · deposit '+(st.depositOk?'✓':'–')+'</div>';
+    var unit = (st.fillMode==='bundle')?'bundle':'shulker';
+    var meta = '<div class="kmMeta">'+(unit==='bundle'?('bundle · '+(st.bundleFullPct||0)+'% load'):('template '+(st.templateSlots||0)+' slots'))+
+      ' · '+unit+' src '+(st.shulkerSrcOk?'✓':'–')+' · sources '+(st.itemSrcs||0)+' · deposit '+(st.depositOk?'✓':'–')+'</div>';
     var body='';
     if(hasErr) body+=kmErrCards(st);
     var kb=st.kitsBuildable, sf=st.shortfalls||[];
@@ -1367,9 +1445,9 @@
   function openKitPicker(i, ev){
     if(typeof ABMItems==='undefined'){ toast('item catalog not loaded — hard-refresh','err',3600); return; }
     closeKitPicker();
-    var s=kitTemplate()[String(i)]||null;
+    var actName=kmActiveName(), s=kmActiveSlots(actName)[String(i)]||null;
     var rect=(ev&&ev.currentTarget&&ev.currentTarget.getBoundingClientRect)?ev.currentTarget.getBoundingClientRect():null;
-    KMP={ slot:i, cat:ABMItems.cats[0], q:'', rect:rect,
+    KMP={ slot:i, cat:ABMItems.cats[0], q:'', rect:rect, bundle:(kmFillMode(actName)==='bundle'),
           item:s?mcStrip(s.item):null, count:s?(s.count||1):1,
           match:s?(s.match||'Auto'):'Auto', enchants:(s&&s.enchants)?s.enchants.slice():[] };
     var scrim=document.createElement('div'); scrim.className='kmScrim'; scrim.id='kmScrim'; scrim.onclick=closeKitPicker;
@@ -1379,12 +1457,25 @@
   }
   function kmItemsHtml(){
     var list = KMP.q ? ABMItems.all.filter(function(id){ return id.indexOf(KMP.q)>=0; }) : (ABMItems.byCat[KMP.cat]||[]);
+    if(KMP.bundle) list=list.filter(function(id){ return !kmIsShulkerItem(id); });   // shulker boxes can't go in a bundle
     var shown=list.slice(0,240);
     var items=shown.map(function(id){ var st=kmStack(id);
       return '<div class="kmIt'+(id===KMP.item?' sel':'')+'" data-id="'+esc(id)+'" title="'+esc(kmPretty(id))+(st<64?(' · stacks to '+st):'')+'">'+kitIcon(id,26)+(st<64?'<span class="kmStk">'+st+'</span>':'')+'</div>'; }).join('');
     var more = list.length>shown.length ? '<div class="kmMore">+'+(list.length-shown.length)+' more — type to search</div>' : (items?'':'<div class="kmMore">no matches</div>');
     return items+more;
   }
+  /* projected bundle load if the picker's current item+count is saved into this slot */
+  function kmPickerProjWeight(){
+    var slots=Object.assign({}, asMap(kmActiveSlots(kmActiveName())));
+    delete slots[String(KMP.slot)];
+    if(KMP.item) slots['__proj']={item:KMP.item, count:KMP.count};
+    return kmBundleWeight(slots);
+  }
+  function kmProjText(){
+    var w=kmPickerProjWeight(), used=Math.round(w*64), p=Math.round(w*100), over=w>1.0001;
+    return '<span class="'+(over?'kmProjOver':(p>=85?'kmProjWarn':''))+'">Bundle load after save: <b>'+used+' / 64</b> ('+p+'%)'+(over?' — over capacity, trim first':'')+'</span>';
+  }
+  function kmUpdateProj(){ var el=document.getElementById('kmProj'); if(el) el.innerHTML=kmProjText(); }
   function renderPicker(){
     var pop=document.getElementById('kmPop'); if(!pop) return;
     var cats=ABMItems.cats.map(function(c){ return '<span class="kmCat'+(c===KMP.cat&&!KMP.q?' on':'')+'" data-cat="'+esc(c)+'">'+esc(c)+'</span>'; }).join('');
@@ -1393,6 +1484,7 @@
       var mx=kmStack(KMP.item);
       cfg='<div class="kmCfg"><div class="kmCfgRow"><span>Count <span class="kmDimt">(max '+mx+')</span></span>'+
         '<span class="kmStep"><button type="button" data-st="-">−</button><input id="kmCount" inputmode="numeric" value="'+KMP.count+'"><button type="button" data-st="+">+</button></span></div>';
+      if(KMP.bundle) cfg+='<div class="kmCfgRow kmProjRow"><span id="kmProj">'+kmProjText()+'</span></div>';
       var et=ABMItems.enchTypeOf(KMP.item);
       if(et){
         cfg+='<div class="kmCfgRow"><span>Match</span><select id="kmMatch">'+
@@ -1446,8 +1538,9 @@
     var save=pop.querySelector('.kmSave'); if(save) save.onclick=saveKitSlot;
     var del=pop.querySelector('.kmDel'); if(del) del.onclick=function(){ removeKitSlot(KMP.slot); };
     var ci=pop.querySelector('#kmCount');
-    [].forEach.call(pop.querySelectorAll('.kmStep button'), function(b){ b.onclick=function(){ var mx=kmStack(KMP.item), v=(parseInt(ci.value,10)||1)+(this.dataset.st==='+'?1:-1); v=Math.max(1,Math.min(mx,v)); KMP.count=v; ci.value=v; }; });
-    if(ci) ci.onchange=function(){ var mx=kmStack(KMP.item), v=Math.max(1,Math.min(mx,parseInt(this.value,10)||1)); KMP.count=v; this.value=v; };
+    [].forEach.call(pop.querySelectorAll('.kmStep button'), function(b){ b.onclick=function(){ var mx=kmStack(KMP.item), v=(parseInt(ci.value,10)||1)+(this.dataset.st==='+'?1:-1); v=Math.max(1,Math.min(mx,v)); KMP.count=v; ci.value=v; kmUpdateProj(); }; });
+    if(ci) ci.oninput=function(){ var mx=kmStack(KMP.item), v=Math.max(1,Math.min(mx,parseInt(this.value,10)||1)); KMP.count=v; kmUpdateProj(); };
+    if(ci) ci.onchange=function(){ var mx=kmStack(KMP.item), v=Math.max(1,Math.min(mx,parseInt(this.value,10)||1)); KMP.count=v; this.value=v; kmUpdateProj(); };
     var ms=pop.querySelector('#kmMatch'); if(ms) ms.onchange=function(){ KMP.match=this.value; renderPicker(); };
     [].forEach.call(pop.querySelectorAll('.kmEnch input'), function(cb){ cb.onchange=function(){ var id=this.dataset.ench, k=KMP.enchants.indexOf(id);
       if(this.checked){ if(k<0) KMP.enchants.push(id); } else if(k>=0) KMP.enchants.splice(k,1);
@@ -1455,10 +1548,13 @@
   }
   function saveKitSlot(){
     if(!KMP || !KMP.item) return;
+    if(KMP.bundle && kmIsShulkerItem(KMP.item)){ toast('shulker boxes can’t go in a bundle — pick another item','err',4200); return; }
     var val={ item:KMP.item, count:KMP.count, match:KMP.match, enchants:(KMP.match==='ByEnchants')?KMP.enchants.slice():[] };
     var slot=KMP.slot, name=kmPretty(KMP.item), cnt=KMP.count;
     kmWriteSlot(slot, val)
-      .then(function(){ toast('slot '+(slot+1)+' = '+name+' ×'+cnt, 'ok'); closeKitPicker(); return refreshAfterMutate(); })
+      .then(function(){ var over=KMP.bundle && kmPickerProjWeight()>1.0001;
+        toast('slot '+(slot+1)+' = '+name+' ×'+cnt+(over?' — bundle now over capacity, trim it':''), over?'err':'ok', over?4600:2600);
+        closeKitPicker(); return refreshAfterMutate(); })
       .catch(function(e){ toast(e.message,'err',4200); });
   }
   function removeKitSlot(i){
@@ -1535,7 +1631,19 @@
       '.kmPopFoot{display:flex;align-items:center;gap:.5rem;margin-top:.6rem}.kmGrow{flex:1}'+
       '.kmPopFoot button{font-size:.76rem;border-radius:8px;padding:.36rem .7rem;cursor:pointer;border:1px solid var(--line,#1d2730);background:#0b0f14;color:#cdd9e2}'+
       '.kmSave{font-weight:700;color:var(--acc,#3ddc97);border-color:var(--acc-dim,#1f7a55)!important}.kmSave:disabled{opacity:.5;cursor:default}'+
-      '.kmDel{color:#ffb4b4;border-color:#5a2b2b!important}';
+      '.kmDel{color:#ffb4b4;border-color:#5a2b2b!important}'+
+      /* bundle: container-mode selector + capacity meter + picker projection */
+      '.kmModeBar{margin:.05rem 0 .35rem}.kmModeWrap{display:flex;align-items:center;gap:.35rem}'+
+      '.kmModeSel{font-family:var(--sans,sans-serif);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line,#1d2730);border-radius:7px;padding:.26rem .4rem}'+
+      '.kmKBbun{color:var(--acc,#3ddc97);border-color:var(--acc-dim,#1f7a55)}'+
+      '.kmCap{margin:.15rem 0 .5rem}.kmCapBar{height:8px;border-radius:8px;background:#0b0f14;border:1px solid var(--line,#1d2730);overflow:hidden}.kmCapBar i{display:block;height:100%;transition:width .15s}'+
+      '.kmCapTxt{font-family:var(--mono,monospace);font-size:.62rem;margin-top:.25rem;line-height:1.35}'+
+      '.kmCapOk .kmCapBar i{background:var(--acc,#3ddc97)}.kmCapOk .kmCapTxt{color:var(--dim,#7b8a98)}'+
+      '.kmCapWarn .kmCapBar i{background:var(--warn,#ffb454)}.kmCapWarn .kmCapTxt{color:var(--warn,#ffb454)}'+
+      '.kmCapOver .kmCapBar i{background:var(--crash,#ff6b6b)}.kmCapOver .kmCapTxt{color:#ffb4b4}'+
+      '.kmProjRow{justify-content:flex-start!important;font-family:var(--mono,monospace);font-size:.66rem;color:var(--dim,#7b8a98)}'+
+      '.kmProjWarn{color:var(--warn,#ffb454)}.kmProjOver{color:#ffb4b4;font-weight:700}'+
+      '.kmBad{color:#ffb4b4}';
     document.head.appendChild(s);
   }
 

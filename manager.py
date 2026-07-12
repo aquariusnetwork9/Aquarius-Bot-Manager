@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.20.0"
+__version__ = "3.20.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -3346,6 +3346,257 @@ def _map_tile_evict():
         pass
 
 
+# ---- per-bot "explored chunks" recorder + persistent tile store (Xaero-style) --------------
+# A record toggle gates *capture*; the map's Explored layer always serves whatever is already
+# stored, so turning recording OFF stops saving new ground but keeps past exploration visible.
+# While a bot records, a daemon polls its loopback /viewer/map.png (the same top-down 1px/block
+# render the live map uses) and composites each frame — skipping void (pure-black / unloaded)
+# pixels — into a persistent per-bot lod0 tile pyramid (512 blocks = 512px, matching the satellite
+# native tile). Per-bot maps, per-bot toggle. Compositing needs Pillow (python3-pil); without it
+# the recorder is a no-op and the toggle only tracks intent.
+EXPLORED_DIR = os.path.join(_AQ_DIR, "explored-map")
+EXPLORED_TILE = 512
+EXPLORED_POLL_S = 2.0
+try:
+    EXPLORED_CACHE_MB = max(0, int(os.environ.get("ABM_EXPLORED_MB", "512")))
+except ValueError:
+    EXPLORED_CACHE_MB = 512
+EXPLORED_MAX_FILES = 40000
+_EXPLORED_LOCK = threading.Lock()
+_EXPLORED_RECORDERS = {}                       # bot name -> threading.Event (set() to stop)
+_EXPLORED_STATE = os.path.join(EXPLORED_DIR, "_recording.json")
+_EXPLORED_CFG_PATH = [None]                     # cfg path for recorder threads (set on first start / resume)
+try:
+    from PIL import Image, ImageChops
+    _PIL_OK = True
+except Exception:
+    _PIL_OK = False
+
+
+def _explored_safe(name):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name or "bot")[:64]
+
+
+def _explored_dim_id(s):
+    s = (s or "").lower()
+    return 1 if "nether" in s else 2 if "end" in s else 0
+
+
+def _explored_tile_path(name, dim, lod, tx, ty):
+    return os.path.join(EXPLORED_DIR, _explored_safe(name), str(int(dim)), str(int(lod)),
+                        "%d_%d.png" % (int(tx), int(ty)))
+
+
+def _explored_evict():
+    """Trim EXPLORED_DIR to EXPLORED_CACHE_MB / EXPLORED_MAX_FILES (LRU by mtime), like _map_tile_evict."""
+    cap = EXPLORED_CACHE_MB * 1024 * 1024
+    entries, total = [], 0
+    for root, _dirs, files in os.walk(EXPLORED_DIR):
+        for fn in files:
+            if not fn.endswith(".png"):
+                continue
+            p = os.path.join(root, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+    if total <= cap and len(entries) <= EXPLORED_MAX_FILES:
+        return
+    entries.sort()
+    i = 0
+    while i < len(entries) and (total > cap or (len(entries) - i) > EXPLORED_MAX_FILES):
+        _mt, sz, p = entries[i]
+        try:
+            os.remove(p)
+            total -= sz
+        except OSError:
+            pass
+        i += 1
+
+
+def _explored_composite(name, dim, png_bytes, cx, cz, size):
+    """Paste one map.png frame (centered at world cx,cz, side px, 1px/block) into the bot's lod0 tiles.
+    Pure-black pixels are void/unloaded and stay transparent, so the void ring around the currently
+    loaded area never overwrites previously-saved ground. Tiles are 512-block, Z increases downward
+    (matching the satellite pyramid + Leaflet's lat=Z convention)."""
+    if not _PIL_OK:
+        return
+    try:
+        frame = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    except Exception:
+        return
+    fw, fh = frame.size
+    x0, z0 = cx - fw // 2, cz - fh // 2                 # world block at the frame's top-left pixel
+    r, g, b = frame.split()
+    mask = ImageChops.lighter(ImageChops.lighter(r, g), b).point(lambda p: 255 if p > 0 else 0)  # 255 = not void
+    if not mask.getbbox():
+        return
+    T = EXPLORED_TILE
+    tx0, tx1 = x0 // T, (x0 + fw - 1) // T              # // floors toward -inf: correct tile index for -coords
+    tz0, tz1 = z0 // T, (z0 + fh - 1) // T
+    touched = False
+    with _EXPLORED_LOCK:
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(tz0, tz1 + 1):
+                wx0, wz0 = tx * T, ty * T               # this tile's world origin
+                sx0, sz0 = max(x0, wx0), max(z0, wz0)
+                sx1, sz1 = min(x0 + fw, wx0 + T), min(z0 + fh, wz0 + T)
+                if sx1 <= sx0 or sz1 <= sz0:
+                    continue
+                box = (sx0 - x0, sz0 - z0, sx1 - x0, sz1 - z0)   # overlap region in frame pixels
+                mcrop = mask.crop(box)
+                if not mcrop.getbbox():                 # overlap is entirely void — nothing to write
+                    continue
+                fcrop = frame.crop(box)
+                path = _explored_tile_path(name, dim, 0, tx, ty)
+                tile = None
+                try:
+                    if os.path.exists(path):
+                        tile = Image.open(path).convert("RGBA")
+                except Exception:
+                    tile = None
+                if tile is None:
+                    tile = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+                tile.paste(fcrop, (sx0 - wx0, sz0 - wz0), mcrop)
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    tmp = path + ".tmp"
+                    tile.save(tmp, "PNG")
+                    os.replace(tmp, path)
+                    touched = True
+                except Exception:
+                    pass
+    if touched:
+        try:
+            _explored_evict()
+        except Exception:
+            pass
+
+
+def _explored_recorder(name, stop):
+    """Poll a recording bot's loopback map render and composite it into its explored tiles until stopped."""
+    while not stop.is_set():
+        try:
+            inst = {}
+            cfg_path = _EXPLORED_CFG_PATH[0]
+            if cfg_path:
+                try:
+                    inst = (load_config(cfg_path).get("by_name") or {}).get(name) or {}
+                except Exception:
+                    inst = {}
+            port = viewer_port_for(inst)
+            if port and _PIL_OK:
+                dim = 0
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:%d/viewer/state.json" % port, timeout=4) as rq:
+                        stj = json.loads(rq.read().decode("utf-8", "replace"))
+                    dim = _explored_dim_id(stj.get("dimension") or stj.get("dim") or stj.get("world"))
+                except Exception:
+                    pass
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:%d/viewer/map.png?size=%d" % (port, EXPLORED_TILE), timeout=6) as rq:
+                        png = rq.read()
+                        cx = int(rq.headers.get("X-Center-X", "0"))
+                        cz = int(rq.headers.get("X-Center-Z", "0"))
+                        size = int(rq.headers.get("X-Size", str(EXPLORED_TILE)))
+                    _explored_composite(name, dim, png, cx, cz, size)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        stop.wait(EXPLORED_POLL_S)
+
+
+def _explored_recording_set():
+    try:
+        with open(_EXPLORED_STATE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _explored_save_recording(s):
+    try:
+        os.makedirs(EXPLORED_DIR, exist_ok=True)
+        tmp = _EXPLORED_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(sorted(s), f)
+        os.replace(tmp, _EXPLORED_STATE)
+    except Exception:
+        pass
+
+
+def _explored_start(name):
+    with _EXPLORED_LOCK:
+        if name in _EXPLORED_RECORDERS:
+            return
+        ev = threading.Event()
+        _EXPLORED_RECORDERS[name] = ev
+    threading.Thread(target=_explored_recorder, args=(name, ev), daemon=True).start()
+
+
+def _explored_stop(name):
+    with _EXPLORED_LOCK:
+        ev = _EXPLORED_RECORDERS.pop(name, None)
+    if ev:
+        ev.set()
+
+
+def explored_set_record(name, on, cfg_path=None):
+    if cfg_path:
+        _EXPLORED_CFG_PATH[0] = cfg_path
+    s = _explored_recording_set()
+    if on:
+        s.add(name)
+        _explored_start(name)
+    else:
+        s.discard(name)
+        _explored_stop(name)
+    _explored_save_recording(s)
+
+
+def explored_is_recording(name):
+    with _EXPLORED_LOCK:
+        return name in _EXPLORED_RECORDERS
+
+
+def explored_resume_all(cfg_path):
+    """Re-arm recorders for bots that were recording before an ABM restart."""
+    _EXPLORED_CFG_PATH[0] = cfg_path
+    if not _PIL_OK:
+        return
+    for n in _explored_recording_set():
+        _explored_start(n)
+
+
+# ---- per-bot map waypoints (named persistent markers dropped from the right-click menu) ----
+WAYPOINTS_DIR = os.path.join(_AQ_DIR, "waypoints")
+
+
+def _waypoints_path(name):
+    return os.path.join(WAYPOINTS_DIR, _explored_safe(name) + ".json")
+
+
+def waypoints_load(name):
+    try:
+        with open(_waypoints_path(name)) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def waypoints_save(name, wps):
+    os.makedirs(WAYPOINTS_DIR, exist_ok=True)
+    tmp = _waypoints_path(name) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(wps[:500], f)                        # hard cap so a runaway can't grow unbounded
+    os.replace(tmp, _waypoints_path(name))
+
+
 _CF_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 _CF_DL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 _CF_BIN = ("/usr/local/bin/cloudflared", "/usr/bin/cloudflared")
@@ -5531,6 +5782,13 @@ class Handler(BaseHTTPRequestHandler):
             if sub == "command":
                 return "operate"
             return None
+        if rest.startswith("map/"):              # explored-chunk tiles + record toggle + waypoints
+            sub = rest[len("map/"):]
+            if sub.startswith("explored/"):
+                return "view"
+            if sub in ("record", "waypoints"):
+                return "view" if method == "GET" else "operate"
+            return None
         if method == "GET":
             return "view" if rest in ("logs", "config") else None
         if rest in ("start", "stop", "restart", "command"):
@@ -6323,6 +6581,36 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/instances/") and "/viewer/" in path:
             return self._viewer_relay(path, q)
 
+        # explored-chunk map tiles + per-bot record state + waypoints (local; a selected remote
+        # node was already proxied above, and serves these from its own disk the same way).
+        if path.startswith("/api/instances/") and "/map/" in path:
+            mm = re.match(r"^/api/instances/([^/]+)/map/explored/(\d+)/(\d+)/(-?\d+)/(-?\d+)$", path)
+            if mm:
+                name = urllib.parse.unquote(mm.group(1))
+                dim, lod, tx, ty = int(mm.group(2)), int(mm.group(3)), int(mm.group(4)), int(mm.group(5))
+                if lod != 0:
+                    return self._tile_blank(30)          # v1 stores lod0 only; Leaflet scales other zooms
+                try:
+                    with open(_explored_tile_path(name, dim, 0, tx, ty), "rb") as f:
+                        data = f.read()
+                except Exception:
+                    return self._tile_blank(30)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")   # tiles change as the bot explores
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+                return
+            mr = re.match(r"^/api/instances/([^/]+)/map/(record|waypoints)$", path)
+            if mr:
+                name = urllib.parse.unquote(mr.group(1))
+                if mr.group(2) == "record":
+                    return self._json({"on": explored_is_recording(name), "pil": _PIL_OK})
+                return self._json({"waypoints": waypoints_load(name)})
+            return self._json({"error": "not found"}, 404)
+
         if path.startswith("/api/instances/") and "/control/" in path:
             return self._control_relay(path, q)
 
@@ -6681,6 +6969,33 @@ class Handler(BaseHTTPRequestHandler):
         # live control plane: POST a command to a bot, or write a config field (forwarded to its loopback /control/*)
         if path.startswith("/api/instances/") and (path.endswith("/control/command") or path.endswith("/control/config")):
             return self._control_relay(path, pq)
+
+        # spatial map: flip a bot's chunk-recording toggle, or add/delete a per-bot waypoint
+        mr = re.match(r"^/api/instances/([^/]+)/map/(record|waypoints)$", path)
+        if mr:
+            name = urllib.parse.unquote(mr.group(1))
+            try:
+                body = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad request"}, 400)
+            if mr.group(2) == "record":
+                on = bool(body.get("on"))
+                explored_set_record(name, on, self.cfg_path)
+                return self._json({"ok": True, "on": on, "pil": _PIL_OK})
+            wps = waypoints_load(name)
+            if body.get("del") is not None:
+                did = str(body.get("del"))
+                wps = [w for w in wps if str(w.get("id")) != did]
+            else:
+                wp = {
+                    "id": str(body.get("id") or "wp%d" % (int(time.time() * 1000) % 1000000000)),
+                    "x": int(body.get("x", 0)), "z": int(body.get("z", 0)), "dim": int(body.get("dim", 0)),
+                    "label": str(body.get("label", "Waypoint"))[:60],
+                    "color": str(body.get("color", "#5cc8ff"))[:9],
+                }
+                wps = [w for w in wps if str(w.get("id")) != wp["id"]] + [wp]
+            waypoints_save(name, wps)
+            return self._json({"ok": True, "waypoints": wps})
 
         # controller: set/clear which box this browser is viewing (abm_node cookie)
         if path == "/api/node/select":
@@ -7537,6 +7852,11 @@ def serve(cfg_path, host, port):
     njobs = len((cfg["raw"].get("settings", {}).get("schedules") or {}).get("jobs", []))
     if njobs:
         print(f"scheduler: {njobs} job(s) loaded")
+    # spatial map: re-arm chunk recorders for bots that were recording before this restart
+    rec = _explored_recording_set()
+    if rec:
+        print(f"map recorder: resuming {len(rec)} bot(s)" + ("" if _PIL_OK else " — WARNING: Pillow missing, no-op"))
+    explored_resume_all(cfg_path)
     # resume public sharing (active exposure provider) if it was left on and a login is set
     if SHARE.enabled(cfg) and auth_configured(cfg):
         print(f"public sharing: resuming '{SHARE.active_id(cfg)}' provider…")
@@ -12203,8 +12523,8 @@ function closeShares(e){ if(!e||e.target.id==='shareScrim'){ $('shareScrim').cla
 function shToggleAll(){ const on=$('shAll').checked; $('shBotsWrap').style.opacity=on?.4:1; $('shBotsWrap').style.pointerEvents=on?'none':'auto'; }
 async function loadShareBots(){
   const w=$('shBots');
-  try{ const d=await (await fetch('/api/instances')).json();
-    w.innerHTML=(d.instances||[]).map(i=>'<label class="shbot"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto"> '+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</label>').join('')||'<span class="hint">No bots.</span>';
+  try{ const d=await api('/api/fleet/status');
+    w.innerHTML=fleetBots(d).map(i=>'<label class="shbot"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto"> '+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</label>').join('')||'<span class="hint">No bots.</span>';
   }catch(e){ w.innerHTML='<span class="hint">Could not load bots.</span>'; }
 }
 async function createShare(btn){
@@ -12278,6 +12598,13 @@ function onBotCheck(cb){
   if(cb.checked){ const inv=!!cb.closest('#usIBots'); const dr=getRole(inv?'roleI':'roleA'); if(dr!=='admin') sel.value=dr; }
 }
 function botCheckboxes(){ return _usrBots.map(i=>'<label class="shbot" style="display:flex;align-items:center;gap:.45rem"><input type="checkbox" value="'+esc(i.name)+'"'+(i.node?' data-node="'+esc(i.node)+'"':'')+' style="width:auto" onchange="onBotCheck(this)"> <span>'+esc(i.name)+(i.node?' <span class="hint">@'+esc(i.node)+'</span>':'')+'</span>'+botRoleSel()+'</label>').join('')||'<span class="hint">No bots.</span>'; }
+// fleet-wide bot list for the user/share pickers: the controller's own bots (node=null, matching
+// today's local-target shape) plus every reachable node's bots tagged with that node's registry name.
+function fleetBots(d){
+  const out=[];
+  (d.fleet||[]).forEach(r=>(r.instances||[]).forEach(i=>out.push({name:i.name, node:r.controller?null:r.name})));
+  return out;
+}
 async function openUsers(){
   $('usersScrim').classList.add('open'); $('usrMsg').textContent=''; $('invMsg').textContent=''; $('invResult').style.display='none';
   $('usrRole_add').innerHTML=roleRadiosHtml('roleA'); $('usrScope_add').innerHTML=scopeHtml('usA');
@@ -12286,7 +12613,7 @@ async function openUsers(){
 }
 function closeUsers(e){ if(!e||e.target.id==='usersScrim') $('usersScrim').classList.remove('open'); }
 async function loadUserBots(){
-  try{ const d=await (await fetch('/api/instances')).json(); _usrBots=d.instances||[]; }catch(e){ _usrBots=[]; }
+  try{ const d=await api('/api/fleet/status'); _usrBots=fleetBots(d); }catch(e){ _usrBots=[]; }
   ['usA','usI'].forEach(idp=>{ const el=$(idp+'Bots'); if(el) el.innerHTML=botCheckboxes(); });
 }
 async function addUser(btn){

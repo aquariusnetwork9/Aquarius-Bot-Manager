@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.20.0 — *latest*
+## v3.20.1 — *latest*
+
+- **Spatial map: per-bot "explored chunks" recorder.** The fullscreen map now records a persistent, Xaero-style trail of everywhere a bot has actually rendered — polling the bot's existing `/viewer/map.png`, composited into a per-bot 512px tile pyramid on disk (void stays unrecorded). A **record** toggle gates new writes; playback always shows what's already saved, so switching it off just stops growing the trail. Right-click the map for **Go here / Copy coords / Add waypoint / Measure**, and waypoints persist per bot. No bot/jar changes — everything lives ABM-side. Needs `python3-pil` (installed automatically by `install.sh`; a missing Pillow just makes the recorder a no-op).
+- **Users & share links can now grant access to bots on other nodes.** The bot picker in the Users and Share-link modals only ever listed bots on the local box, so there was no way to check a remote node's bot as an explicit per-user or per-share target — even though the "@node" label was already supported. It now pulls the full fleet (controller + every registered node) the same way the Fleet view does, so remote bots show up as `name @node` and can be picked directly. "All bots" is unchanged and still covers local bots only.
+
+## v3.20.0
 
 - **The item-list pickers are now live and editable.** The populated chip + dropdown pickers on **Action Limiter** (illegal items), **Auto Eat** (food list), **Auto Miner** (ore targets), and **Auto Drop** (drop list) were a read-only mockup — the "+ add item" dropdown did nothing. They now bind to the bot's **real config field**: each shows the bot's actual list and **adding/removing an item persists immediately** to the running bot (gated by the per-module **config** permission; read-only without it). Requires **AquariusProxy 5.12.2+** — its `/control/config` op API now handles string **Set** fields (`itemsBlacklist`, `foods`) and list **remove-by-value**, which it previously couldn't edit at all. Older bots / unmapped fields stay read-only.
 

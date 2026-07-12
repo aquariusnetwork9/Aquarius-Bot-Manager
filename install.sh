@@ -73,7 +73,9 @@ echo "==> Installing Aquarius Bot Manager  (user=$RUN_USER dir=$INSTALL_DIR base
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3 tmux unzip wget git curl
+# python3-pil (Pillow) powers the spatial map's per-bot "explored chunks" recorder (composites the
+# bot's map render into a persistent tile pyramid). Optional — without it the recorder is a no-op.
+apt-get install -y python3 python3-pil tmux unzip wget git curl
 
 # fetch or update the manager
 if [ -d "$INSTALL_DIR/.git" ]; then
