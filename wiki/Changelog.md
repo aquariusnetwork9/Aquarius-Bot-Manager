@@ -2,7 +2,13 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.20.1 — *latest*
+## v3.21.0 — *latest*
+
+- **The Console tab now renders color and clickable links.** The live console tail was plain text — colored log output came through as raw ANSI escape junk (or got silently stripped), and URLs were inert. Color/bold formatting now renders as it would in a real terminal, and `http(s)://` links are clickable (opens in a new tab). Applies to both the bot drawer's Console tab and the Telemetry page's mini console. Log text is HTML-escaped before any of this runs, so console content — which includes live, untrusted 2b2t chat — can't inject markup.
+- **You can now send a bare Enter.** The console command bar silently refused to send an empty line, so there was no way to accept a bracketed default in an interactive prompt (e.g. a launcher's first-run setup wizard asking for a port) the way you can in a real terminal. An empty box + Enter/Send now sends a plain Enter keypress.
+- **"⟲ Re-run installer" button in the Console tab.** For when a bot's first-run setup wizard got answered wrong or was interrupted: backs up `config.json` (timestamped, in the bot's own folder) and restarts the bot so the wizard runs again. The Minecraft account (`mc_auth_cache.json`) and the jar are left untouched. Owner-only, confirmation required.
+
+## v3.20.1
 
 - **Spatial map: per-bot "explored chunks" recorder.** The fullscreen map now records a persistent, Xaero-style trail of everywhere a bot has actually rendered — polling the bot's existing `/viewer/map.png`, composited into a per-bot 512px tile pyramid on disk (void stays unrecorded). A **record** toggle gates new writes; playback always shows what's already saved, so switching it off just stops growing the trail. Right-click the map for **Go here / Copy coords / Add waypoint / Measure**, and waypoints persist per bot. No bot/jar changes — everything lives ABM-side. Needs `python3-pil` (installed automatically by `install.sh`; a missing Pillow just makes the recorder a no-op).
 - **Users & share links can now grant access to bots on other nodes.** The bot picker in the Users and Share-link modals only ever listed bots on the local box, so there was no way to check a remote node's bot as an explicit per-user or per-share target — even though the "@node" label was already supported. It now pulls the full fleet (controller + every registered node) the same way the Fleet view does, so remote bots show up as `name @node` and can be picked directly. "All bots" is unchanged and still covers local bots only.

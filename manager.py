@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.20.1"
+__version__ = "3.21.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -194,7 +194,9 @@ def logs(inst, lines=300):
     s = session_name(inst)
     if not session_exists(s):
         return "(not running)"
-    p = tmux("capture-pane", "-t", s, "-p", "-J", "-S", f"-{int(lines)}")
+    # -e keeps the pane's SGR color/style escapes so the console can render them instead of
+    # discarding all formatting at capture time.
+    p = tmux("capture-pane", "-t", s, "-p", "-e", "-J", "-S", f"-{int(lines)}")
     return p.stdout if p.returncode == 0 else f"(error reading logs: {p.stderr})"
 
 
@@ -554,6 +556,8 @@ def connection_state(inst, status=None):
 
 def send_command(inst, command):
     """Type a command into the instance's live console (tmux pane stdin) and press Enter.
+    An empty command is a bare Enter keypress — same as a regular terminal, this is how you
+    accept a bracketed default in an interactive prompt (e.g. a launcher's first-run wizard).
     Returns a status string. Raises ValueError if not running."""
     s = session_name(inst)
     if not session_exists(s):
@@ -561,11 +565,10 @@ def send_command(inst, command):
     if pane_dead(s):
         raise ValueError("instance has crashed; restart it before sending commands")
     command = (command or "").rstrip("\n")
-    if command == "":
-        raise ValueError("empty command")
     # -l sends the text literally (so 'C-c', spaces, etc. aren't read as key names);
     # '--' stops option parsing so commands starting with '-' work; then Enter submits.
-    tmux("send-keys", "-t", s, "-l", "--", command)
+    if command:
+        tmux("send-keys", "-t", s, "-l", "--", command)
     tmux("send-keys", "-t", s, "Enter")
     return "sent"
 
@@ -2322,6 +2325,68 @@ def rollback_migration(cfg_path, name):
 
     MIGRATE_JOB.start(name, target)
     return {"ok": True, "name": name, "restored_from": os.path.basename(bak)}
+
+
+# ---------------------------------------------------------------------------
+# re-run a bot's first-run setup wizard  (fast synchronous op — no download involved,
+# unlike migrate, so no background job/log needed)
+# ---------------------------------------------------------------------------
+
+def _preinstall_backups(directory):
+    """Existing pre-reinstall backup subdirs in a bot dir, oldest..newest."""
+    try:
+        ds = [d for d in os.listdir(directory)
+              if d.startswith("preinstall-") and os.path.isdir(os.path.join(directory, d))]
+    except OSError:
+        return []
+    return sorted(ds)
+
+
+def reinstall_instance(inst):
+    """Back up config.json (timestamped, recoverable) and remove it, then restart the bot so its
+    launcher/proxy first-run setup wizard runs again — for when the initial setup got answered wrong
+    or was interrupted. mc_auth_cache.json (the Minecraft account), launch_config.json, and the jar
+    are left untouched; only the bot's own runtime config is reset."""
+    directory = inst["dir"]
+    cpath = os.path.join(directory, "config.json")
+    was_running = instance_status(inst) == "running"
+    if was_running:
+        stop(inst)
+        for _ in range(30):
+            if instance_status(inst) != "running":
+                break
+            time.sleep(0.5)
+    bak = None
+    if os.path.isfile(cpath):
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bakdir = os.path.join(directory, "preinstall-" + ts)
+        os.makedirs(bakdir, exist_ok=True)
+        shutil.copy2(cpath, os.path.join(bakdir, "config.json"))
+        os.remove(cpath)
+        bak = os.path.basename(bakdir)
+    start(inst)
+    return {"ok": True, "backup": bak, "status": instance_status(inst)}
+
+
+def rollback_reinstall(inst):
+    """Restore the most recent pre-reinstall config.json backup and restart."""
+    directory = inst["dir"]
+    baks = _preinstall_backups(directory)
+    if not baks:
+        raise ValueError("no pre-reinstall backup found for this bot")
+    src = os.path.join(directory, baks[-1], "config.json")
+    if not os.path.isfile(src):
+        raise ValueError("backup is missing config.json")
+    was_running = instance_status(inst) == "running"
+    if was_running:
+        stop(inst)
+        for _ in range(30):
+            if instance_status(inst) != "running":
+                break
+            time.sleep(0.5)
+    shutil.copy2(src, os.path.join(directory, "config.json"))
+    start(inst)
+    return {"ok": True, "restored_from": baks[-1], "status": instance_status(inst)}
 
 
 # ---------------------------------------------------------------------------
@@ -7555,6 +7620,26 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
 
+        # re-run a bot's first-run setup wizard (owner-only; backs up config.json first) + rollback
+        m = re.match(r"^/api/instances/([^/]+)/reinstall$", path)
+        if m:
+            inst = self._find(cfg, urllib.parse.unquote(m.group(1)))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            try:
+                return self._json(reinstall_instance(inst))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+        m = re.match(r"^/api/instances/([^/]+)/reinstall/rollback$", path)
+        if m:
+            inst = self._find(cfg, urllib.parse.unquote(m.group(1)))
+            if not inst:
+                return self._json({"error": "no such instance"}, 404)
+            try:
+                return self._json(rollback_reinstall(inst))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
         # per-instance action
         m = re.match(r"^/api/instances/([^/]+)/(start|stop|restart)$", path)
         if m:
@@ -10642,7 +10727,9 @@ function showTab(t){
 function renderPresetBar(){
   const bar=$('presetBar'); if(!bar)return;
   const presets=(SETTINGS&&SETTINGS.console_presets)||[];
-  bar.innerHTML=presets.map((p,i)=>`<button class="chip" title="sends: ${esc(p.command)}" onclick="sendPreset(${i})">${esc(p.label)}</button>`).join('');
+  const chips=presets.map((p,i)=>`<button class="chip" title="sends: ${esc(p.command)}" onclick="sendPreset(${i})">${esc(p.label)}</button>`).join('');
+  const reinstall=`<button class="chip warn owner-only" title="Back up config.json and restart so this bot's first-run setup wizard runs again" onclick="reinstallBot(this)">⟲ Re-run installer</button>`;
+  bar.innerHTML=chips+reinstall;
 }
 async function sendPreset(i){
   const presets=(SETTINGS&&SETTINGS.console_presets)||[];
@@ -10651,6 +10738,17 @@ async function sendPreset(i){
   if(d.error){ $('drawerMsg').textContent='✗ '+d.error; return; }
   $('drawerMsg').textContent='✓ sent: '+presets[i].command;
   setTimeout(loadLogs,250); setTimeout(loadLogs,1200);
+}
+async function reinstallBot(btn){
+  if(!CUR)return;
+  if(!confirm('Back up '+CUR+'’s config.json and restart it so the first-run setup wizard runs again?\n\nA timestamped backup is kept in the bot’s folder (preinstall-…) — the Minecraft account and jar are untouched.'))return;
+  btn.disabled=true;
+  const d=await api(`/api/instances/${encodeURIComponent(CUR)}/reinstall`,'POST',{});
+  btn.disabled=false;
+  const msg=$('drawerMsg');
+  if(d.error){ msg.textContent='✗ '+d.error; return; }
+  msg.textContent=d.backup?('✓ backed up config → '+d.backup+', restarting…'):'✓ restarting…';
+  setTimeout(loadLogs,600); setTimeout(loadLogs,1500); setTimeout(loadLogs,3000);
 }
 // follow-tail / scroll-pause state for the console
 let logPinned=true, lastLogText=null, lastSeenLines=0;
@@ -10673,7 +10771,7 @@ async function loadLogs(){
   const txt=d.logs||'(empty)';
   if(txt===lastLogText){ if(logPinned) box.scrollTop=box.scrollHeight; return; }
   const prevH=box.scrollHeight, prevTop=box.scrollTop;
-  lastLogText=txt; box.textContent=txt;
+  lastLogText=txt; box.innerHTML=ansiToHtml(txt);
   if(logPinned){
     box.scrollTop=box.scrollHeight; lastSeenLines=logLineCount();
     const p=$('logPill'); if(p) p.style.display='none';
@@ -10688,13 +10786,16 @@ async function loadLogs(){
 }
 let CMDHIST=[], CMDIDX=-1;
 async function sendCmd(){
+  if(!CUR)return;
+  // an empty box + Enter/Send is a bare Enter keypress — same as a real terminal, this is how
+  // you accept a bracketed default in an interactive prompt (e.g. a launcher's setup wizard).
   const inp=$('cmdInput'); const cmd=inp.value.trim();
-  if(!cmd)return;
   inp.disabled=true;
   const d=await api(`/api/instances/${encodeURIComponent(CUR)}/command`,'POST',{command:cmd});
   inp.disabled=false; inp.focus();
   if(d.error){ $('drawerMsg').textContent='✗ '+d.error; return; }
-  CMDHIST.push(cmd); CMDIDX=CMDHIST.length; inp.value='';
+  if(cmd){ CMDHIST.push(cmd); CMDIDX=CMDHIST.length; }
+  inp.value='';
   $('drawerMsg').textContent='';
   // surface the result quickly (log also auto-polls)
   setTimeout(loadLogs,250); setTimeout(loadLogs,1200);
@@ -11299,7 +11400,7 @@ async function telTailNow(){
   const txt=d.logs||'(not running)';
   if(txt===box.__last)return;
   const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<60;
-  box.__last=txt; box.textContent=txt;
+  box.__last=txt; box.innerHTML=ansiToHtml(txt);
   if(atBottom)box.scrollTop=box.scrollHeight;
 }
 function openTelemetry(name){
@@ -12374,6 +12475,39 @@ async function adopt(session,btn){
 }
 
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+// console rich-text rendering: ANSI SGR color/style -> <span>, plus clickable http(s) links.
+// Escapes first so log content (which is untrusted — it includes live 2b2t chat) can never inject
+// markup; linkify only ever runs on already-escaped text chunks, never on the tags this builds.
+const ANSI_FG={30:'#5c6773',31:'#f07178',32:'#a0d17a',33:'#e0c26e',34:'#7aa2f7',35:'#c58eef',36:'#5fd8cf',37:'#c8ccd4',
+               90:'#6b7280',91:'#ff9aa6',92:'#b9e896',93:'#f2d98a',94:'#9cbcfb',95:'#dcabff',96:'#8fe9e0',97:'#f2f4f8'};
+const URL_RE=/(https?:\/\/[^\s<>"']+)/g;
+function linkify(chunk){
+  return chunk.replace(URL_RE,u=>{
+    const clean=u.replace(/[.,)\]}>]+$/,'');           // don't swallow trailing prose punctuation
+    const trail=u.slice(clean.length);
+    return `<a href="${clean}" target="_blank" rel="noopener noreferrer">${clean}</a>${trail}`;
+  });
+}
+function ansiToHtml(raw){
+  const text=esc(raw);
+  const re=/\x1b\[([0-9;]*)m/g;
+  let out='', open=false, bold=false, last=0, m;
+  while((m=re.exec(text))){
+    out+=linkify(text.slice(last,m.index)); last=re.lastIndex;
+    const codes=m[1]===''?[0]:m[1].split(';').map(Number);
+    for(const c of codes){
+      if(c===0||c===39){ if(open){out+='</span>';open=false;} if(c===0)bold=false; }
+      else if(c===1){ bold=true; }
+      else if(ANSI_FG[c]!=null){
+        if(open) out+='</span>';
+        out+=`<span style="color:${ANSI_FG[c]}${bold?';font-weight:700':''}">`; open=true;
+      }
+    }
+  }
+  out+=linkify(text.slice(last));
+  if(open) out+='</span>';
+  return out.replace(/\x1b\[[0-9;]*[A-Za-z]/g,'');      // drop any other leftover escape codes
+}
 function jsq(s){return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
 function tick(){$('clock').textContent=new Date().toLocaleTimeString();syncAgo();}
 setInterval(tick,1000);tick();
