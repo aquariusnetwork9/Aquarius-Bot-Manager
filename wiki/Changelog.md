@@ -2,7 +2,12 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.21.0 — *latest*
+## v3.21.1 — *latest*
+
+- **Client theme (beta) — a tab-based dashboard layout, opt-in.** A second visual theme alongside today's dashboard (now labeled **Graphite**). Pick it in **Settings → Appearance**: a top tab bar (Dashboard / Fleet / Activity / Automation) replaces the sidebar, the rest of the toolbar collapses into a **⋯ overflow menu**, and a themed **box switcher** appears next to the brand for owners/admins managing more than one box. The Console tab gets its own visual style under Client — **Threaded Log**, **Message Feed** (Discord-like grouping), or **Status Deck** — picked from the same Appearance panel, rendered over the same real console output (best-effort line classification: a misclassified line only changes which visual lane it lands in, never the text). Accent color, font pairing, and background image are shared between both themes. Defaults to **Graphite** on every box — nothing changes until you switch it on. The 48-module Control Surface keeps its existing v1/v2/v3 styles for now; a matching Client style is a fast-follow.
+- **Appearance settings now propagate across the fleet.** Saving a theme/layout change on the controller pushes it to every registered node in the background, so the whole fleet renders the same look instead of each box needing to be set individually.
+
+## v3.21.0
 
 - **The Console tab now renders color and clickable links.** The live console tail was plain text — colored log output came through as raw ANSI escape junk (or got silently stripped), and URLs were inert. Color/bold formatting now renders as it would in a real terminal, and `http(s)://` links are clickable (opens in a new tab). Applies to both the bot drawer's Console tab and the Telemetry page's mini console. Log text is HTML-escaped before any of this runs, so console content — which includes live, untrusted 2b2t chat — can't inject markup.
 - **You can now send a bare Enter.** The console command bar silently refused to send an empty line, so there was no way to accept a bracketed default in an interactive prompt (e.g. a launcher's first-run setup wizard asking for a port) the way you can in a real terminal. An empty box + Enter/Send now sends a plain Enter keypress.

@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.0"
+__version__ = "3.21.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2458,6 +2458,8 @@ def get_settings(cfg):
         "ui": {
             "sidebar": s.get("ui", {}).get("sidebar", "full"),
             "sidebar_side": s.get("ui", {}).get("sidebar_side", "left"),
+            "theme_family": s.get("ui", {}).get("theme_family", "graphite"),
+            "console_style": s.get("ui", {}).get("console_style", "feed"),
         },
         "box_name": s.get("box_name") or "Controller",
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
@@ -2553,6 +2555,16 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             if sd not in ("left", "right"):
                 raise ValueError("sidebar_side must be left or right")
             u["sidebar_side"] = sd
+        if "theme_family" in ui:
+            tf = (ui["theme_family"] or "").strip()
+            if tf not in ("graphite", "client"):
+                raise ValueError("theme_family must be graphite or client")
+            u["theme_family"] = tf
+        if "console_style" in ui:
+            cs = (ui["console_style"] or "").strip()
+            if cs not in ("threaded", "feed", "deck"):
+                raise ValueError("console_style must be threaded, feed or deck")
+            u["console_style"] = cs
     if schedules is not None:
         s["schedules"] = validate_schedule(schedules)
     save_config(cfg)
@@ -2562,6 +2574,24 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
         except Exception:
             pass
     return get_settings(cfg)
+
+
+def propagate_appearance(theme, ui):
+    """Push a just-saved theme/ui to every registered node, so the whole fleet renders the
+    same look. Only the controller has entries in its own nodes.json, so this is naturally
+    a one-hop broadcast (a node never re-propagates further). Fire-and-forget in the
+    background — an unreachable node just misses this update; it's not worth blocking the
+    Save button on N node round-trips."""
+    nodes = load_nodes()["nodes"]
+    if not nodes:
+        return
+    def push(node):
+        try:
+            node_request(node, "POST", "/api/settings", body={"theme": theme, "ui": ui}, timeout=10)
+        except Exception:
+            pass
+    for n in nodes:
+        threading.Thread(target=push, args=(n,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -7290,6 +7320,8 @@ class Handler(BaseHTTPRequestHandler):
                                     ui=p.get("ui"),
                                     schedules=p.get("schedules"),
                                     box_name=p.get("box_name"))
+                if p.get("theme") is not None or p.get("ui") is not None:
+                    propagate_appearance(out.get("theme"), out.get("ui"))
                 return self._json({"ok": True, "settings": out})
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
@@ -9171,6 +9203,132 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 .permrow{display:flex;gap:.5rem;align-items:center;padding:.18rem .1rem;font-size:.82rem;border-bottom:1px solid #ffffff08}
 .permcol{width:48px;text-align:center;flex:none}
 .permcol input{width:auto}
+
+/* ===================== Client theme (tab nav) — additive, scoped under body.tf-client ===================== */
+:root{
+  --faint:#5c6773; --u-blue:#7aa2f7; --u-violet:#c58eef; --u-rose:#ff9aa6; --u-cyan:#5fd8cf;
+}
+body.tf-client #abmNodeBar{display:none}
+#clientHeader{flex-wrap:wrap;row-gap:.6rem}
+.cl-brand{display:flex;align-items:center;gap:.6rem;font-weight:800;letter-spacing:-.02em;font-size:1.05rem;flex:none}
+.cl-brand .dot{width:10px;height:10px;border-radius:50%;background:var(--acc);box-shadow:0 0 12px var(--acc)}
+.cl-brand small{font-family:var(--mono);font-weight:400;color:var(--dim);font-size:.66rem;letter-spacing:0}
+
+.boxswitch{position:relative;flex:none}
+.boxswitch-btn{display:flex;align-items:center;gap:.35rem;font-family:var(--sans);font-weight:600;font-size:.76rem;
+  color:var(--txt);background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:.35rem .6rem;cursor:pointer}
+.boxswitch-btn:hover{border-color:var(--acc-dim)}
+.boxswitch-btn .car{color:var(--dim);font-size:.7rem}
+.boxswitch-menu{position:absolute;top:calc(100% + 6px);left:0;min-width:200px;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 28px #00000060;padding:.35rem;z-index:40;display:none}
+.boxswitch-menu.open{display:block}
+.boxswitch-menu button{display:flex;align-items:center;gap:.5rem;width:100%;text-align:left;background:none;border:none;
+  color:var(--txt);font-family:var(--sans);font-size:.78rem;padding:.42rem .55rem;border-radius:7px;cursor:pointer}
+.boxswitch-menu button:hover{background:var(--panel-2)}
+.boxswitch-menu button.cur{color:var(--acc)}
+.boxswitch-menu button .bd{width:6px;height:6px;border-radius:50%;background:var(--acc);flex:none}
+.boxswitch-menu button .bd.off{background:var(--dim)}
+.boxswitch-menu .bx-off{color:var(--dim);font-size:.68rem}
+
+.cl-tabs{display:flex;gap:1.3rem;flex:1;min-width:0;overflow-x:auto}
+.viewtab{position:relative;font-weight:600;font-size:.83rem;color:var(--dim);padding:.5rem 0;cursor:pointer;
+  white-space:nowrap;user-select:none}
+.viewtab:hover{color:var(--txt)}
+.viewtab.active{color:var(--txt)}
+.viewtab.active::after{content:'';position:absolute;left:0;right:0;bottom:-1.05rem;height:2px;background:var(--acc);border-radius:2px 2px 0 0}
+.viewtab .pip{margin-left:.35rem;background:#ffb45420;color:var(--warn);font-size:.66rem;font-weight:700;border-radius:5px;padding:0 .35rem}
+
+.cl-overflow{position:relative;flex:none}
+.cl-overflow-btn{font-family:var(--sans);font-weight:700;font-size:.85rem;color:var(--txt);background:var(--panel-2);
+  border:1px solid var(--line);border-radius:8px;padding:.4rem .6rem;cursor:pointer}
+.cl-overflow-menu{position:absolute;top:calc(100% + 6px);right:0;min-width:210px;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 28px #00000060;padding:.35rem;z-index:40;display:none}
+.cl-overflow-menu.open{display:block}
+.cl-overflow-menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--txt);
+  font-family:var(--sans);font-size:.8rem;font-weight:600;padding:.45rem .6rem;border-radius:7px;cursor:pointer}
+.cl-overflow-menu button:hover{background:var(--panel-2)}
+.cl-overflow-menu button.danger{color:var(--crash)}
+.cl-overflow-menu hr{border:none;border-top:1px solid var(--line);margin:.3rem 0}
+
+/* ---- Client console styles: threaded / feed / deck, layered over the same real log data ---- */
+.log.style-thread,.log.style-feed,.log.style-deck{white-space:normal;font-family:var(--sans)}
+.logStyleHint{font-size:.7rem;color:var(--dim);margin-bottom:.4rem}
+.logStyleHint a{color:var(--acc);cursor:pointer;text-decoration:none;border-bottom:1px dotted var(--acc-dim)}
+
+.a-row{display:flex;align-items:baseline;gap:.7rem;padding:.3rem .2rem;border-left:2px solid transparent;
+  font-family:var(--mono);font-size:.78rem;line-height:1.65}
+.a-row:hover{background:var(--panel-2)}
+.a-row[data-k="sys"]{border-color:var(--acc-dim)}
+.a-row[data-k="warn"]{border-color:var(--warn)}
+.a-row[data-k="err"]{border-color:var(--crash)}
+.a-row .t{color:var(--faint);font-size:.7rem;flex:none;width:4.4em;font-variant-numeric:tabular-nums}
+.a-row .tag{flex:none;font-size:.6rem;letter-spacing:.06em;text-transform:uppercase;font-weight:700;
+  padding:.05rem .38rem;border-radius:4px;width:3.6em;text-align:center}
+.a-row[data-k="sys"] .tag{color:var(--acc);background:#3ddc9714}
+.a-row[data-k="chat"] .tag{color:var(--u-cyan);background:#5fd8cf14}
+.a-row[data-k="warn"] .tag{color:var(--warn);background:#ffb45418}
+.a-row[data-k="err"] .tag{color:var(--crash);background:#ff5d5d18}
+.a-row .m{color:#b9c7d2;min-width:0;word-break:break-word}
+.a-row .m b.u1{color:var(--u-blue)} .a-row .m b.u2{color:var(--u-violet)} .a-row .m b.u3{color:var(--u-rose)}
+
+.b-group{display:flex;gap:.65rem;padding:.4rem .2rem}
+.b-glyph{flex:none;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:.72rem;font-weight:700;background:var(--panel-2)}
+.b-glyph.sys{background:#3ddc9718;color:var(--acc)} .b-glyph.warn{background:#ffb45420;color:var(--warn)}
+.b-glyph.err{background:#ff5d5d20;color:var(--crash)} .b-glyph.chat{background:var(--panel-2);color:var(--txt)}
+.b-body{min-width:0}
+.b-head{display:flex;align-items:baseline;gap:.5rem}
+.b-name{font-weight:700;font-size:.82rem}
+.b-name.sys{color:var(--acc)} .b-name.warn{color:var(--warn)} .b-name.err{color:var(--crash)}
+.b-name.u1{color:var(--u-blue)} .b-name.u2{color:var(--u-violet)} .b-name.u3{color:var(--u-rose)}
+.b-time{font-family:var(--mono);font-size:.66rem;color:var(--faint)}
+.b-line{font-size:.82rem;color:#c7d2db;line-height:1.6;word-break:break-word}
+.b-time-inline{font-family:var(--mono);font-size:.62rem;color:var(--faint);margin-right:.5rem}
+
+.c-row{display:grid;grid-template-columns:8px 4.2em 3.6em 1fr;align-items:baseline;gap:.55rem;padding:.34rem .5rem;border-radius:7px}
+.c-row .sq{width:7px;height:7px;border-radius:2px;align-self:center}
+.c-row[data-k="sys"] .sq{background:var(--acc)} .c-row[data-k="chat"] .sq{background:var(--u-cyan)}
+.c-row[data-k="warn"] .sq{background:var(--warn)} .c-row[data-k="err"] .sq{background:var(--crash)}
+.c-row.wash-warn{background:#ffb45410} .c-row.wash-err{background:#ff5d5d14}
+.c-row .t{font-family:var(--mono);font-size:.64rem;color:var(--faint);font-variant-numeric:tabular-nums}
+.c-row .lbl{font-family:var(--sans);font-weight:700;font-size:.64rem;letter-spacing:.04em;text-transform:uppercase;color:var(--dim)}
+.c-row[data-k="sys"] .lbl{color:var(--acc-dim)}
+.c-row .m{font-size:.81rem;color:#c7d2db;min-width:0;word-break:break-word}
+.c-row .m b.u1{color:var(--u-blue)} .c-row .m b.u2{color:var(--u-violet)} .c-row .m b.u3{color:var(--u-rose)}
+
+/* ---- Appearance tab: Graphite/Client theme cards ---- */
+.themecards{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-bottom:1rem}
+.themecard{border:1px solid var(--line);border-radius:12px;padding:.7rem;cursor:pointer;background:var(--panel-2)}
+.themecard:hover{border-color:var(--acc-dim)}
+.themecard.sel{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc) inset}
+.themecard .thc-head{display:flex;align-items:center;justify-content:space-between;margin-top:.5rem}
+.themecard .thc-name{font-weight:700;font-size:.88rem}
+.themecard .thc-radio{width:15px;height:15px;border-radius:50%;border:1px solid var(--line);position:relative}
+.themecard.sel .thc-radio{border-color:var(--acc)}
+.themecard.sel .thc-radio::after{content:'';position:absolute;inset:2.5px;border-radius:50%;background:var(--acc)}
+.themecard .thc-desc{font-size:.72rem;color:var(--dim);margin-top:.3rem;line-height:1.5}
+.themecard .thumb{height:56px;border-radius:8px;background:var(--bg);border:1px solid var(--line);display:flex;overflow:hidden}
+.themecard .thumb.tabs-thumb{flex-direction:column}
+.themecard .thumb .side{width:20px;background:var(--panel);display:flex;flex-direction:column;gap:3px;padding:5px 3px}
+.themecard .thumb .side i{height:4px;border-radius:2px;background:var(--line)}
+.themecard .thumb .top{height:12px;background:var(--panel);display:flex;gap:3px;align-items:center;padding:0 5px}
+.themecard .thumb .top i{width:14px;height:3px;border-radius:2px;background:var(--acc-dim)}
+.themecard .thumb .rows{flex:1;padding:6px;display:flex;flex-direction:column;gap:4px;justify-content:center}
+.themecard .thumb .rows i{height:5px;border-radius:2px;background:var(--line)}
+
+.stylecards{display:grid;grid-template-columns:1fr;gap:.5rem;margin-bottom:.9rem}
+.stylecard{border:1px solid var(--line);border-radius:10px;padding:.55rem .65rem;cursor:pointer;background:var(--panel-2)}
+.stylecard:hover{border-color:var(--acc-dim)}
+.stylecard.sel{border-color:var(--acc)}
+.stylecard .sc-head{display:flex;align-items:center;justify-content:space-between}
+.stylecard .sc-name{font-weight:700;font-size:.82rem}
+.stylecard.sel .sc-name{color:var(--acc)}
+.stylecard .sc-radio{width:13px;height:13px;border-radius:50%;border:1px solid var(--line);position:relative}
+.stylecard.sel .sc-radio{border-color:var(--acc)}
+.stylecard.sel .sc-radio::after{content:'';position:absolute;inset:2px;border-radius:50%;background:var(--acc)}
+.stylecard .sc-preview{margin-top:.4rem;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:.3rem .2rem;pointer-events:none}
+.stylecard .sc-preview .a-row,.stylecard .sc-preview .c-row{font-size:.68rem;padding:.2rem .3rem}
+.stylecard .sc-preview .b-group{padding:.25rem .3rem}
 </style>
 </head>
 <body>
@@ -9196,6 +9354,7 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
   </div>
 </header>
 <div class="topbar" id="slimTop" style="display:none"></div>
+<header id="clientHeader" style="display:none"></header>
 <main>
   <div id="viewDashboard">
     <div class="meta" id="meta"><span id="metaText">loading…</span> <span id="syncState" class="hint" style="opacity:.6"></span></div>
@@ -9805,19 +9964,38 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
     </div>
 
     <div id="stAp">
-      <div class="hint" style="margin-bottom:.4rem">Sidebar &amp; navigation</div>
-      <div id="sidebarRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem">
-        <div class="chip" data-sb="off" onclick="pickSidebar('off')">Off · classic header</div>
-        <div class="chip" data-sb="rail" onclick="pickSidebar('rail')">Icon rail</div>
-        <div class="chip" data-sb="full" onclick="pickSidebar('full')">Full</div>
-        <div class="chip" data-sb="cmd" onclick="pickSidebar('cmd')">Command center</div>
+      <div class="hint" style="margin-bottom:.5rem">Theme</div>
+      <div class="themecards" id="themecards"></div>
+
+      <div id="graphitePanel">
+        <div class="hint" style="margin-bottom:.4rem">Sidebar &amp; navigation</div>
+        <div id="sidebarRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem">
+          <div class="chip" data-sb="off" onclick="pickSidebar('off')">Off · classic header</div>
+          <div class="chip" data-sb="rail" onclick="pickSidebar('rail')">Icon rail</div>
+          <div class="chip" data-sb="full" onclick="pickSidebar('full')">Full</div>
+          <div class="chip" data-sb="cmd" onclick="pickSidebar('cmd')">Command center</div>
+        </div>
+        <div id="sideOrientRow" style="display:flex;gap:1rem;margin-bottom:.95rem;font-size:.84rem">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="sbside" value="left" style="width:auto" onchange="pickSide('left')"> Left</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="sbside" value="right" style="width:auto" onchange="pickSide('right')"> Right</label>
+        </div>
+        <div class="hint" style="margin-bottom:.5rem">Theme preset</div>
+        <div id="presetRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.9rem"></div>
+        <div class="hint" style="margin-bottom:.4rem">Density</div>
+        <div id="densityRow" style="display:flex;gap:1rem;margin-bottom:.9rem;font-size:.84rem">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="" style="width:auto" onchange="SELDENSITY='';previewTheme()"> Comfortable</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="compact" style="width:auto" onchange="SELDENSITY='compact';previewTheme()"> Compact</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="spacious" style="width:auto" onchange="SELDENSITY='spacious';previewTheme()"> Spacious</label>
+        </div>
       </div>
-      <div id="sideOrientRow" style="display:flex;gap:1rem;margin-bottom:.95rem;font-size:.84rem">
-        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="sbside" value="left" style="width:auto" onchange="pickSide('left')"> Left</label>
-        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="sbside" value="right" style="width:auto" onchange="pickSide('right')"> Right</label>
+
+      <div id="clientPanel" style="display:none">
+        <div class="hint" style="margin-bottom:.4rem">Console style</div>
+        <div class="stylecards" id="clientStyleCards"></div>
+        <div class="hint" style="margin:.2rem 0 .6rem;font-size:.68rem;color:var(--dim);text-transform:none;letter-spacing:0">The 48-module Control Surface keeps its existing v1/v2/v3 styles for now — a matching Client style is on the way.</div>
       </div>
-      <div class="hint" style="margin-bottom:.5rem">Theme preset</div>
-      <div id="presetRow" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.9rem"></div>
+
+      <div class="hint" style="margin-bottom:.4rem">Accent &amp; font <span class="hint" style="text-transform:none;letter-spacing:0">— shared across both themes</span></div>
       <label>Accent colour <span class="hint">blank = preset default</span>
         <div style="display:flex;gap:.5rem;align-items:center">
           <input type="color" id="accentPick" style="width:48px;height:38px;padding:2px;background:#06090c;border:1px solid var(--line);border-radius:9px">
@@ -9826,13 +10004,6 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
         </div>
       </label>
       <div id="accentSwatches" style="display:flex;gap:.4rem;flex-wrap:wrap;margin:.45rem 0 .9rem"></div>
-
-      <div class="hint" style="margin-bottom:.4rem">Density</div>
-      <div id="densityRow" style="display:flex;gap:1rem;margin-bottom:.9rem;font-size:.84rem">
-        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="" style="width:auto" onchange="SELDENSITY='';previewTheme()"> Comfortable</label>
-        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="compact" style="width:auto" onchange="SELDENSITY='compact';previewTheme()"> Compact</label>
-        <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="density" value="spacious" style="width:auto" onchange="SELDENSITY='spacious';previewTheme()"> Spacious</label>
-      </div>
 
       <label>Font <span class="hint">display + monospace pairing</span>
         <select id="fontSel" onchange="SELFONT=this.value;previewTheme()" style="font-family:var(--sans);font-size:.84rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem;width:100%;cursor:pointer"></select>
@@ -9928,6 +10099,7 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
   </div>
   <div class="body">
     <div id="tabLogs">
+      <div class="logStyleHint" id="logStyleHint" style="display:none"></div>
       <div id="logWrap">
         <pre class="log" id="logBox" onscroll="onLogScroll()">…</pre>
         <button id="logPill" class="logpill" style="display:none" onclick="jumpLogBottom()">↓ Jump to latest</button>
@@ -10730,6 +10902,15 @@ function renderPresetBar(){
   const chips=presets.map((p,i)=>`<button class="chip" title="sends: ${esc(p.command)}" onclick="sendPreset(${i})">${esc(p.label)}</button>`).join('');
   const reinstall=`<button class="chip warn owner-only" title="Back up config.json and restart so this bot's first-run setup wizard runs again" onclick="reinstallBot(this)">⟲ Re-run installer</button>`;
   bar.innerHTML=chips+reinstall;
+  updateLogStyleHint();
+}
+function updateLogStyleHint(){
+  const h=$('logStyleHint'); if(!h)return;
+  if(!(SETTINGS&&SETTINGS.ui&&SETTINGS.ui.theme_family==='client')){ h.style.display='none'; return; }
+  const names={threaded:'Threaded Log',feed:'Message Feed',deck:'Status Deck'};
+  const style=(SETTINGS.ui.console_style)||'feed';
+  h.style.display='';
+  h.innerHTML='Rendering as <b>'+esc(names[style]||style)+'</b> — change this in <a onclick="openSettings()">Settings → Appearance</a>';
 }
 async function sendPreset(i){
   const presets=(SETTINGS&&SETTINGS.console_presets)||[];
@@ -10771,7 +10952,15 @@ async function loadLogs(){
   const txt=d.logs||'(empty)';
   if(txt===lastLogText){ if(logPinned) box.scrollTop=box.scrollHeight; return; }
   const prevH=box.scrollHeight, prevTop=box.scrollTop;
-  lastLogText=txt; box.innerHTML=ansiToHtml(txt);
+  lastLogText=txt;
+  if(SETTINGS&&SETTINGS.ui&&SETTINGS.ui.theme_family==='client'){
+    const style=SETTINGS.ui.console_style||'feed';
+    box.className='log style-'+(style==='threaded'?'thread':style);
+    box.innerHTML=consoleRowsHtml(style,txt)||ansiToHtml(txt);
+  }else{
+    box.className='log';
+    box.innerHTML=ansiToHtml(txt);
+  }
   if(logPinned){
     box.scrollTop=box.scrollHeight; lastSeenLines=logLineCount();
     const p=$('logPill'); if(p) p.style.display='none';
@@ -11169,10 +11358,13 @@ function sbFoot(){ return '<div class="sfoot"><div class="nav"><a onclick="locat
 
 function renderSidebar(ui){
   ui=ui||(SETTINGS&&SETTINGS.ui)||{sidebar:'full',sidebar_side:'left'};
+  document.body.classList.toggle('tf-client', ui.theme_family==='client');
+  if(ui.theme_family==='client'){ renderClientChrome(); return; }
   const style=ui.sidebar||'full', side=ui.sidebar_side||'left';
   const app=$('app'), sb=$('sidebar'), hdr=$('classicHeader'), top=$('slimTop');
   if(!app||!sb)return;
   app.classList.toggle('right', side==='right');
+  const cl=$('clientHeader'); if(cl) cl.style.display='none';
   if(style==='off'){
     app.classList.remove('has-side');
     sb.style.display='none'; sb.className='side'; sb.innerHTML='';
@@ -11212,6 +11404,69 @@ function renderSlimTop(){
     +'<button class="danger" onclick="bulk(\'stop\')">■ Stop all</button>'
     +'<button class="go" onclick="openDeploy()">➕ Add Bot</button>';
 }
+/* ---- Client theme: top tab-bar chrome, built from the same navModel() as the sidebar ---- */
+function renderClientChrome(){
+  const app=$('app'), sb=$('sidebar'), hdr=$('classicHeader'), top=$('slimTop'), cl=$('clientHeader');
+  if(!app||!cl)return;
+  app.classList.remove('has-side','right');
+  if(sb){ sb.style.display='none'; sb.innerHTML=''; }
+  if(hdr) hdr.style.display='none';
+  if(top) top.style.display='none';
+  cl.style.display='flex';
+  const model=navModel();
+  const tabs=model.filter(n=>n.view), overflow=model.filter(n=>n.act);
+  cl.innerHTML=
+    '<div class="cl-brand"><span class="dot"></span>Aquarius <small>BOT MANAGER v'+esc(ABMVER)+'</small></div>'
+    +'<div class="boxswitch owner-only" id="boxswitch"></div>'
+    +'<div class="cl-tabs">'+tabs.map(n=>{
+        const active=n.view===CURVIEW?' active':'';
+        const pip=n.pip?`<span class="pip${n.pipwarn?' warn':''}">${n.pip}</span>`:'';
+        return `<span class="viewtab${active}" data-view="${n.view}" onclick="showView('${n.view}')">${esc(n.lbl)}${pip}</span>`;
+      }).join('')+'</div>'
+    +'<div class="cl-overflow owner-only" id="clOverflow">'
+      +'<button class="cl-overflow-btn" onclick="toggleClOverflow(event)" title="More">⋯</button>'
+      +'<div class="cl-overflow-menu" id="clOverflowMenu">'
+        +overflow.map(n=>`<button onclick="${n.act}">${esc(n.lbl)}</button>`).join('')
+        +'<hr>'
+        +'<button onclick="bulk(\'start\')">▶ Start all</button>'
+        +'<button onclick="bulk(\'restart\')">⟳ Restart all</button>'
+        +'<button class="danger" onclick="bulk(\'stop\')">■ Stop all</button>'
+      +'</div>'
+    +'</div>'
+    +'<button onclick="manualRefresh(this)" title="Refresh now">🔄</button>'
+    +'<button class="danger" onclick="location.href=\'/logout\'" title="Log out">⎋</button>';
+  loadBoxswitch();
+  refreshClientTabsActive();
+}
+function refreshClientTabsActive(){
+  document.querySelectorAll('#clientHeader .viewtab').forEach(a=>a.classList.toggle('active',a.getAttribute('data-view')===CURVIEW));
+}
+function toggleClOverflow(e){ e.stopPropagation(); const m=$('clOverflowMenu'); if(m) m.classList.toggle('open'); }
+function toggleBoxswitch(e){ e.stopPropagation(); const m=$('boxswitchMenu'); if(m) m.classList.toggle('open'); }
+document.addEventListener('click',(e)=>{
+  const om=$('clOverflowMenu'); if(om&&!e.target.closest('#clOverflow')) om.classList.remove('open');
+  const bm=$('boxswitchMenu'); if(bm&&!e.target.closest('#boxswitch')) bm.classList.remove('open');
+});
+// Themed box switcher: same real /api/nodes + /api/node/select the legacy #abmNodeBar uses, just
+// styled into the Client nav instead of a separate unthemed strip (which is CSS-hidden under tf-client).
+async function loadBoxswitch(){
+  const el=$('boxswitch'); if(!el)return;
+  let d; try{ d=await (await fetch('/api/nodes')).json(); }catch(e){ el.innerHTML=''; return; }
+  const nodes=(d&&d.nodes)||[];
+  if(!nodes.length){ el.innerHTML=''; return; }
+  const cur=(typeof window.ABM_CURRENT_NODE!=='undefined'&&window.ABM_CURRENT_NODE)||'';
+  el.innerHTML='<button class="boxswitch-btn" onclick="toggleBoxswitch(event)"><span>'+esc(curBoxLabel())+'</span><span class="car">▾</span></button>'
+    +'<div class="boxswitch-menu" id="boxswitchMenu">'
+      +'<button class="'+(cur===''?'cur':'')+'" onclick="selectClientBox(\'\')"><span class="bd"></span>★ '+esc((SETTINGS&&SETTINGS.box_name)||'Controller')+'</button>'
+      +nodes.map(n=>{
+        const alive=n.tunnel&&n.tunnel.alive;
+        return '<button class="'+(cur===n.name?'cur':'')+'" onclick="selectClientBox(\''+jsq(n.name)+'\')"><span class="bd'+(alive?'':' off')+'"></span>'
+          +esc(n.label||n.name)+(alive?'':' <span class="bx-off">(offline)</span>')+'</button>';
+      }).join('')
+    +'</div>';
+}
+async function selectClientBox(name){ await api('/api/node/select','POST',{name}); location.href='/'; }
+
 function refreshNavActive(){
   const sb=$('sidebar'); if(!sb)return;
   sb.querySelectorAll('.nav a[data-view]').forEach(a=>{
@@ -11263,7 +11518,7 @@ function showView(name,arg){
   else if(name==='activity'){ loadActivityView(); }
   else if(name==='telemetry'){ openTelemetry(arg); }
   else if(name==='automation'){ renderAutomationView(); }
-  renderSlimTop(); refreshNavActive();
+  renderSlimTop(); refreshNavActive(); refreshClientTabsActive();
   window.scrollTo(0,0);
 }
 
@@ -12302,7 +12557,48 @@ async function savePresets(){
   $('preMsg').style.color='var(--dim)'; $('preMsg').textContent='✓ saved ('+presets.length+')';
 }
 let SELPRESET=null, SELACCENT='', SELBG='', SELBGDIM=0.6, SELDENSITY='', SELFONT='aquarius';
+let SELFAMILY='graphite', SELCSTYLE='feed';
 const ACCENT_SWATCHES=['#3ddc97','#5cc8ff','#ff7a45','#b388ff','#ff6f9c','#e8b53a','#39b8d6','#5fd17a','#ff5d5d','#e6e6e6'];
+const THEME_FAMILIES=[
+  {id:'graphite',name:'Graphite',desc:'The dashboard as it is today — left sidebar, dense cards, existing Control Surface styles.',tabs:false},
+  {id:'client',  name:'Client',  desc:'Top tab bar, softer console formatting, a themed box switcher when you manage more than one box.',tabs:true},
+];
+function renderThemeCards(){
+  $('themecards').innerHTML=THEME_FAMILIES.map(f=>`
+    <div class="themecard ${f.id===SELFAMILY?'sel':''}" data-f="${f.id}" onclick="pickThemeFamily('${f.id}')">
+      <div class="thumb${f.tabs?' tabs-thumb':''}">${f.tabs
+        ?'<div class="top"><i></i><i></i><i></i></div><div class="rows"><i style="width:70%"></i><i style="width:55%"></i></div>'
+        :'<div class="side"><i></i><i></i><i></i></div><div class="rows"><i></i><i style="width:80%"></i><i style="width:65%"></i></div>'}</div>
+      <div class="thc-head"><span class="thc-name">${esc(f.name)}</span><span class="thc-radio"></span></div>
+      <div class="thc-desc">${esc(f.desc)}</div>
+    </div>`).join('');
+}
+function pickThemeFamily(id){
+  SELFAMILY=id;
+  renderThemeCards();
+  $('graphitePanel').style.display=id==='graphite'?'':'none';
+  $('clientPanel').style.display=id==='client'?'':'none';
+}
+const CONSOLE_STYLES=[
+  {id:'threaded',name:'Threaded Log',desc:'Closest to a terminal — a color rule and a small tag per line.'},
+  {id:'feed',    name:'Message Feed',desc:'Discord-like grouping: sender + time once per run of messages.'},
+  {id:'deck',    name:'Status Deck', desc:'Severity lanes with aligned columns.'},
+];
+const CSTYLE_PREVIEW={
+  threaded:'<div class="a-row" data-k="sys"><span class="t">09:14</span><span class="tag">sys</span><span class="m">Connected as duskwalker</span></div><div class="a-row" data-k="chat"><span class="t">09:16</span><span class="tag">chat</span><span class="m"><b class="u1">Kestrel_9</b>: anyone got spare pearls</span></div>',
+  feed:'<div class="b-group"><div class="b-glyph sys">S</div><div class="b-body"><div class="b-head"><span class="b-name sys">System</span><span class="b-time">09:14</span></div><div class="b-line">Connected as duskwalker</div></div></div><div class="b-group"><div class="b-glyph chat">K</div><div class="b-body"><div class="b-head"><span class="b-name u1">Kestrel_9</span><span class="b-time">09:16</span></div><div class="b-line">anyone got spare pearls</div></div></div>',
+  deck:'<div class="c-row" data-k="sys"><span class="sq"></span><span class="t">09:14</span><span class="lbl">sys</span><span class="m">Connected as duskwalker</span></div><div class="c-row" data-k="chat"><span class="sq"></span><span class="t">09:16</span><span class="lbl">chat</span><span class="m"><b class="u1">Kestrel_9</b>: anyone got spare pearls</span></div>',
+};
+function renderClientStyleCards(){
+  const el=$('clientStyleCards'); if(!el)return;
+  el.innerHTML=CONSOLE_STYLES.map(s=>`
+    <div class="stylecard ${s.id===SELCSTYLE?'sel':''}" data-s="${s.id}" onclick="pickConsoleStyle('${s.id}')">
+      <div class="sc-head"><span class="sc-name">${esc(s.name)}</span><span class="sc-radio"></span></div>
+      <div style="font-size:.72rem;color:var(--dim)">${esc(s.desc)}</div>
+      <div class="sc-preview">${CSTYLE_PREVIEW[s.id]}</div>
+    </div>`).join('');
+}
+function pickConsoleStyle(id){ SELCSTYLE=id; renderClientStyleCards(); }
 function renderPresets(){
   const t=SETTINGS.theme;
   SELPRESET=t.preset; SELACCENT=t.accent||''; SELBG=t.bg_image||'';
@@ -12325,8 +12621,13 @@ function renderPresets(){
   document.querySelectorAll('#densityRow input[name=density]').forEach(r=>{r.checked=(r.value===SELDENSITY);});
   const ui=SETTINGS.ui||{sidebar:'full',sidebar_side:'left'};
   SELSIDEBAR=ui.sidebar||'full'; SELSIDE=ui.sidebar_side||'left';
+  SELFAMILY=ui.theme_family||'graphite'; SELCSTYLE=ui.console_style||'feed';
   document.querySelectorAll('#sidebarRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.sb===SELSIDEBAR));
   document.querySelectorAll('#sideOrientRow input[name=sbside]').forEach(r=>{r.checked=(r.value===SELSIDE);});
+  renderThemeCards();
+  $('graphitePanel').style.display=SELFAMILY==='graphite'?'':'none';
+  $('clientPanel').style.display=SELFAMILY==='client'?'':'none';
+  renderClientStyleCards();
 }
 function pickAccent(c){ SELACCENT=c; $('accentHex').value=c; $('accentPick').value=c; previewTheme(); }
 function pickPreset(k){
@@ -12337,7 +12638,7 @@ function pickPreset(k){
 function previewTheme(){ applyTheme({presets:SETTINGS.presets,fonts:SETTINGS.fonts,theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY,font:SELFONT}}); }
 async function saveAppearance(){
   $('apMsg').textContent='saving…';
-  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY,font:SELFONT},ui:{sidebar:SELSIDEBAR,sidebar_side:SELSIDE}});
+  const d=await api('/api/settings','POST',{theme:{preset:SELPRESET,accent:SELACCENT,bg_image:SELBG,bg_dim:SELBGDIM,density:SELDENSITY,font:SELFONT},ui:{sidebar:SELSIDEBAR,sidebar_side:SELSIDE,theme_family:SELFAMILY,console_style:SELCSTYLE}});
   if(d.error){$('apMsg').style.color='var(--crash)';$('apMsg').textContent='✗ '+d.error;return;}
   SETTINGS=d.settings; applyTheme(SETTINGS); renderSidebar();
   $('apMsg').style.color='var(--dim)';$('apMsg').textContent='✓ saved';
@@ -12507,6 +12808,90 @@ function ansiToHtml(raw){
   out+=linkify(text.slice(last));
   if(open) out+='</span>';
   return out.replace(/\x1b\[[0-9;]*[A-Za-z]/g,'');      // drop any other leftover escape codes
+}
+/* ---- Client console styles: best-effort per-line classification layered over the same real,
+   already-escaped/linkified text ansiToHtml renders. A misclassified line only changes which
+   visual lane it lands in (sys/chat/warn/err) — the text itself is never altered or hidden. ---- */
+function ansiLineToHtml(line){
+  const text=esc(line);
+  const re=/\x1b\[([0-9;]*)m/g;
+  let out='', open=false, bold=false, last=0, m, fg=null;
+  while((m=re.exec(text))){
+    out+=linkify(text.slice(last,m.index)); last=re.lastIndex;
+    const codes=m[1]===''?[0]:m[1].split(';').map(Number);
+    for(const c of codes){
+      if(c===0||c===39){ if(open){out+='</span>';open=false;} if(c===0)bold=false; }
+      else if(c===1){ bold=true; }
+      else if(ANSI_FG[c]!=null){
+        if(fg==null) fg=ANSI_FG[c];   // remember the line's first color as a classification hint,
+        if(open) out+='</span>';      // even past a later reset — most real output resets before EOL
+        out+=`<span style="color:${ANSI_FG[c]}${bold?';font-weight:700':''}">`; open=true;
+      }
+    }
+  }
+  out+=linkify(text.slice(last));
+  if(open) out+='</span>';
+  return {html:out.replace(/\x1b\[[0-9;]*[A-Za-z]/g,''), fg};
+}
+const CHAT_LINE_RE=/^(?:\[[^\]]*\]\s*)?<([^>]{1,32})>\s?(.*)$/;
+const WARN_COLORS=new Set([ANSI_FG[33],ANSI_FG[93]]), ERR_COLORS=new Set([ANSI_FG[31],ANSI_FG[91]]);
+const TIME_RE=/^\[?(\d{1,2}:\d{2}:\d{2})\]?\s*/;
+function userColorIdx(name){ let h=0; for(let i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))>>>0; return (h%3)+1; }
+function classifyLogLine(raw){
+  // timestamp/chat detection always match against the de-escaped text (never sliced back into
+  // raw by offset — an ANSI code ahead of the match would misalign that). The rendered body only
+  // drops the timestamp in the common case where raw starts with that same literal text verbatim;
+  // otherwise it's left in (shown once in the .t column, once inline) rather than risk a bad slice.
+  const plain=raw.replace(/\x1b\[[0-9;]*[A-Za-z]/g,'');
+  const tm=plain.match(TIME_RE);
+  const t=tm?tm[1]:'';
+  const afterTime=tm?plain.slice(tm[0].length):plain;
+  const cm=afterTime.match(CHAT_LINE_RE);
+  const body=(tm&&raw.startsWith(tm[0]))?raw.slice(tm[0].length):raw;
+  const {html,fg}=ansiLineToHtml(body);
+  if(cm) return {k:'chat', t, who:cm[1], u:userColorIdx(cm[1]), html:ansiLineToHtml(cm[2]).html};
+  if(fg&&ERR_COLORS.has(fg)) return {k:'err', t, html};
+  if(fg&&WARN_COLORS.has(fg)) return {k:'warn', t, html};
+  return {k:'sys', t, html};
+}
+function logRows(raw){ return raw.split('\n').filter(l=>l.length).map(classifyLogLine); }
+const CK_TAG={sys:'sys',chat:'chat',warn:'warn',err:'err'};
+function renderThreadRows(rows){
+  return rows.map(r=>{
+    let m=r.html; if(r.who) m=`<b class="u${r.u}">${esc(r.who)}</b>: `+m;
+    return `<div class="a-row" data-k="${r.k}"><span class="t">${esc(r.t)}</span><span class="tag">${CK_TAG[r.k]}</span><span class="m">${m}</span></div>`;
+  }).join('');
+}
+function bGlyph(r){ if(r.k==='sys')return{cls:'sys',g:'S'}; if(r.k==='warn')return{cls:'warn',g:'!'};
+  if(r.k==='err')return{cls:'err',g:'✕'}; return{cls:'chat',g:(r.who||'?')[0].toUpperCase()}; }
+function bName(r){ if(r.k==='sys')return{cls:'sys',n:'System'}; if(r.k==='warn')return{cls:'warn',n:'Warning'};
+  if(r.k==='err')return{cls:'err',n:'Error'}; return{cls:'u'+r.u,n:r.who}; }
+function renderFeedRows(rows){
+  let html='', i=0;
+  while(i<rows.length){
+    const r=rows[i], key=r.who||r.k, start=i;
+    while(i<rows.length && (rows[i].who||rows[i].k)===key) i++;
+    const run=rows.slice(start,i), glyph=bGlyph(r), name=bName(r);
+    const lines=run.map((x,idx)=>{
+      const showTime=idx>0?`<span class="b-time-inline">${esc(x.t)}</span>`:'';
+      let body=x.html; if(idx>0&&x.who) body=`<b class="u${x.u}">${esc(x.who)}</b>: `+body;
+      return `<div class="b-line">${showTime}${body}</div>`;
+    }).join('');
+    html+=`<div class="b-group"><div class="b-glyph ${glyph.cls}">${glyph.g}</div><div class="b-body"><div class="b-head"><span class="b-name ${name.cls}">${esc(name.n)}</span><span class="b-time">${esc(r.t)}</span></div>${lines}</div></div>`;
+  }
+  return html;
+}
+function renderDeckRows(rows){
+  return rows.map(r=>{
+    let m=r.html; if(r.who) m=`<b class="u${r.u}">${esc(r.who)}</b>: `+m;
+    const wash=r.k==='warn'?' wash-warn':r.k==='err'?' wash-err':'';
+    return `<div class="c-row${wash}" data-k="${r.k}"><span class="sq"></span><span class="t">${esc(r.t)}</span><span class="lbl">${CK_TAG[r.k]}</span><span class="m">${m}</span></div>`;
+  }).join('');
+}
+function consoleRowsHtml(style, raw){
+  const rows=logRows(raw);
+  if(!rows.length) return '';
+  return style==='threaded'?renderThreadRows(rows):style==='deck'?renderDeckRows(rows):renderFeedRows(rows);
 }
 function jsq(s){return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
 function tick(){$('clock').textContent=new Date().toLocaleTimeString();syncAgo();}
