@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.1"
+__version__ = "3.21.2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1077,15 +1077,27 @@ def self_update(do_restart=True, service=SERVICE_NAME):
         # was the "Unexpected token '<'" the update button showed. Detach a tiny
         # helper (its own session, so it survives our SIGTERM under KillMode=process)
         # that waits a beat, then runs the restart.
-        try:
-            subprocess.Popen(
-                ["sh", "-c", "sleep 1.5; sudo -n systemctl restart \"$1\"", "sh", service],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, start_new_session=True)
-            out["restarted"] = True
-        except Exception as e:  # noqa: BLE001 — report, don't crash the update
+        #
+        # That detach means we can never confirm the restart itself actually landed —
+        # it deliberately outlives this request. But we CAN check passwordless sudo
+        # works *before* claiming "restarted: true": without it, this silently pulls
+        # the new code, reports success, and leaves the old process running forever.
+        preflight = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True, timeout=5)
+        if preflight.returncode != 0:
             out["restarted"] = False
-            out["restart_error"] = str(e)
+            out["restart_error"] = ("passwordless sudo isn't available for this user — code was pulled "
+                                     "but the running process wasn't reloaded; restart it manually "
+                                     f"(sudo systemctl restart {service})")
+        else:
+            try:
+                subprocess.Popen(
+                    ["sh", "-c", "sleep 1.5; sudo -n systemctl restart \"$1\"", "sh", service],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL, start_new_session=True)
+                out["restarted"] = True
+            except Exception as e:  # noqa: BLE001 — report, don't crash the update
+                out["restarted"] = False
+                out["restart_error"] = str(e)
     return out
 
 
@@ -9071,9 +9083,13 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .sbrand{display:flex;align-items:center;gap:.6rem;padding:1.05rem 1rem .7rem;font-weight:800;letter-spacing:-.02em;font-size:1.02rem}
 .sbrand .dot{width:11px;height:11px;border-radius:50%;background:var(--acc);box-shadow:0 0 14px var(--acc);flex:none}
 .sbrand .txt small{display:block;font-family:var(--mono);font-weight:400;color:var(--dim);font-size:.6rem;letter-spacing:0}
-.boxchip{margin:0 .8rem .55rem;display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;border:1px solid var(--line);border-radius:10px;background:var(--panel-2);cursor:pointer;font-size:.8rem}
+.boxwrap{position:relative;margin:0 .8rem .55rem}
+.boxwrap .boxswitch-menu{left:0;right:0;min-width:0}
+.boxchip{display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;border:1px solid var(--line);border-radius:10px;background:var(--panel-2);cursor:pointer;font-size:.8rem}
+.boxchip:hover{border-color:var(--acc-dim)}
 .boxchip .bdot{width:8px;height:8px;border-radius:50%;background:var(--run);box-shadow:0 0 8px var(--run);flex:none}
-.boxchip .car{margin-left:auto;color:var(--dim);font-size:.7rem}
+.boxchip .car{margin-left:auto;color:var(--dim);font-size:.7rem;transition:transform .15s}
+.boxwrap.open .boxchip .car{transform:rotate(180deg)}
 .nav{display:flex;flex-direction:column;gap:.12rem;padding:.3rem .6rem}
 .navg{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.14em;color:#586675;padding:.7rem .65rem .25rem}
 .nav a{display:flex;align-items:center;gap:.75rem;padding:.55rem .65rem;border-radius:9px;color:var(--dim);font-weight:600;font-size:.86rem;text-decoration:none;cursor:pointer;position:relative;white-space:nowrap}
@@ -9090,7 +9106,9 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .side.rail .sbrand .txt,.side.rail .navg,.side.rail .nav a .lbl,.side.rail .nav a .pip,
 .side.rail .boxchip .txt,.side.rail .boxchip .car,.side.rail .sfoot .lbl,.side.rail .squick{display:none}
 .side.rail .nav a{justify-content:center;padding:.62rem 0}
-.side.rail .boxchip{justify-content:center;padding:.5rem 0;margin:0 .55rem .55rem}
+.side.rail .boxwrap{margin:0 .55rem .55rem}
+.side.rail .boxchip{justify-content:center;padding:.5rem 0}
+.side.rail .boxwrap .boxswitch-menu{left:auto;right:auto;min-width:220px}
 .side.rail .nav a.active{box-shadow:inset 3px 0 0 var(--acc)}
 .app.right .side.rail .nav a.active{box-shadow:inset -3px 0 0 var(--acc)}
 .railtoggle{margin:.25rem .55rem .35rem;text-align:center;color:var(--dim);cursor:pointer;font-size:.85rem;border:1px dashed var(--line);border-radius:8px;padding:.32rem 0}
@@ -11339,9 +11357,12 @@ function navHtml(){
   return '<div class="nav">'+navModel().map(n=>{
     if(n.g) return `<div class="navg">${n.g}</div>`;
     const act=n.view?`showView('${n.view}')`:n.act;
-    const active=(n.view&&n.view===CURVIEW)?' active':'';
+    // act-based items all open owner/admin-only management modals (Boxes, Proxies, Users, Settings, …);
+    // Client theme already hides these via the #clOverflow wrapper being owner-only — tag them here too so
+    // Graphite's flat nav list (which has no such wrapper) hides them from guests/non-admin users as well.
+    const cls=[n.view&&n.view===CURVIEW?'active':'',n.act?'owner-only':''].filter(Boolean).join(' ');
     const pip=n.pip?`<span class="pip${n.pipwarn?' warn':''}">${n.pip}</span>`:'';
-    return `<a class="${active.trim()}" data-view="${n.view||''}" onclick="${act}"><span class="ic">${n.ic}</span><span class="lbl">${esc(n.lbl)}</span>${pip}</a>`;
+    return `<a class="${cls}" data-view="${n.view||''}" onclick="${act}"><span class="ic">${n.ic}</span><span class="lbl">${esc(n.lbl)}</span>${pip}</a>`;
   }).join('')+'</div>';
 }
 function sbBrand(){ return '<div class="sbrand"><span class="dot"></span><span class="txt">Aquarius<small>BOT MANAGER v'+esc(ABMVER)+'</small></span></div>'; }
@@ -11353,7 +11374,12 @@ function curBoxLabel(){
     return window.ABM_CURRENT_LABEL||window.ABM_CURRENT_NODE;
   return (SETTINGS&&SETTINGS.box_name)||'Controller';
 }
-function sbBox(){ return '<div class="boxchip" onclick="openBoxes()"><span class="bdot"></span><span class="txt">★ '+esc(curBoxLabel())+'</span><span class="car">▾</span></div>'; }
+function sbBox(){
+  return '<div class="boxwrap owner-only" id="sbBoxWrap" style="display:none">'
+    +'<div class="boxchip" onclick="toggleSbBox(event)"><span class="bdot"></span><span class="txt">★ '+esc(curBoxLabel())+'</span><span class="car">▾</span></div>'
+    +'<div class="boxswitch-menu" id="sbBoxMenu"></div>'
+    +'</div>';
+}
 function sbFoot(){ return '<div class="sfoot"><div class="nav"><a onclick="location.href=\'/logout\'"><span class="ic">⏻</span><span class="lbl">Log out</span></a></div></div>'; }
 
 function renderSidebar(ui){
@@ -11389,6 +11415,7 @@ function renderSidebar(ui){
   }
   h+=sbFoot();
   sb.style.display='flex'; sb.innerHTML=h;
+  if(style!=='cmd') loadSbBox();
   renderSlimTop();
   updateSidebarLive();
 }
@@ -11443,29 +11470,64 @@ function refreshClientTabsActive(){
 }
 function toggleClOverflow(e){ e.stopPropagation(); const m=$('clOverflowMenu'); if(m) m.classList.toggle('open'); }
 function toggleBoxswitch(e){ e.stopPropagation(); const m=$('boxswitchMenu'); if(m) m.classList.toggle('open'); }
+function toggleSbBox(e){
+  e.stopPropagation();
+  const w=$('sbBoxWrap'), m=$('sbBoxMenu'); if(!w||!m)return;
+  w.classList.toggle('open'); m.classList.toggle('open');
+}
 document.addEventListener('click',(e)=>{
   const om=$('clOverflowMenu'); if(om&&!e.target.closest('#clOverflow')) om.classList.remove('open');
   const bm=$('boxswitchMenu'); if(bm&&!e.target.closest('#boxswitch')) bm.classList.remove('open');
+  if(!e.target.closest('#sbBoxWrap')){
+    const sw=$('sbBoxWrap'); if(sw) sw.classList.remove('open');
+    const sm=$('sbBoxMenu'); if(sm) sm.classList.remove('open');
+  }
 });
+// Shared box-menu content: current box + each linked node (online/offline dot) + a Fleet… entry.
+// Used by both the Client theme's pill switcher (#boxswitch) and Graphite's chip dropdown (#sbBoxWrap).
+// Empty string = no linked boxes yet, so the caller can hide its trigger entirely.
+async function boxMenuHtml(){
+  let d; try{ d=await (await fetch('/api/nodes')).json(); }catch(e){ return ''; }
+  const nodes=(d&&d.nodes)||[];
+  if(!nodes.length) return '';
+  const cur=(typeof window.ABM_CURRENT_NODE!=='undefined'&&window.ABM_CURRENT_NODE)||'';
+  let h='<button class="'+(cur===''?'cur':'')+'" onclick="menuSelectBox(\'\')"><span class="bd"></span>★ '+esc((SETTINGS&&SETTINGS.box_name)||'Controller')+'</button>';
+  h+=nodes.map(n=>{
+    const alive=n.tunnel&&n.tunnel.alive;
+    return '<button class="'+(cur===n.name?'cur':'')+'" onclick="menuSelectBox(\''+jsq(n.name)+'\',this)"><span class="bd'+(alive?'':' off')+'"></span>'
+      +esc(n.label||n.name)+(alive?'':' <span class="bx-off">(offline)</span>')+'</button>';
+  }).join('');
+  h+='<hr><button onclick="openBoxes()">🖥 Fleet…</button>';
+  return h;
+}
+// Picking a box from either dropdown: reachable (or the controller itself) switches straight away;
+// an offline node reconnects first and only switches on success, instead of dead-ending on an
+// unreachable page the way a bare openNode() would.
+async function menuSelectBox(name,btn){
+  if(!name || (btn && !btn.querySelector('.bd.off'))){ await openNode(name); return; }
+  const orig=btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="bd off"></span> reconnecting…';
+  let d; try{ d=await api('/api/nodes/reconnect','POST',{name}); }catch(e){ d={error:String(e)}; }
+  if(d&&d.reachable){ await openNode(name); return; }
+  btn.disabled=false; btn.innerHTML=orig;
+  alert('✗ still offline'+(d&&d.error?(': '+d.error):'.'));
+}
 // Themed box switcher: same real /api/nodes + /api/node/select the legacy #abmNodeBar uses, just
 // styled into the Client nav instead of a separate unthemed strip (which is CSS-hidden under tf-client).
 async function loadBoxswitch(){
   const el=$('boxswitch'); if(!el)return;
-  let d; try{ d=await (await fetch('/api/nodes')).json(); }catch(e){ el.innerHTML=''; return; }
-  const nodes=(d&&d.nodes)||[];
-  if(!nodes.length){ el.innerHTML=''; return; }
-  const cur=(typeof window.ABM_CURRENT_NODE!=='undefined'&&window.ABM_CURRENT_NODE)||'';
+  const h=await boxMenuHtml();
+  if(!h){ el.innerHTML=''; return; }
   el.innerHTML='<button class="boxswitch-btn" onclick="toggleBoxswitch(event)"><span>'+esc(curBoxLabel())+'</span><span class="car">▾</span></button>'
-    +'<div class="boxswitch-menu" id="boxswitchMenu">'
-      +'<button class="'+(cur===''?'cur':'')+'" onclick="selectClientBox(\'\')"><span class="bd"></span>★ '+esc((SETTINGS&&SETTINGS.box_name)||'Controller')+'</button>'
-      +nodes.map(n=>{
-        const alive=n.tunnel&&n.tunnel.alive;
-        return '<button class="'+(cur===n.name?'cur':'')+'" onclick="selectClientBox(\''+jsq(n.name)+'\')"><span class="bd'+(alive?'':' off')+'"></span>'
-          +esc(n.label||n.name)+(alive?'':' <span class="bx-off">(offline)</span>')+'</button>';
-      }).join('')
-    +'</div>';
+    +'<div class="boxswitch-menu" id="boxswitchMenu">'+h+'</div>';
 }
-async function selectClientBox(name){ await api('/api/node/select','POST',{name}); location.href='/'; }
+// Graphite's chip dropdown: same boxMenuHtml(), just mounted under the sidebar chip instead of a topbar pill.
+async function loadSbBox(){
+  const wrap=$('sbBoxWrap'); if(!wrap)return;
+  const h=await boxMenuHtml();
+  if(!h){ wrap.style.display='none'; return; }
+  wrap.style.display='';
+  $('sbBoxMenu').innerHTML=h;
+}
 
 function refreshNavActive(){
   const sb=$('sidebar'); if(!sb)return;
@@ -11583,7 +11645,8 @@ async function reconnectBox(name,btn){
   btn.disabled=false; btn.innerHTML=o;
   if(d&&d.error&&!('reachable' in d)){ alert('✗ '+d.error); return; }
   if(d&&!d.reachable){ alert('Still offline'+(d.error?(': '+d.error):'.')); }
-  loadFleetView();
+  // refresh whichever view called this — the Boxes modal or the separate Fleet page
+  if($('boxScrim')&&$('boxScrim').classList.contains('open')) loadBoxes(); else loadFleetView();
 }
 
 async function loadActivityView(){
@@ -11907,7 +11970,12 @@ async function renameBox(isController, name, current){
   try{ renderSidebar(SETTINGS&&SETTINGS.ui); }catch(e){}
   try{ showView(CURVIEW); }catch(e){}
 }
-async function openBoxes(){ $('boxScrim').classList.add('open'); $('boxMsg').textContent=''; await loadBoxes(); }
+async function openBoxes(){
+  const sw=$('sbBoxWrap'); if(sw) sw.classList.remove('open');
+  const sm=$('sbBoxMenu'); if(sm) sm.classList.remove('open');
+  const bm=$('boxswitchMenu'); if(bm) bm.classList.remove('open');
+  $('boxScrim').classList.add('open'); $('boxMsg').textContent=''; await loadBoxes();
+}
 function closeBoxes(e){ if(e&&e.target!==$('boxScrim'))return; $('boxScrim').classList.remove('open'); }
 function boxMode(){
   const m=(document.querySelector('input[name=boxmode]:checked')||{}).value||'ssh';
@@ -11935,8 +12003,13 @@ async function loadBoxes(){
     const meta=up?((r.running||0)+'/'+(r.bots||0)+' bots running'+hostBit(r.host)):('offline'+(r.error?(' — '+esc(r.error)):''));
     const sub=r.controller?'controller':esc((r.ssh_user||'')+'@'+(r.ssh_host||''));
     const ren=`<button title="Rename this box" onclick="renameBox(${r.controller?'true':'false'},'${jsq(r.name)}','${jsq(r.label||r.name)}')">✎</button>`;
-    const right=ren+(r.controller?' <span class="hint">controller</span>':
-      (` <button onclick="openNode('${jsq(r.name)}')">Open</button> `+
+    // every box gets a real way to open it — including the controller, which used to be a dead end if you
+    // pulled this window up while already viewing another box's dashboard.
+    const openBtn=r.controller?`<button onclick="openNode('')">Open</button>`
+      :(up?`<button onclick="openNode('${jsq(r.name)}')">Open</button>`
+          :`<button onclick="reconnectBox('${jsq(r.name)}',this)">↻ Reconnect</button>`);
+    const right=ren+(r.controller?` <span class="hint">controller</span> ${openBtn}`:
+      (` ${openBtn} `+
        (r.do?`<button class="danger" onclick="destroyBox('${jsq(r.name)}',this)">Destroy</button> `:'')+
        `<button class="danger" onclick="removeBox('${jsq(r.name)}',this)">Remove</button>`));
     return `<div style="display:flex;align-items:center;gap:.6rem;padding:.45rem .6rem;border:1px solid var(--line);border-radius:9px">
@@ -11948,7 +12021,8 @@ async function loadBoxes(){
   }).join('');
 }
 async function openNode(name){
-  try{ await api('/api/node/select','POST',{name}); }catch(e){}
+  try{ await api('/api/node/select','POST',{name}); }
+  catch(e){ alert('✗ failed to switch box: '+e); return; }
   location.href='/';
 }
 async function fleetAction(action,btn){
