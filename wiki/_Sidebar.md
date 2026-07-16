@@ -7,6 +7,7 @@
 - [[Configuration]]
 - [[Proxies]]
 - [[Multi-VPS Controller]]
+- [[Custom Domain]]
 - [[Fleet (DigitalOcean)]]
 - **[[Security]]** ⚠️
 - [[Architecture and Limitations]]
