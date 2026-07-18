@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test4"
+__version__ = "3.21.7-test5"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -9675,6 +9675,11 @@ button.go{border-color:var(--acc-dim);color:var(--acc)}
 button.warn{border-color:#5a3b1f;color:var(--warn)}
 button.danger{border-color:#5a1f1f;color:var(--crash)}
 button:disabled{opacity:.4;cursor:not-allowed;transform:none}
+select{font-family:var(--sans);font-size:.82rem;cursor:pointer;border:1px solid var(--line);
+  background:var(--panel-2);color:var(--txt);padding:.4rem .6rem;border-radius:7px}
+select:hover{border-color:var(--acc-dim)}
+select:focus{outline:none;border-color:var(--acc-dim)}
+select option{background:var(--panel-2);color:var(--txt)}
 main{padding:1.6rem;max-width:1200px;margin:0 auto}
 .meta{font-family:var(--mono);font-size:.72rem;color:var(--dim);margin-bottom:1rem}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:1rem}
@@ -9783,7 +9788,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .fctrl{display:flex;align-items:center;gap:.5rem;justify-content:flex-end;min-width:46%}
 .fctrl input[type=text],.fctrl input[type=password]{font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.34rem .5rem;width:100%}
 .fctrl input:focus,.fctrl select:focus{outline:none;border-color:var(--acc)}
-.fctrl select{font-family:var(--sans);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.34rem .5rem;cursor:pointer}
+.fctrl select{font-family:var(--sans);font-size:.78rem;padding:.34rem .5rem}
 .snum{width:62px;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.34rem .4rem;text-align:right}
 .snum.wide{width:110px}
 .slider{-webkit-appearance:none;appearance:none;height:5px;border-radius:5px;background:#2a3640;flex:1;max-width:170px;cursor:pointer}
@@ -9849,7 +9854,7 @@ textarea{width:100%;min-height:55vh;font-family:var(--mono);font-size:.78rem;lin
 .gauge.crit .b i{background:var(--crash)} .gauge.crit .v{color:var(--crash)}
 /* file manager */
 .fbbar{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin-bottom:.5rem}
-.fbbar select{font-family:var(--mono);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.4rem .5rem;max-width:50%}
+.fbbar select{font-family:var(--mono);font-size:.74rem;max-width:50%}
 .fbpath{font-family:var(--mono);font-size:.7rem;color:var(--dim);margin-bottom:.5rem;word-break:break-all}
 .frow2{display:flex;align-items:center;gap:.55rem;padding:.4rem .55rem;border:1px solid var(--line);border-radius:8px;margin-bottom:.3rem;background:var(--panel-2)}
 .frow2:hover{border-color:var(--acc-dim)}
@@ -10003,7 +10008,8 @@ body.guest-view .cap-operate,body.guest-view .cap-config,body.guest-operate .cap
 .shurl{border:1px solid var(--acc);border-radius:8px;padding:.5rem .6rem;background:color-mix(in srgb,var(--acc) 8%,transparent)}
 /* public-sharing provider menu (dropdown + one card for the chosen provider) */
 .pf{display:flex;flex-direction:column;gap:.25rem;color:var(--dim);font-size:.8rem}
-.pf input,.pf select{font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem}
+.pf input{font-family:var(--mono);font-size:.78rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem}
+.pf select{font-family:var(--mono);font-size:.78rem;padding:.4rem .5rem}
 .provcard{margin-top:.5rem;padding:.7rem .75rem;border:1px solid var(--line);border-radius:12px;background:var(--panel-2);display:flex;flex-direction:column;gap:.45rem}
 .provcard .pblurb{color:var(--dim);font-size:.78rem;line-height:1.4}
 .setuprow{display:flex;gap:.6rem;align-items:center;padding:.5rem .6rem;border:1px dashed var(--acc-dim);border-radius:10px;background:color-mix(in srgb,var(--acc) 6%,transparent)}
@@ -10819,7 +10825,7 @@ body.tf-client #abmNodeBar{display:none}
       <div id="accentSwatches" style="display:flex;gap:.4rem;flex-wrap:wrap;margin:.45rem 0 .9rem"></div>
 
       <label>Font <span class="hint">display + monospace pairing</span>
-        <select id="fontSel" onchange="SELFONT=this.value;previewTheme()" style="font-family:var(--sans);font-size:.84rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem;width:100%;cursor:pointer"></select>
+        <select id="fontSel" onchange="SELFONT=this.value;previewTheme()" style="font-size:.84rem;padding:.5rem .6rem;width:100%"></select>
       </label>
 
       <label>Background image URL <span class="hint">blank = solid theme colour</span>
@@ -13650,7 +13656,7 @@ function openTelemetry(name){
   if(!i){ el.innerHTML='<div class="pagehd"><h1>Telemetry</h1></div><div class="panel hint">No instance to show yet.</div>'; return; }
   const opts=list.map(x=>`<option value="${esc(x.name)}"${x.name===TELBOT?' selected':''}>${esc(x.name)}</option>`).join('');
   el.innerHTML=`<div class="pagehd"><h1>${esc(TELBOT)}</h1><span class="sub">${esc(i.dir||'')}</span><span class="sp" style="flex:1"></span>
-      <select onchange="showView('telemetry',this.value)" style="font-family:var(--sans);font-size:.8rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.35rem .5rem">${opts}</select></div>
+      <select onchange="showView('telemetry',this.value)" style="font-size:.8rem;padding:.35rem .5rem">${opts}</select></div>
     <div class="tiles" id="telTiles">${telTilesHtml(i)}</div>
     <div class="cols">
       <div class="panel"><h3>CPU<span class="sub">live · since opened</span></h3><div id="telChart"></div></div>
