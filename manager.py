@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.5"
+__version__ = "3.21.6"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -7602,9 +7602,14 @@ class Handler(BaseHTTPRequestHandler):
                                 "apt install python3-pip failed: " + snap["output"][-2000:]})
                 r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "apprise"],
                                    capture_output=True, text=True, timeout=90)
+                tail = (r.stdout or "") + (r.stderr or "")
+                if r.returncode != 0 and "externally-managed-environment" in tail:
+                    r = subprocess.run([sys.executable, "-m", "pip", "install", "--user",
+                                       "--break-system-packages", "apprise"],
+                                       capture_output=True, text=True, timeout=90)
+                    tail = (r.stdout or "") + (r.stderr or "")
                 reset_apprise_available()
                 ok = r.returncode == 0 and apprise_available()
-                tail = (r.stdout or "") + (r.stderr or "")
                 return self._json({"ok": ok, "output": tail[-4000:]})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)}, 500)
