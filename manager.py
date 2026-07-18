@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.2"
+__version__ = "3.21.3"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2454,10 +2454,34 @@ DEFAULT_CONSOLE_PRESETS = [
 # once usage crosses these. Stored under settings.thresholds.
 DEFAULT_THRESHOLDS = {"cpu_pct": 85, "mem_pct": 85, "disk_pct": 90}
 
+# Fleet-level notification fan-out (ntfy + optional Apprise + legacy Discord webhook). Stored
+# under settings.notifications. Events are things only the manager itself can see: a scheduled
+# job ran, a watchdog restarted a bot, or a bot's tmux session went offline/came back — distinct
+# from AquariusProxy's own per-bot ntfy notifications (visual range / MC connect-disconnect),
+# which live in each bot's own config.json.
+DEFAULT_NOTIFICATIONS = {
+    "ntfy": {"enabled": False, "server": "https://ntfy.sh", "topic": ""},
+    "apprise_urls": [],
+    "batching": {"enabled": True, "window_seconds": 45},
+    "events": {
+        "job":      {"enabled": True,  "priority": 3, "tags": "stopwatch"},
+        "watchdog": {"enabled": True,  "priority": 4, "tags": "arrows_counterclockwise"},
+        "offline":  {"enabled": True,  "priority": 4, "tags": "red_circle"},
+        "online":   {"enabled": True,  "priority": 2, "tags": "green_circle"},
+    },
+}
+
 
 def get_settings(cfg):
     s = cfg["raw"].get("settings", {})
     presets = s.get("console_presets")
+    notif = _notifications_cfg(cfg)
+    if not notif["ntfy"]["topic"]:
+        # generate once and persist immediately - regenerating on every read would silently
+        # rotate the topic (and break existing ntfy subscriptions) on each unsaved restart.
+        notif["ntfy"]["topic"] = secrets.token_hex(3) + "-alerts"
+        s.setdefault("notifications", {})["ntfy"] = notif["ntfy"]
+        save_config(cfg)
     return {
         "theme": {
             "preset": s.get("theme", {}).get("preset", "midnight"),
@@ -2478,6 +2502,8 @@ def get_settings(cfg):
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
         "schedules": s.get("schedules") or {"notify_webhook": "", "jobs": []},
+        "notifications": notif,
+        "apprise_available": apprise_available(),
         "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
         "fonts": FONT_PRESETS,
@@ -2489,7 +2515,7 @@ def get_settings(cfg):
 
 
 def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None,
-                  thresholds=None, ui=None, schedules=None, box_name=None):
+                  thresholds=None, ui=None, schedules=None, box_name=None, notifications=None):
     s = cfg["raw"].setdefault("settings", {})
     if box_name is not None:
         s["box_name"] = clean_box_label(box_name, default="Controller")
@@ -2579,6 +2605,8 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             u["console_style"] = cs
     if schedules is not None:
         s["schedules"] = validate_schedule(schedules)
+    if notifications is not None:
+        s["notifications"] = validate_notifications(notifications)
     save_config(cfg)
     if schedules is not None and SCHEDULER is not None:
         try:
@@ -5483,6 +5511,173 @@ def _discord_notify(webhook, text):
         pass
 
 
+def validate_notifications(notif):
+    """Validate + normalize a settings.notifications object. Returns the cleaned dict."""
+    if not isinstance(notif, dict):
+        raise ValueError("notifications must be an object")
+    ntfy = notif.get("ntfy") or {}
+    if not isinstance(ntfy, dict):
+        raise ValueError("notifications.ntfy must be an object")
+    server = (ntfy.get("server") or "https://ntfy.sh").strip()
+    if server and not re.match(r"^https?://", server):
+        raise ValueError("ntfy server must be an http(s) URL")
+    if len(server) > 300:
+        raise ValueError("ntfy server URL is too long")
+    topic = (ntfy.get("topic") or "").strip()
+    if len(topic) > 128:
+        raise ValueError("ntfy topic is too long")
+
+    urls = notif.get("apprise_urls") or []
+    if not isinstance(urls, list):
+        raise ValueError("apprise_urls must be a list")
+    if len(urls) > 20:
+        raise ValueError("too many apprise URLs (max 20)")
+
+    batching = notif.get("batching") or {}
+    if not isinstance(batching, dict):
+        raise ValueError("notifications.batching must be an object")
+    try:
+        window = max(10, min(3600, int(batching.get("window_seconds", 45) or 45)))
+    except (TypeError, ValueError):
+        raise ValueError("batching.window_seconds must be a number")
+
+    events = notif.get("events") or {}
+    if not isinstance(events, dict):
+        raise ValueError("notifications.events must be an object")
+    clean_events = {}
+    for key, default in DEFAULT_NOTIFICATIONS["events"].items():
+        ev = events.get(key) or {}
+        if not isinstance(ev, dict):
+            raise ValueError(f"notifications.events.{key} must be an object")
+        try:
+            priority = int(ev.get("priority", default["priority"]))
+        except (TypeError, ValueError):
+            raise ValueError(f"notifications.events.{key}.priority must be a number")
+        clean_events[key] = {
+            "enabled": bool(ev.get("enabled", default["enabled"])),
+            "priority": max(1, min(5, priority)),
+            "tags": str(ev.get("tags", default["tags"]))[:200],
+        }
+
+    return {
+        "ntfy": {"enabled": bool(ntfy.get("enabled", False)), "server": server or "https://ntfy.sh", "topic": topic},
+        "apprise_urls": [str(u).strip()[:500] for u in urls if str(u).strip()],
+        "batching": {"enabled": bool(batching.get("enabled", True)), "window_seconds": window},
+        "events": clean_events,
+    }
+
+
+_APPRISE_AVAILABLE = None
+
+
+def apprise_available():
+    """Cached check for the optional `apprise` package (never a hard dependency, see module
+    docstring). Re-checked on demand after an install attempt via reset_apprise_available()."""
+    global _APPRISE_AVAILABLE
+    if _APPRISE_AVAILABLE is None:
+        try:
+            import apprise  # noqa: F401
+            _APPRISE_AVAILABLE = True
+        except ImportError:
+            _APPRISE_AVAILABLE = False
+    return _APPRISE_AVAILABLE
+
+
+def reset_apprise_available():
+    global _APPRISE_AVAILABLE
+    _APPRISE_AVAILABLE = None
+
+
+def _ntfy_send(ntfy_cfg, title, message, priority, tags):
+    server = (ntfy_cfg.get("server") or "").rstrip("/")
+    topic = (ntfy_cfg.get("topic") or "").strip()
+    if not ntfy_cfg.get("enabled") or not server or not topic:
+        return
+    try:
+        body = {"topic": topic, "title": title, "message": message, "priority": priority}
+        if tags:
+            body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(server + "/", data=data, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8).read()
+    except Exception:
+        pass
+
+
+def _apprise_send(urls, title, message):
+    if not urls or not apprise_available():
+        return
+    try:
+        import apprise
+        ap = apprise.Apprise()
+        for u in urls:
+            ap.add(u)
+        ap.notify(title=title, body=message)
+    except Exception:
+        pass
+
+
+def _notifications_cfg(cfg):
+    """Tolerant read of settings.notifications, merged over the defaults - never raises, so a
+    stale/hand-edited config.json can't take down notify_event()."""
+    s = cfg["raw"].get("settings", {}).get("notifications") or {}
+    try:
+        return validate_notifications(s)
+    except ValueError:
+        return dict(DEFAULT_NOTIFICATIONS)
+
+
+_BATCH_LOCK = threading.Lock()
+_BATCH_QUEUE = {}    # event key -> [(title, message), ...]
+_BATCH_TIMERS = {}   # event key -> threading.Timer
+
+
+def _batch_flush(cfg, key):
+    with _BATCH_LOCK:
+        items = _BATCH_QUEUE.pop(key, [])
+        _BATCH_TIMERS.pop(key, None)
+    if not items:
+        return
+    notif = _notifications_cfg(cfg)
+    ev = notif["events"].get(key, {"priority": 1, "tags": ""})
+    title = f"{len(items)} {key} event(s)"
+    shown = items[:20]
+    message = "\n".join(f"- {t}: {m}" for t, m in shown)
+    if len(items) > 20:
+        message += f"\n...and {len(items) - 20} more"
+    _ntfy_send(notif["ntfy"], title, message, int(ev.get("priority", 1)), ev.get("tags", ""))
+    _apprise_send(notif["apprise_urls"], title, message)
+    hook = (cfg["raw"].get("settings", {}).get("schedules") or {}).get("notify_webhook", "")
+    _discord_notify(hook, f"{title}\n{message}")
+
+
+def notify_event(cfg, key, title, message, force=False):
+    """Fan-out for one fleet-level notification event to ntfy + Apprise + the legacy Discord
+    webhook, per settings.notifications. key is one of DEFAULT_NOTIFICATIONS['events'] ('job',
+    'watchdog', 'offline', 'online') or 'test' (always force=True, bypasses enabled/batching)."""
+    notif = _notifications_cfg(cfg)
+    ev = notif["events"].get(key, {"enabled": True, "priority": 3, "tags": ""})
+    if not force and not ev.get("enabled", True):
+        return
+    priority = int(ev.get("priority", 3))
+    tags = ev.get("tags", "")
+    if not force and notif["batching"]["enabled"] and priority <= 1:
+        window = notif["batching"]["window_seconds"]
+        with _BATCH_LOCK:
+            _BATCH_QUEUE.setdefault(key, []).append((title, message))
+            if key not in _BATCH_TIMERS:
+                t = threading.Timer(window, _batch_flush, args=(cfg, key))
+                t.daemon = True
+                _BATCH_TIMERS[key] = t
+                t.start()
+        return
+    _ntfy_send(notif["ntfy"], title, message, priority, tags)
+    _apprise_send(notif["apprise_urls"], title, message)
+    hook = (cfg["raw"].get("settings", {}).get("schedules") or {}).get("notify_webhook", "")
+    _discord_notify(hook, f"{title} — {message}")
+
+
 class Scheduler:
     """Background runner for settings.schedules. Re-reads the config each tick so edits
     take effect live; never throws out of the loop (a bad job is reported, not fatal)."""
@@ -5493,6 +5688,7 @@ class Scheduler:
         self._stop = threading.Event()
         self._started = False
         self._rt = {}            # job id -> {next_run,last_run,last_result,tries}
+        self._proc_status = {}   # bot name -> last-seen instance_status(), for online/offline events
         self._lock = threading.Lock()
 
     def start(self):
@@ -5535,12 +5731,12 @@ class Scheduler:
         job = next((j for j in sched["jobs"] if j["id"] == job_id), None)
         if not job:
             raise ValueError("no such job")
-        return self._fire(cfg, job, sched.get("notify_webhook", ""), manual=True)
+        return self._fire(cfg, job, manual=True)
 
     def _tick(self):
         cfg = load_config(self.cfg_path)
+        self._watch_status(cfg)
         sched = validate_schedule(cfg["raw"].get("settings", {}).get("schedules", {}))
-        hook = sched.get("notify_webhook", "")
         now = time.time()
         ids = {j["id"] for j in sched["jobs"]}
         with self._lock:                       # forget runtime for deleted jobs
@@ -5555,13 +5751,30 @@ class Scheduler:
                     if "next_run" not in rt:
                         rt["next_run"] = next_fire(job["when"], now, rt.get("last_run"))
                     if now >= rt["next_run"]:
-                        self._fire(cfg, job, hook)
+                        self._fire(cfg, job)
                         rt["last_run"] = now
                         rt["next_run"] = next_fire(job["when"], now, now)
                 else:
-                    self._watchdog(cfg, job, hook, now)
+                    self._watchdog(cfg, job, now)
             except Exception as e:
                 self._rt.setdefault(job["id"], {})["last_result"] = f"error: {e}"
+
+    def _watch_status(self, cfg):
+        """Fleet-wide bot process online/offline notification, independent of whether an
+        on_crash watchdog job is configured for that bot - a plain diff of instance_status()
+        against what we last saw this tick. Skips the first sighting of each bot so a fresh
+        ABM restart doesn't fire an 'online' notification for every already-running instance."""
+        for inst in cfg["instances"]:
+            name = inst["name"]
+            st = instance_status(inst)
+            prev = self._proc_status.get(name)
+            self._proc_status[name] = st
+            if prev is None or st == prev:
+                continue
+            if st == "crashed":
+                notify_event(cfg, "offline", f"🔴 {name} offline", f"{name} crashed or stopped responding")
+            elif st == "running" and prev == "crashed":
+                notify_event(cfg, "online", f"🟢 {name} online", f"{name} is back up")
 
     def _statuses(self, cfg, box):
         """Map bot name -> status for a box ('' = this box, else node name)."""
@@ -5581,7 +5794,7 @@ class Scheduler:
             return [""] + [n["name"] for n in load_nodes()["nodes"]]
         return [job["box"]]
 
-    def _watchdog(self, cfg, job, hook, now):
+    def _watchdog(self, cfg, job, now):
         for box in self._boxes_for(job):
             statuses = self._statuses(cfg, box)
             targets = ([job["target"]] if job["target"] != "all" else list(statuses))
@@ -5605,11 +5818,10 @@ class Scheduler:
                 self._rt.setdefault(job["id"], {})["last_result"] = (
                     f"watchdog: {bot} {res} (try {rt['tries']}/{job['max_tries']})")
                 if job.get("notify"):
-                    _discord_notify(hook, f"🔁 watchdog restarted **{bot}**"
-                                    + (f" on {box}" if box else "")
-                                    + f" (try {rt['tries']}/{job['max_tries']}) — {res}")
+                    notify_event(cfg, "watchdog", f"🔁 watchdog restarted {bot}",
+                                 (f"on {box} " if box else "") + f"(try {rt['tries']}/{job['max_tries']}) — {res}")
 
-    def _fire(self, cfg, job, hook, manual=False):
+    def _fire(self, cfg, job, manual=False):
         results = []
         for box in self._boxes_for(job):
             statuses = self._statuses(cfg, box)
@@ -5620,7 +5832,7 @@ class Scheduler:
         self._rt.setdefault(job["id"], {})["last_result"] = summary
         if job.get("notify"):
             label = job.get("name") or job["action"]
-            _discord_notify(hook, f"⏱ **{label}** ran — {summary}")
+            notify_event(cfg, "job", f"⏱ {label} ran", summary)
         return summary
 
     def _dispatch(self, cfg, box, bot, action, command):
@@ -7331,7 +7543,8 @@ class Handler(BaseHTTPRequestHandler):
                                     thresholds=p.get("thresholds"),
                                     ui=p.get("ui"),
                                     schedules=p.get("schedules"),
-                                    box_name=p.get("box_name"))
+                                    box_name=p.get("box_name"),
+                                    notifications=p.get("notifications"))
                 if p.get("theme") is not None or p.get("ui") is not None:
                     propagate_appearance(out.get("theme"), out.get("ui"))
                 return self._json({"ok": True, "settings": out})
@@ -7339,6 +7552,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(e)}, 400)
             except json.JSONDecodeError as e:
                 return self._json({"error": f"invalid request: {e}"}, 400)
+
+        # notifications: install the optional Apprise package on this box (never a hard
+        # dependency - see the module docstring). The Settings UI hides this button and shows
+        # the Apprise URL fields instead once apprise_available() flips true.
+        if path == "/api/notifications/apprise_install":
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "apprise"],
+                                   capture_output=True, text=True, timeout=90)
+                reset_apprise_available()
+                ok = r.returncode == 0 and apprise_available()
+                tail = (r.stdout or "") + (r.stderr or "")
+                return self._json({"ok": ok, "output": tail[-4000:]})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
+
+        # notifications: send a one-off test through ntfy + apprise + the legacy discord webhook
+        if path == "/api/notifications/test":
+            try:
+                notify_event(cfg, "test", "🔔 Test notification",
+                             "This is a test from Aquarius Bot Manager.", force=True)
+                return self._json({"ok": True})
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
 
         # automation: fire a job right now ("Run now")
         if path == "/api/schedules/run":
@@ -9978,6 +10214,7 @@ body.tf-client #abmNodeBar{display:none}
       <div class="tab active" id="stApBtn" onclick="setTab('ap')">Appearance</div>
       <div class="tab" id="stPreBtn" onclick="setTab('pre')">Console</div>
       <div class="tab" id="stMonBtn" onclick="setTab('mon')">Monitoring</div>
+      <div class="tab" id="stNotBtn" onclick="setTab('not')">Notifications</div>
       <div class="tab" id="stSysBtn" onclick="setTab('sys')">System</div>
     </div>
 
@@ -10087,6 +10324,45 @@ body.tf-client #abmNodeBar{display:none}
         <pre class="log" id="sysJob" style="min-height:90px;max-height:30vh">(no system job run yet)</pre>
       </div>
       <div class="hint" style="margin-top:.6rem">Requires passwordless sudo for <code>reboot</code> and <code>apt-get</code>. See README. Your password is never stored.</div>
+    </div>
+
+    <div id="stNot" style="display:none">
+      <div class="hint" style="margin-bottom:.6rem">Push alerts for scheduled jobs, watchdog restarts, and a bot's process going offline/coming back — no Discord required. Per-job <b>Notify</b> toggles live in Automation.</div>
+
+      <div style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px;margin-bottom:.8rem">
+        <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">ntfy <span class="hint" style="text-transform:none;letter-spacing:0">— no account, subscribe to a topic and go</span></div>
+        <div class="frow"><div class="flabel">Enabled</div><div class="fctrl"><div class="tgl" id="notNtfyOn" onclick="this.classList.toggle('on')"></div></div></div>
+        <div class="frow"><div class="flabel">Server</div><div class="fctrl"><input type="text" id="notNtfyServer" placeholder="https://ntfy.sh" oninput="renderSubscribeHelper()"></div></div>
+        <div class="frow"><div class="flabel">Topic</div><div class="fctrl"><input type="text" id="notNtfyTopic" style="font-family:var(--mono)" oninput="renderSubscribeHelper()"></div></div>
+        <div id="notSubscribe" style="display:flex;gap:.7rem;align-items:center;margin:.6rem 0"></div>
+        <div class="mbar"><span class="msg" id="notNtfyMsg" style="color:var(--dim);flex:1"></span>
+          <button onclick="sendTestNotification('notNtfyMsg')">Send test</button>
+          <button class="go" onclick="saveNtfy()">Save</button></div>
+      </div>
+
+      <div style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px;margin-bottom:.8rem">
+        <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Fleet events</div>
+        <div class="hint" style="margin-bottom:.5rem">What this manager itself notifies on — job runs, watchdog restarts, a bot's process going offline/coming back. Priority 1-5 (ntfy: 5=urgent).</div>
+        <div id="notEventRows"></div>
+        <div class="mbar"><span class="msg" id="notEventMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="saveEvents()">Save</button></div>
+      </div>
+
+      <div style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px;margin-bottom:.8rem">
+        <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Batching</div>
+        <div class="hint" style="margin-bottom:.5rem">Collapses events at priority 1 into one digest per window instead of pinging for each. Priority 2+ always sends immediately.</div>
+        <div class="frow"><div class="flabel">Enabled</div><div class="fctrl"><div class="tgl" id="notBatchOn" onclick="this.classList.toggle('on')"></div></div></div>
+        <div class="frow"><div class="flabel">Window <span class="unit">seconds</span></div><div class="fctrl"><input type="number" min="10" max="3600" id="notBatchWindow" class="snum wide"></div></div>
+        <div class="mbar"><span class="msg" id="notBatchMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="saveBatching()">Save</button></div>
+      </div>
+
+      <div id="notApprisePanel" style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px;margin-bottom:.8rem"></div>
+
+      <div style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
+        <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Legacy: Discord webhook</div>
+        <div class="hint" style="margin-bottom:.55rem">Optional — pinged alongside ntfy/Apprise when a job runs/fails or the watchdog restarts a bot.</div>
+        <input type="text" id="notDiscordHook" placeholder="https://discord.com/api/webhooks/…" style="width:100%;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.5rem .6rem">
+        <div class="mbar" style="margin-top:.6rem"><span class="msg" id="notDiscordMsg" style="color:var(--dim);flex:1"></span><button onclick="saveDiscordHook()">Save webhook</button></div>
+      </div>
     </div>
   </div>
 </div>
@@ -10231,6 +10507,108 @@ async function saveThresholds(){
   const d=await api('/api/settings','POST',{thresholds});
   if(d.error){ $('monMsg').style.color='var(--crash)'; $('monMsg').textContent='✗ '+d.error; return; }
   SETTINGS=d.settings; renderHost(); $('monMsg').textContent='✓ saved';
+}
+
+const NOT_EVENT_LABELS={job:'Job ran',watchdog:'Watchdog restarted',offline:'Bot offline',online:'Bot online'};
+function renderNotifications(){
+  const n=(SETTINGS&&SETTINGS.notifications)||{ntfy:{},apprise_urls:[],batching:{},events:{}};
+  $('notNtfyOn').classList.toggle('on', !!(n.ntfy&&n.ntfy.enabled));
+  $('notNtfyServer').value=(n.ntfy&&n.ntfy.server)||'https://ntfy.sh';
+  $('notNtfyTopic').value=(n.ntfy&&n.ntfy.topic)||'';
+  renderSubscribeHelper();
+  $('notEventRows').innerHTML=Object.keys(NOT_EVENT_LABELS).map(k=>{
+    const e=(n.events&&n.events[k])||{enabled:true,priority:3,tags:''};
+    return `<div class="frow"><div class="flabel">${NOT_EVENT_LABELS[k]}</div><div class="fctrl" style="display:flex;gap:.4rem;align-items:center">
+      <div class="tgl ${e.enabled?'on':''}" id="notEv_${k}_on" onclick="this.classList.toggle('on')" title="enabled"></div>
+      <input type="number" min="1" max="5" id="notEv_${k}_pri" value="${e.priority}" class="snum" title="priority 1-5" style="width:3.2rem">
+      <input type="text" id="notEv_${k}_tags" value="${esc(e.tags||'')}" placeholder="tags" style="flex:1;font-family:var(--mono);font-size:.72rem">
+    </div></div>`;
+  }).join('');
+  $('notBatchOn').classList.toggle('on', !!(n.batching&&n.batching.enabled));
+  $('notBatchWindow').value=(n.batching&&n.batching.window_seconds)||45;
+  renderApprisePanel();
+  $('notDiscordHook').value=(SETTINGS.schedules&&SETTINGS.schedules.notify_webhook)||'';
+}
+function renderSubscribeHelper(){
+  const server=($('notNtfyServer').value||'https://ntfy.sh').replace(/\/+$/,'');
+  const topic=$('notNtfyTopic').value.trim();
+  const el=$('notSubscribe');
+  if(!topic){ el.innerHTML='<span class="hint">enter a topic to see the subscribe link</span>'; return; }
+  const url=server+'/'+encodeURIComponent(topic);
+  el.innerHTML=`<img src="https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(url)}" alt="subscribe QR" style="border-radius:8px;background:#fff;padding:4px" width="90" height="90">
+    <div><div class="hint" style="margin-bottom:.3rem">Scan with the ntfy app, or subscribe to:</div><code style="font-size:.76rem;word-break:break-all">${esc(url)}</code></div>`;
+}
+async function saveNtfy(){
+  $('notNtfyMsg').style.color='var(--dim)'; $('notNtfyMsg').textContent='saving…';
+  const notifications={...(SETTINGS.notifications||{}), ntfy:{
+    enabled:$('notNtfyOn').classList.contains('on'),
+    server:$('notNtfyServer').value.trim()||'https://ntfy.sh',
+    topic:$('notNtfyTopic').value.trim()}};
+  const d=await api('/api/settings','POST',{notifications});
+  if(d.error){ $('notNtfyMsg').style.color='var(--crash)'; $('notNtfyMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; $('notNtfyMsg').textContent='✓ saved'; renderSubscribeHelper();
+}
+async function saveEvents(){
+  $('notEventMsg').style.color='var(--dim)'; $('notEventMsg').textContent='saving…';
+  const events={};
+  Object.keys(NOT_EVENT_LABELS).forEach(k=>{
+    events[k]={enabled:$('notEv_'+k+'_on').classList.contains('on'), priority:+$('notEv_'+k+'_pri').value||3, tags:$('notEv_'+k+'_tags').value.trim()};
+  });
+  const notifications={...(SETTINGS.notifications||{}), events};
+  const d=await api('/api/settings','POST',{notifications});
+  if(d.error){ $('notEventMsg').style.color='var(--crash)'; $('notEventMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; $('notEventMsg').textContent='✓ saved';
+}
+async function saveBatching(){
+  $('notBatchMsg').style.color='var(--dim)'; $('notBatchMsg').textContent='saving…';
+  const notifications={...(SETTINGS.notifications||{}), batching:{
+    enabled:$('notBatchOn').classList.contains('on'), window_seconds:+$('notBatchWindow').value||45}};
+  const d=await api('/api/settings','POST',{notifications});
+  if(d.error){ $('notBatchMsg').style.color='var(--crash)'; $('notBatchMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; $('notBatchMsg').textContent='✓ saved';
+}
+function renderApprisePanel(){
+  const el=$('notApprisePanel');
+  if(!SETTINGS.apprise_available){
+    el.innerHTML=`<div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Apprise <span class="hint" style="text-transform:none;letter-spacing:0">— optional, for Telegram / Pushover / Slack / etc</span></div>
+      <div class="hint" style="margin-bottom:.6rem">Not installed on this box. ntfy above doesn't need this — only install it if you also want to fan out to other services.</div>
+      <div class="mbar"><span class="msg" id="notAppriseMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="installApprise()">📦 Install Apprise</button></div>`;
+    return;
+  }
+  const urls=(SETTINGS.notifications&&SETTINGS.notifications.apprise_urls)||[];
+  el.innerHTML=`<div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Apprise <span class="hint" style="text-transform:none;letter-spacing:0">— one URL per line</span></div>
+    <div class="hint" style="margin-bottom:.5rem">e.g. <code>tgram://token/chat_id</code>, <code>pover://user@token</code> — see Apprise's supported-services docs for the full URL syntax per service.</div>
+    <textarea id="notAppriseUrls" rows="3" style="width:100%;font-family:var(--mono);font-size:.74rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.5rem .6rem">${esc(urls.join('\n'))}</textarea>
+    <div class="mbar" style="margin-top:.6rem"><span class="msg" id="notAppriseMsg" style="color:var(--dim);flex:1"></span>
+      <button onclick="sendTestNotification('notAppriseMsg')">Send test</button>
+      <button class="go" onclick="saveApprise()">Save</button></div>`;
+}
+async function installApprise(){
+  $('notAppriseMsg').style.color='var(--dim)'; $('notAppriseMsg').textContent='installing… (can take a minute)';
+  const d=await api('/api/notifications/apprise_install','POST',{});
+  if(!d||!d.ok){ $('notAppriseMsg').style.color='var(--crash)'; $('notAppriseMsg').textContent='✗ install failed'+(d&&d.output?': '+d.output.slice(-300):''); return; }
+  SETTINGS=await api('/api/settings'); renderApprisePanel();
+}
+async function saveApprise(){
+  $('notAppriseMsg').style.color='var(--dim)'; $('notAppriseMsg').textContent='saving…';
+  const urls=$('notAppriseUrls').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const notifications={...(SETTINGS.notifications||{}), apprise_urls:urls};
+  const d=await api('/api/settings','POST',{notifications});
+  if(d.error){ $('notAppriseMsg').style.color='var(--crash)'; $('notAppriseMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; $('notAppriseMsg').textContent='✓ saved';
+}
+async function saveDiscordHook(){
+  $('notDiscordMsg').style.color='var(--dim)'; $('notDiscordMsg').textContent='saving…';
+  const jobs=(SETTINGS.schedules&&SETTINGS.schedules.jobs)||[];
+  const d=await api('/api/settings','POST',{schedules:{notify_webhook:$('notDiscordHook').value.trim(), jobs}});
+  if(d.error){ $('notDiscordMsg').style.color='var(--crash)'; $('notDiscordMsg').textContent='✗ '+d.error; return; }
+  SETTINGS=d.settings; $('notDiscordMsg').textContent='✓ saved';
+}
+async function sendTestNotification(msgId){
+  const msgEl=$(msgId);
+  if(msgEl){ msgEl.style.color='var(--dim)'; msgEl.textContent='sending test…'; }
+  const d=await api('/api/notifications/test','POST',{});
+  if(msgEl){ msgEl.style.color=(d&&d.ok)?'var(--dim)':'var(--crash)'; msgEl.textContent=(d&&d.ok)?'✓ sent (check your device)':'✗ failed'; }
 }
 
 async function refresh(){
@@ -11824,12 +12202,11 @@ function schedDraw(){
         <div class="frow"><div class="flabel">Action</div><div class="fctrl"><select id="njAction" onchange="schedFormSync()"><option value="restart">Restart</option><option value="start">Start</option><option value="stop">Stop</option><option value="command">Send command</option></select></div></div>
         <div class="frow" id="njCmdRow" style="display:none"><div class="flabel">Command</div><div class="fctrl"><input type="text" id="njCmd" placeholder="fly resupplyspares"></div></div>
         <div class="frow"><div class="flabel">Name <span class="unit">optional</span></div><div class="fctrl"><input type="text" id="njName" placeholder="Nightly restart"></div></div>
-        <div class="frow"><div class="flabel">Notify on Discord</div><div class="fctrl"><div class="tgl" id="njNotify" onclick="this.classList.toggle('on')"></div></div></div>
+        <div class="frow"><div class="flabel">Notify</div><div class="fctrl"><div class="tgl" id="njNotify" onclick="this.classList.toggle('on')"></div></div></div>
         <div class="mbar" style="margin-top:.6rem"><span class="msg" id="njMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="schedAdd()">+ Add job</button></div></div>
-      <div class="panel"><h3>Discord notifications</h3>
-        <div class="hint" style="margin-bottom:.5rem">Webhook pinged when a job runs/fails or the watchdog restarts a bot (only jobs with <b>Notify</b> on).</div>
-        <input type="text" id="njHook" placeholder="https://discord.com/api/webhooks/…" value="${esc(SCHEDHOOK)}" style="width:100%;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.5rem .6rem">
-        <div class="mbar" style="margin-top:.6rem"><span class="msg" id="hookMsg" style="color:var(--dim);flex:1"></span><button onclick="schedSaveHook()">Save webhook</button></div>
+      <div class="panel"><h3>Notifications</h3>
+        <div class="hint" style="margin-bottom:.5rem">Jobs with <b>Notify</b> on ping ntfy / Apprise / Discord (whichever you've set up) when they run or the watchdog restarts a bot.</div>
+        <div class="row"><button onclick="openSettings();setTab('not')">⚙ Configure in Settings → Notifications</button></div>
         <div class="hint" style="margin-top:.9rem">Schedule examples: <code>every:30m</code>, <code>daily:04:00</code>, cron <code>0 */6 * * *</code> (every 6h). For resupply, use action <b>Send command</b> with <code>fly resupplyspares</code>.</div></div>
     </div>`;
   schedFormSync(); schedBoxSync();
@@ -11860,7 +12237,6 @@ async function schedAdd(){
 async function schedToggle(id){ const j=SCHEDJOBS.find(x=>x.id===id); if(!j)return; j.enabled=!j.enabled; if(await schedPersist())schedDraw(); }
 async function schedDelete(id){ if(!confirm('Delete this job?'))return; SCHEDJOBS=SCHEDJOBS.filter(x=>x.id!==id); if(await schedPersist())renderAutomationView(); }
 async function schedRun(id){ const d=await api('/api/schedules/run','POST',{id}); if(d.error)alert('Run failed: '+d.error); else setTimeout(renderAutomationView,500); }
-async function schedSaveHook(){ SCHEDHOOK=$('njHook').value.trim(); $('hookMsg').textContent='saving…'; if(await schedPersist($('hookMsg'))){ $('hookMsg').style.color='var(--dim)'; $('hookMsg').textContent='✓ saved'; } }
 
 /* settings → appearance: sidebar picker */
 function pickSidebar(v){ SELSIDEBAR=v; document.querySelectorAll('#sidebarRow .chip').forEach(c=>c.classList.toggle('sel',c.dataset.sb===v)); previewLayout(); }
@@ -12595,14 +12971,17 @@ function setTab(t){
   $('stApBtn').classList.toggle('active',t==='ap');
   $('stPreBtn').classList.toggle('active',t==='pre');
   $('stMonBtn').classList.toggle('active',t==='mon');
+  $('stNotBtn').classList.toggle('active',t==='not');
   $('stSysBtn').classList.toggle('active',t==='sys');
   $('stAp').style.display=t==='ap'?'':'none';
   $('stPre').style.display=t==='pre'?'':'none';
   $('stMon').style.display=t==='mon'?'':'none';
+  $('stNot').style.display=t==='not'?'':'none';
   $('stSys').style.display=t==='sys'?'':'none';
   if(sysTimer){clearInterval(sysTimer);sysTimer=null;}
   if(t==='pre'){renderPresetEditor();}
   if(t==='mon'){renderThresholds();}
+  if(t==='not'){renderNotifications();}
   if(t==='sys'){loadSysInfo();loadSysJob();renderSysToggle();sysTimer=setInterval(()=>{loadSysInfo();loadSysJob();},4000);}
 }
 function presetRow(label,command){

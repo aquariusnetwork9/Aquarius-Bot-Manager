@@ -174,6 +174,26 @@ SCHEMA = {
       "ignoreOtherBots": {"type": "bool"},
     },
   },
+  "Notifications": {
+    "notifications.ntfy": {
+      "_label": "Ntfy Notifications",
+      "enabled": {"type": "bool"},
+      "server": {"type": "string", "label": "Server URL"},
+      "topic": {"type": "string"},
+      "visualRange.enabled": {"type": "bool", "label": "Visual range: enabled"},
+      "visualRange.priority": {"type": "int", "min": 1, "max": 5, "label": "Visual range: priority"},
+      "visualRange.tags": {"type": "string", "label": "Visual range: tags"},
+      "offline.enabled": {"type": "bool", "label": "Offline: enabled"},
+      "offline.priority": {"type": "int", "min": 1, "max": 5, "label": "Offline: priority"},
+      "offline.tags": {"type": "string", "label": "Offline: tags"},
+      "online.enabled": {"type": "bool", "label": "Online: enabled"},
+      "online.priority": {"type": "int", "min": 1, "max": 5, "label": "Online: priority"},
+      "online.tags": {"type": "string", "label": "Online: tags"},
+      "proxyEvent.enabled": {"type": "bool", "label": "Proxy events: enabled"},
+      "proxyEvent.priority": {"type": "int", "min": 1, "max": 5, "label": "Proxy events: priority"},
+      "proxyEvent.tags": {"type": "string", "label": "Proxy events: tags"},
+    },
+  },
   "Advanced": {
     "tickRate": {"rate": {"type": "float", "min": 0.1, "max": 5.0, "step": 0.1}},
     "actionLimiter": {

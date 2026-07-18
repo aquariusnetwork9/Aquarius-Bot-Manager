@@ -5,6 +5,7 @@
 - [[Usage]]
 - **[[Control Surface]]** 🛰️
 - [[Configuration]]
+- [[Notifications]]
 - [[Proxies]]
 - [[Multi-VPS Controller]]
 - [[Custom Domain]]

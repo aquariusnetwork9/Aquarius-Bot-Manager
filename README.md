@@ -45,7 +45,8 @@ The 3.x line turns the single-host manager into a **front-facing control plane w
 | **Named user accounts (RBAC)** | Real per-person logins with roles **view / operate / config / admin**, each scoped to specific bots — added directly or via a one-time **invite link**. Live disable / reset / delete. |
 | **Fine-grained permissions** | Per user, control exactly **which modules** they may use and configure, whether they get the **free-form console**, and whether they may **start/stop/restart** — enforced server-side, not just hidden. |
 | **Multi-VPS controller** | Connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, run fleet-wide bulk actions, and connect/provision/destroy DigitalOcean droplets. [Multi-VPS Controller →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Multi-VPS-Controller) |
-| **Automation scheduler** | Cron / interval / daily jobs + an on-crash auto-restart watchdog, this box or cross-box, with optional Discord pings. |
+| **Automation scheduler** | Cron / interval / daily jobs + an on-crash auto-restart watchdog, this box or cross-box. |
+| **Notifications** | Push alerts via **ntfy** (no account needed) for jobs, watchdog restarts, and bot online/offline — plus optional Apprise fanout or a legacy Discord webhook. [Notifications →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Notifications) |
 
 ---
 
@@ -60,7 +61,7 @@ A quick map of the surface — each links to its wiki page for the full guide.
 - **Jailed file manager** — browse / edit / rename / delete files (incl. upload/download and cross-box transfer), realpath-jailed to an allowlist of roots.
 - **Access control** — shareable guest links, named user accounts with roles + per-bot scopes, and per-user fine-grained module/console/lifecycle permissions. [Security →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Security)
 - **Multi-VPS controller & fleet** — drive your other boxes from one tab over SSH tunnels; DigitalOcean connect / provision / destroy. [Multi-VPS Controller →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Multi-VPS-Controller) · [Fleet (DigitalOcean) →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Fleet-(DigitalOcean))
-- **Automation** — scheduled restarts/commands + on-crash watchdog, this box or fleet-wide, with Discord notifications.
+- **Automation** — scheduled restarts/commands + on-crash watchdog, this box or fleet-wide. [Notifications →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Notifications) cover ntfy / Apprise / legacy Discord alerts for it.
 - **Appearance** — themes, a custom background image, density, selectable fonts, and a selectable sidebar (icon rail / full / command center, left or right) with dedicated Fleet, Activity and per-bot Telemetry pages and a ⌘K command palette.
 - **Self-update & backup** — in-place `git pull` self-update (bots untouched) with an "update available" badge and an optional daily timer; portable config backup/restore.
 

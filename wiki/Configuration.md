@@ -99,3 +99,6 @@ Stored under `settings` in `instances.json`, managed via the UI or `abm settings
 - **System actions** — reboot / OS-update toggle (off by default; see **[[Security]]**).
 - **webshare** — the saved Webshare API token (base64-obfuscated). See **[[Proxies]]**.
 - **file_roots** — allowlisted roots for the file manager (defaults to the base dir + manager dir).
+- **notifications** — ntfy server/topic, optional Apprise URLs, batching, and per-event
+  priority/tags for scheduled jobs, watchdog restarts, and bot online/offline. See
+  **[[Notifications]]**.

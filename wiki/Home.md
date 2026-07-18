@@ -30,7 +30,8 @@ As of **v1.4.0** a manager can additionally act as a **controller** that connect
 - **Jailed file manager** — browse/edit configs within an allowlist of roots.
 - **Multi-VPS controller** — connect your other boxes over SSH tunnels and run them from one dashboard: a Fleet view, an in-page box switcher, and DigitalOcean connect/provision/destroy. See **[[Multi-VPS Controller]]**.
 - **Multi-user access & sharing** — named **user accounts with roles** (View / Operate / Config / Admin), **fine-grained per-module permissions**, and one-time invite links; or hand out **tiered shareable links** scoped to specific bots. Expose the dashboard publicly with one click via a **pluggable tunnel menu** (Cloudflare / Tailscale Funnel / ngrok / your own domain). See **[[Security]]**.
-- **Automation** — a scheduler (cron / interval / daily) plus an on-crash watchdog, run across one box or the whole fleet, with optional Discord notifications.
+- **Automation** — a scheduler (cron / interval / daily) plus an on-crash watchdog, run across one box or the whole fleet.
+- **Notifications** — push alerts via **[ntfy](https://ntfy.sh)** (no account needed) for scheduled jobs, watchdog restarts, and bot online/offline; optional Apprise fanout (Telegram/Pushover/Slack/etc) or a legacy Discord webhook. See **[[Notifications]]**.
 - **Themes & visual customization** — theme presets + accent swatches, 10 selectable fonts, a custom background image, a density control, and selectable sidebar/command-center layouts.
 - **Self-update & backup** — update the manager in place (with an "update available" badge) and download/restore a portable config backup.
 - **Reconnect-friendly** — bots and the dashboard survive your browser closing or your PC rebooting; a **Connect** panel hands you a one-click reconnect shortcut.

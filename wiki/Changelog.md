@@ -2,7 +2,13 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.21.2 — *latest*
+## v3.21.3 — *latest*
+
+- **Push notifications via ntfy, replacing Discord as the required alerting path.** A new **Settings → Notifications** tab: a generated, per-box ntfy topic (no account needed — scan the QR code or paste the topic into the app), per-event priority/tags for scheduled jobs, watchdog restarts, and a bot's process going offline/coming back, and an optional **Apprise** fanout (Telegram/Pushover/Slack/etc — installs on demand via a one-click button, never a hard dependency of the manager). The existing Discord webhook still works, now filed under "Legacy" in the same tab.
+- **Bots now notify on process offline/online even without a watchdog job configured.** Previously, crash detection only fired if you'd set up an `on_crash` watchdog job for that specific bot. The scheduler now diffs every instance's status each tick and fires the new offline/online events regardless.
+- **AquariusProxy's own alerts (visual range, MC connect/disconnect) can now go straight to ntfy too**, no Discord required — see the bot's **Config** tab under **Notifications**. Requires AquariusProxy 5.12.3+.
+
+## v3.21.2
 
 - **The Graphite box chip is now a real switcher, not just a shortcut to the Boxes panel.** Clicking it used to jump straight to the full Boxes management modal every time. It's now an in-place dropdown — current box + every linked box with a live online/offline dot — that switches directly, with the Boxes panel demoted to a **🖥 Fleet…** entry at the bottom instead of being the only thing the chip could do. The Client theme's existing pill switcher now shares the same underlying logic. See **[[Multi-VPS Controller]]**.
 - **No more dead-end "Open" buttons.** An offline box in either the dropdown or the Boxes panel now reconnects its tunnel first and only switches once that succeeds, instead of leaving you on an "unreachable" page. The controller's own row in the Boxes panel — previously just a static label with nothing to click — now gets a working **Open** too, so there's always a way back to it regardless of which box you're currently viewing.
