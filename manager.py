@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test2"
+__version__ = "3.21.7-test3"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -12056,23 +12056,33 @@ function renderMyNotificationsView(){
     return order.map(c=>({category:c, evs:groups[c]}));
   };
   const bots=d.bots||[];
-  const rows=bots.length ? bots.map(b=>{
+  const rows=bots.length ? bots.map((b,bi)=>{
     const cur=b.prefs||{};
-    const boxes=(b.sources||[]).map(src=>{
-      const evs=catalog[src]||[];
-      const srcCur=cur[src]||{};
-      return groupByCategory(evs).map(g=>`<div style="margin:.35rem 0">
-          <div style="font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);margin-bottom:.25rem">${esc(g.category)}</div>
-          <div style="display:flex;flex-wrap:wrap">${g.evs.map(ev=>chk(b.name,src,ev,!!srcCur[ev.id])).join('')}</div>
-        </div>`).join('');
+    // flatten this bot's (source, category) groups into one dropdown-selectable list, so only
+    // one category's checkboxes show at a time instead of a long wall of every event at once
+    const groups=[];
+    (b.sources||[]).forEach(src=>{
+      groupByCategory(catalog[src]||[]).forEach(g=>groups.push({src, category:g.category, evs:g.evs}));
+    });
+    const selId=`notifCatSel_${bi}`;
+    const options=groups.map((g,gi)=>`<option value="${gi}" data-label="${esc(g.category)}">${esc(g.category)}</option>`).join('');
+    const panels=groups.map((g,gi)=>{
+      const srcCur=cur[g.src]||{};
+      const boxes=g.evs.map(ev=>chk(b.name,g.src,ev,!!srcCur[ev.id])).join('');
+      return `<div class="notifCatPanel" data-idx="${gi}" style="display:${gi===0?'flex':'none'};flex-wrap:wrap">${boxes}</div>`;
     }).join('');
-    return `<div class="panel" style="margin-bottom:.8rem">
-      <h3 style="margin:0 0 .5rem">${esc(b.name)}</h3>
-      ${boxes}
+    return `<div class="panel" style="margin-bottom:1.3rem;box-shadow:0 2px 8px rgba(0,0,0,.22)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:.8rem;flex-wrap:wrap;
+          padding-bottom:.7rem;margin-bottom:.8rem;border-bottom:1px solid var(--line)">
+        <h3 style="margin:0;display:flex;align-items:center;gap:.5rem;font-size:1.05rem">
+          <span style="width:8px;height:8px;border-radius:50%;background:var(--acc);flex:none"></span>${esc(b.name)}</h3>
+        <select id="${selId}" data-notifsel style="width:auto" onchange="showNotifCategory('${selId}',this.value)">${options}</select>
+      </div>
+      ${panels}
     </div>`;
   }).join('') : '<div class="panel hint">No bots visible to you yet.</div>';
   el.innerHTML=`<div class="pagehd"><h1>🔔 My Notifications</h1><span class="sub">Pick what you personally want to hear about, per bot.</span></div>
-    <div class="panel" style="margin-bottom:1rem;display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap">
+    <div class="panel" style="margin-bottom:1.3rem;display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap">
       <div id="myNotifQr"></div>
       <div style="flex:1;min-width:220px">
         <div style="font-weight:700;margin-bottom:.3rem">Your personal alert channel</div>
@@ -12087,6 +12097,33 @@ function renderMyNotificationsView(){
     </div>`;
   const qrEl=$('myNotifQr');
   if(qrEl && d.personal_topic) qrEl.innerHTML=qrSvg(url,120);
+  if(!el.dataset.notifListenerBound){
+    el.dataset.notifListenerBound='1';
+    el.addEventListener('change', e=>{
+      if(e.target.matches('input[type=checkbox][data-bot]')) refreshNotifBadges(e.target.closest('.panel'));
+    });
+  }
+  el.querySelectorAll('.panel').forEach(refreshNotifBadges);
+}
+
+function showNotifCategory(selId, idx){
+  const sel=$(selId);
+  const panel=sel.closest('.panel');
+  panel.querySelectorAll('.notifCatPanel').forEach(p=>{
+    p.style.display=(p.getAttribute('data-idx')===idx)?'flex':'none';
+  });
+}
+
+function refreshNotifBadges(panel){
+  const sel=panel.querySelector('select[data-notifsel]');
+  if(!sel) return;
+  Array.from(sel.options).forEach(opt=>{
+    const catPanel=panel.querySelector(`.notifCatPanel[data-idx="${opt.value}"]`);
+    if(!catPanel) return;
+    const total=catPanel.querySelectorAll('input[type=checkbox]').length;
+    const checkedN=catPanel.querySelectorAll('input[type=checkbox]:checked').length;
+    opt.textContent=checkedN?`${opt.getAttribute('data-label')} (${checkedN}/${total} on)`:opt.getAttribute('data-label');
+  });
 }
 
 async function saveMyNotifications(){
