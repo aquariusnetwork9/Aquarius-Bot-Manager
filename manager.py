@@ -7558,6 +7558,17 @@ class Handler(BaseHTTPRequestHandler):
         # the Apprise URL fields instead once apprise_available() flips true.
         if path == "/api/notifications/apprise_install":
             try:
+                pip_check = subprocess.run([sys.executable, "-m", "pip", "--version"],
+                                           capture_output=True, text=True, timeout=15)
+                if pip_check.returncode != 0:
+                    # try the stdlib bootstrap first (no root needed) before giving up
+                    ensurepip = subprocess.run([sys.executable, "-m", "ensurepip", "--user", "--upgrade"],
+                                               capture_output=True, text=True, timeout=60)
+                    if ensurepip.returncode != 0:
+                        return self._json({"ok": False, "error":
+                            "pip isn't available on this box's Python and can't self-bootstrap "
+                            "(ensurepip is missing too — common on minimal Ubuntu images). Run "
+                            "this on the box, then click Install again: sudo apt install -y python3-pip"})
                 r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "apprise"],
                                    capture_output=True, text=True, timeout=90)
                 reset_apprise_available()
@@ -10586,7 +10597,7 @@ function renderApprisePanel(){
 async function installApprise(){
   $('notAppriseMsg').style.color='var(--dim)'; $('notAppriseMsg').textContent='installing… (can take a minute)';
   const d=await api('/api/notifications/apprise_install','POST',{});
-  if(!d||!d.ok){ $('notAppriseMsg').style.color='var(--crash)'; $('notAppriseMsg').textContent='✗ install failed'+(d&&d.output?': '+d.output.slice(-300):''); return; }
+  if(!d||!d.ok){ $('notAppriseMsg').style.color='var(--crash)'; $('notAppriseMsg').textContent='✗ install failed: '+((d&&(d.error||d.output))?(d.error||d.output).slice(-300):'unknown error'); return; }
   SETTINGS=await api('/api/settings'); renderApprisePanel();
 }
 async function saveApprise(){
