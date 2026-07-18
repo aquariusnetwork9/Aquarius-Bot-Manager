@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test"
+__version__ = "3.21.7-test2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5718,23 +5718,42 @@ def notify_event(cfg, key, title, message, force=False, bot=None):
 # e.g. abm.offline (bot process died) and proxy.offline (MC client disconnected) mean
 # different things.
 
+# Each entry is (key, label, category) - category is UI-grouping only, no behavioral effect.
 NOTIFY_EVENT_CATALOG = {
     "abm": [
-        ("offline", "Bot crashed / went offline"),
-        ("online", "Bot came back online"),
-        ("watchdog", "Watchdog restarted the bot"),
+        ("offline", "Bot crashed / went offline", "Bot status"),
+        ("online", "Bot came back online", "Bot status"),
+        ("watchdog", "Watchdog restarted the bot", "Bot status"),
     ],
     "proxy": [
-        ("visualRange", "Someone got close to the base"),
-        ("offline", "Minecraft client disconnected"),
-        ("online", "Minecraft client connected"),
-        ("proxyEvent", "Other proxy events"),
+        ("visualRange", "Someone got close to the base", "World"),
+        ("offline", "Minecraft client disconnected", "Connection"),
+        ("online", "Minecraft client connected", "Connection"),
+        ("proxyEvent", "Other proxy events", "Connection"),
+        ("attacked", "Another player hit you", "Combat/safety"),
+        ("death", "Your bot died", "Combat/safety"),
+        ("healthDisconnect", "Auto-disconnected: health too low", "Combat/safety"),
+        ("totemPop", "A totem saved you", "Combat/safety"),
+        ("noTotems", "Out of totems", "Combat/safety"),
+        ("outOfFood", "Out of food", "Combat/safety"),
+        ("whitelistBlocked", "Non-whitelisted login blocked", "Proxy security"),
+        ("blacklistKicked", "Blacklisted player blocked", "Proxy security"),
+        ("clientOnline", "Bot fully online (queue done)", "Queue"),
+        ("prioStatus", "Priority queue status changed", "Queue"),
+        ("queueWarning", "Queue warning threshold crossed", "Queue"),
+        ("msaLogin", "Microsoft login needs approval", "Account"),
+        ("proxyConnect", "Someone connected to your proxy", "Proxy access"),
+        ("proxyDisconnect", "Someone disconnected from your proxy", "Proxy access"),
+        ("spectatorConnect", "Spectator connected", "Proxy access"),
+        ("spectatorDisconnect", "Spectator disconnected", "Proxy access"),
+        ("updateAvailable", "Update available", "Maintenance"),
+        ("pluginFailure", "Plugin failed to load", "Maintenance"),
     ],
 }
 
 
 def _empty_bot_notify_prefs():
-    return {src: {k: False for k, _ in evs} for src, evs in NOTIFY_EVENT_CATALOG.items()}
+    return {src: {k: False for k, *_ in evs} for src, evs in NOTIFY_EVENT_CATALOG.items()}
 
 
 def sanitize_notification_prefs(p):
@@ -5756,7 +5775,7 @@ def sanitize_notification_prefs(p):
                 src_in = ev.get(src)
                 if not isinstance(src_in, dict):
                     continue
-                for k, _ in evs:
+                for k, *_ in evs:
                     out[src][k] = bool(src_in.get(k))
             bots[name] = out
     return {"personal_topic": topic, "bots": bots}
@@ -5940,7 +5959,8 @@ def _notify_identity(princ):
 
 
 def _catalog_public():
-    return {src: [{"id": k, "label": label} for k, label in evs] for src, evs in NOTIFY_EVENT_CATALOG.items()}
+    return {src: [{"id": k, "label": label, "category": cat} for k, label, cat in evs]
+            for src, evs in NOTIFY_EVENT_CATALOG.items()}
 
 
 def notify_prefs_bundle(cfg, princ):
@@ -5994,7 +6014,7 @@ def save_notify_prefs(cfg, princ, bots_payload, relay_base_url):
             for src, evs in NOTIFY_EVENT_CATALOG.items():
                 src_in = ev.get(src) or {}
                 if isinstance(src_in, dict):
-                    for k, _ in evs:
+                    for k, *_ in evs:
                         out[src][k] = bool(src_in.get(k))
             clean_bots[name] = out
             if any(out["proxy"].values()):
@@ -12026,14 +12046,29 @@ function renderMyNotificationsView(){
   const chk=(bot,src,ev,checked)=>`<label style="display:inline-flex;align-items:center;gap:.35rem;font-size:.82rem;
       border:1px solid var(--line);padding:.35rem .6rem;border-radius:8px;cursor:pointer;margin:.2rem .4rem .2rem 0">
       <input type="checkbox" data-bot="${esc(bot)}" data-src="${src}" data-ev="${esc(ev.id)}" ${checked?'checked':''}> ${esc(ev.label)}</label>`;
+  const groupByCategory=(evs)=>{
+    const order=[], groups={};
+    evs.forEach(ev=>{
+      const c=ev.category||'Other';
+      if(!groups[c]){ groups[c]=[]; order.push(c); }
+      groups[c].push(ev);
+    });
+    return order.map(c=>({category:c, evs:groups[c]}));
+  };
   const bots=d.bots||[];
   const rows=bots.length ? bots.map(b=>{
     const cur=b.prefs||{};
-    const boxes=(b.sources||[]).map(src=>(catalog[src]||[])
-      .map(ev=>chk(b.name,src,ev,!!(cur[src]&&cur[src][ev.id]))).join('')).join('');
+    const boxes=(b.sources||[]).map(src=>{
+      const evs=catalog[src]||[];
+      const srcCur=cur[src]||{};
+      return groupByCategory(evs).map(g=>`<div style="margin:.35rem 0">
+          <div style="font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);margin-bottom:.25rem">${esc(g.category)}</div>
+          <div style="display:flex;flex-wrap:wrap">${g.evs.map(ev=>chk(b.name,src,ev,!!srcCur[ev.id])).join('')}</div>
+        </div>`).join('');
+    }).join('');
     return `<div class="panel" style="margin-bottom:.8rem">
       <h3 style="margin:0 0 .5rem">${esc(b.name)}</h3>
-      <div style="display:flex;flex-wrap:wrap">${boxes}</div>
+      ${boxes}
     </div>`;
   }).join('') : '<div class="panel hint">No bots visible to you yet.</div>';
   el.innerHTML=`<div class="pagehd"><h1>🔔 My Notifications</h1><span class="sub">Pick what you personally want to hear about, per bot.</span></div>
