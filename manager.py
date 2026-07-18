@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test3"
+__version__ = "3.21.7-test4"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -12058,6 +12058,7 @@ function renderMyNotificationsView(){
   const bots=d.bots||[];
   const rows=bots.length ? bots.map((b,bi)=>{
     const cur=b.prefs||{};
+    const isAquarius=(b.sources||[]).includes('proxy');
     // flatten this bot's (source, category) groups into one dropdown-selectable list, so only
     // one category's checkboxes show at a time instead of a long wall of every event at once
     const groups=[];
@@ -12071,18 +12072,26 @@ function renderMyNotificationsView(){
       const boxes=g.evs.map(ev=>chk(b.name,g.src,ev,!!srcCur[ev.id])).join('');
       return `<div class="notifCatPanel" data-idx="${gi}" style="display:${gi===0?'flex':'none'};flex-wrap:wrap">${boxes}</div>`;
     }).join('');
-    return `<div class="panel" style="margin-bottom:1.3rem;box-shadow:0 2px 8px rgba(0,0,0,.22)">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:.8rem;flex-wrap:wrap;
-          padding-bottom:.7rem;margin-bottom:.8rem;border-bottom:1px solid var(--line)">
-        <h3 style="margin:0;display:flex;align-items:center;gap:.5rem;font-size:1.05rem">
-          <span style="width:8px;height:8px;border-radius:50%;background:var(--acc);flex:none"></span>${esc(b.name)}</h3>
-        <select id="${selId}" data-notifsel style="width:auto" onchange="showNotifCategory('${selId}',this.value)">${options}</select>
+    // fork-tinted panel: reuses the same aqua/zenith palette as the fleet view's .ptag chips
+    // (manager.py:9710) so a bot's identity reads the same way across the whole app
+    const bg=isAquarius
+      ? 'linear-gradient(180deg,var(--panel),var(--panel-2))'
+      : 'linear-gradient(180deg,rgba(92,200,255,.07),rgba(92,200,255,.02)),linear-gradient(180deg,var(--panel),var(--panel-2))';
+    const stripe=isAquarius?'var(--acc-dim)':'#27506b';
+    const forkTag=`<span class="ptag ${isAquarius?'aqua':'zenith'}"><span class="pdot"></span>${isAquarius?'AquariusProxy':'ZenithProxy'}</span>`;
+    return `<div class="panel" style="padding:.85rem 1rem;box-shadow:0 2px 8px rgba(0,0,0,.22);
+        background:${bg};border-left:3px solid ${stripe}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:.6rem;flex-wrap:wrap;
+          padding-bottom:.5rem;margin-bottom:.6rem;border-bottom:1px solid var(--line)">
+        <h3 style="margin:0;display:flex;align-items:center;gap:.45rem;font-size:.98rem">${esc(b.name)}</h3>
+        ${forkTag}
       </div>
+      <select id="${selId}" data-notifsel style="width:100%;margin-bottom:.5rem" onchange="showNotifCategory('${selId}',this.value)">${options}</select>
       ${panels}
     </div>`;
   }).join('') : '<div class="panel hint">No bots visible to you yet.</div>';
   el.innerHTML=`<div class="pagehd"><h1>🔔 My Notifications</h1><span class="sub">Pick what you personally want to hear about, per bot.</span></div>
-    <div class="panel" style="margin-bottom:1.3rem;display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap">
+    <div class="panel" style="margin-bottom:1.1rem;display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap">
       <div id="myNotifQr"></div>
       <div style="flex:1;min-width:220px">
         <div style="font-weight:700;margin-bottom:.3rem">Your personal alert channel</div>
@@ -12090,8 +12099,8 @@ function renderMyNotificationsView(){
         <code style="font-size:.74rem;word-break:break-all">${esc(url)}</code>
       </div>
     </div>
-    ${rows}
-    <div class="row" style="margin-top:.8rem;align-items:center;gap:.7rem">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:.9rem">${rows}</div>
+    <div class="row" style="margin-top:1rem;align-items:center;gap:.7rem">
       <button class="go" onclick="saveMyNotifications()">💾 Save</button>
       <span class="hint" id="myNotifMsg"></span>
     </div>`;
