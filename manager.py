@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.4"
+__version__ = "3.21.5"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2642,6 +2642,9 @@ SYSTEM_COMMANDS = {
     "update": ["sudo", "-n", "sh", "-c",
                "DEBIAN_FRONTEND=noninteractive apt-get update "
                "&& DEBIAN_FRONTEND=noninteractive apt-get -y upgrade"],
+    "pip": ["sudo", "-n", "sh", "-c",
+            "DEBIAN_FRONTEND=noninteractive apt-get update "
+            "&& DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip"],
 }
 SYSTEM_COMMANDS_OVERRIDE = {}  # for testing without touching the box
 
@@ -2761,6 +2764,11 @@ def run_system_action(cfg, action):
         SYS_JOB.start("update", cmd)
         return {"ok": True, "action": "update",
                 "note": "OS update started; poll /api/system/job for output"}
+    if action == "pip":
+        cmd = SYSTEM_COMMANDS_OVERRIDE.get("pip", SYSTEM_COMMANDS["pip"])
+        SYS_JOB.start("pip", cmd)
+        return {"ok": True, "action": "pip",
+                "note": "installing python3-pip; poll /api/system/job for output"}
     raise ValueError(f"unknown system action: {action}")
 
 
@@ -7561,14 +7569,37 @@ class Handler(BaseHTTPRequestHandler):
                 pip_check = subprocess.run([sys.executable, "-m", "pip", "--version"],
                                            capture_output=True, text=True, timeout=15)
                 if pip_check.returncode != 0:
-                    # try the stdlib bootstrap first (no root needed) before giving up
+                    # try the stdlib bootstrap first (no root needed) before touching apt
                     ensurepip = subprocess.run([sys.executable, "-m", "ensurepip", "--user", "--upgrade"],
                                                capture_output=True, text=True, timeout=60)
                     if ensurepip.returncode != 0:
-                        return self._json({"ok": False, "error":
-                            "pip isn't available on this box's Python and can't self-bootstrap "
-                            "(ensurepip is missing too — common on minimal Ubuntu images). Run "
-                            "this on the box, then click Install again: sudo apt install -y python3-pip"})
+                        try:
+                            run_system_action(cfg, "pip")   # single-flight via SYS_JOB - same
+                        except PermissionError:             # gate run_system_action("update") uses
+                            return self._json({"ok": False, "error":
+                                "pip isn't available on this box's Python and can't self-bootstrap "
+                                "(ensurepip is missing too — common on minimal Ubuntu images). Enable "
+                                "System actions in Settings → System, then click Install again to let "
+                                "the manager run 'sudo apt install -y python3-pip' for you — or run "
+                                "that command yourself and click Install again."})
+                        except ValueError as e:
+                            return self._json({"ok": False, "error": f"couldn't install python3-pip: {e}"})
+                        # SYS_JOB now owns the apt-get subprocess in a background thread (no
+                        # per-call timeout to kill it early) - wait a bit since a single small
+                        # package is normally quick, but give up waiting (not running) if it
+                        # takes a while; Settings -> System shows live progress either way.
+                        deadline = time.time() + 100
+                        snap = SYS_JOB.snapshot()
+                        while snap["name"] == "pip" and snap["status"] == "running" and time.time() < deadline:
+                            time.sleep(1)
+                            snap = SYS_JOB.snapshot()
+                        if snap["name"] == "pip" and snap["status"] == "running":
+                            return self._json({"ok": False, "error":
+                                "still installing python3-pip in the background — check Settings → "
+                                "System for progress, then click Install Apprise again once it finishes."})
+                        if snap["name"] == "pip" and snap["status"] == "error":
+                            return self._json({"ok": False, "error":
+                                "apt install python3-pip failed: " + snap["output"][-2000:]})
                 r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "apprise"],
                                    capture_output=True, text=True, timeout=90)
                 reset_apprise_available()
@@ -10582,7 +10613,7 @@ function renderApprisePanel(){
   const el=$('notApprisePanel');
   if(!SETTINGS.apprise_available){
     el.innerHTML=`<div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Apprise <span class="hint" style="text-transform:none;letter-spacing:0">— optional, for Telegram / Pushover / Slack / etc</span></div>
-      <div class="hint" style="margin-bottom:.6rem">Not installed on this box. ntfy above doesn't need this — only install it if you also want to fan out to other services.</div>
+      <div class="hint" style="margin-bottom:.6rem">Not installed on this box. ntfy above doesn't need this — only install it if you also want to fan out to other services. If this box's Python has no pip, enabling <b>System actions</b> (Settings → System) lets the install button run <code>sudo apt install python3-pip</code> for you automatically.</div>
       <div class="mbar"><span class="msg" id="notAppriseMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="installApprise()">📦 Install Apprise</button></div>`;
     return;
   }
