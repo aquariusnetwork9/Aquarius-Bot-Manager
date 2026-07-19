@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test7"
+__version__ = "3.21.7-test8"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -11939,10 +11939,12 @@ function renderSubscribeHelper(){
   const el=$('notSubscribe');
   if(!topic){ el.innerHTML='<span class="hint">enter a topic to see the subscribe link</span>'; return; }
   const url=server+'/'+encodeURIComponent(topic);
+  const deepLink=ntfySchemeUrl(server, topic);
   // rendered client-side (vendored qrcodegen.js) rather than via a third-party image API -
   // the topic is the only secret on this channel, so sending it to an external service would leak it
   el.innerHTML=`<div>${qrSvg(url,90)}</div>
-    <div><div class="hint" style="margin-bottom:.3rem">Easiest: Add subscription → Scan QR code. Entering by hand instead? Server and Topic are two separate fields in the app — don't paste the combined link into the Server box, that 404s:</div>
+    <div>${deepLink?`<a class="go" href="${esc(deepLink)}" style="display:inline-block;text-decoration:none;padding:.4rem .7rem;border-radius:8px;margin-bottom:.4rem">📱 Open in ntfy app</a><br>`:''}
+      <div class="hint" style="margin-bottom:.3rem">Open that on your phone to skip typing entirely, or scan the QR. Entering by hand instead? Server and Topic are two separate fields in the app — don't paste the combined link into the Server box, that 404s:</div>
       <div style="display:grid;grid-template-columns:auto 1fr auto;gap:.3rem .5rem;align-items:center;font-size:.78rem;margin-bottom:.4rem">
         <span class="hint" style="margin:0">Server</span>
         <code style="word-break:break-all">${esc(server)}</code>
@@ -11969,6 +11971,19 @@ function qrSvg(text, px){
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${dim} ${dim}" width="${px}" height="${px}" style="border-radius:8px;background:#fff;display:block">`
     + `<rect width="${dim}" height="${dim}" fill="#fff"/><g fill="#000">${cells}</g></svg>`;
+}
+function ntfySchemeUrl(server, topic){
+  // The official ntfy Android app registers a custom "ntfy://" URI scheme (DetailActivity,
+  // any host/path - see io.heckel.ntfy source) that opens straight into a pre-filled, correctly
+  // split Add Subscription screen: ntfy://<host>[:port]/<topic>[?secure=false for http servers].
+  // Tapping this (on the phone, e.g. opened from this page in a mobile browser) skips manual
+  // Server/Topic entry - and QR scanning - entirely, so it's the fallback for apps/builds where
+  // the QR scanner isn't available.
+  try{
+    const u = new URL((server||'https://ntfy.sh').trim());
+    const secure = u.protocol !== 'http:';
+    return `ntfy://${u.host}/${encodeURIComponent(topic||'')}${secure?'':'?secure=false'}`;
+  }catch(e){ return ''; }
 }
 async function saveNtfy(){
   $('notNtfyMsg').style.color='var(--dim)'; $('notNtfyMsg').textContent='saving…';
@@ -12061,6 +12076,7 @@ function renderMyNotificationsView(){
   const d=NOTIFY_PREFS_BUNDLE; if(!d) return;
   const el=$('viewNotifications');
   const url=(d.ntfy_server||'https://ntfy.sh').replace(/\/+$/,'')+'/'+encodeURIComponent(d.personal_topic||'');
+  const deepLink=ntfySchemeUrl(d.ntfy_server, d.personal_topic);
   const catalog=d.catalog||{abm:[],proxy:[]};
   const chk=(bot,src,ev,checked)=>`<label style="display:inline-flex;align-items:center;gap:.35rem;font-size:.82rem;
       border:1px solid var(--line);padding:.35rem .6rem;border-radius:8px;cursor:pointer;margin:.2rem .4rem .2rem 0">
@@ -12114,8 +12130,9 @@ function renderMyNotificationsView(){
       <div id="myNotifQr"></div>
       <div style="flex:1;min-width:260px">
         <div style="font-weight:700;margin-bottom:.3rem">Your personal alert channel</div>
-        <div class="hint" style="margin-bottom:.6rem">Easiest: in the ntfy app, Add subscription → <b>Scan QR code</b>, point it at the code on the left. Fills in everything correctly by itself.</div>
-        <div class="hint" style="margin-bottom:.4rem">Entering it by hand instead? The app wants <b>Server</b> and <b>Topic</b> as two separate fields — don't paste the combined link into the Server box, that's what causes a 404.</div>
+        ${deepLink?`<div style="margin-bottom:.6rem"><a class="go" href="${esc(deepLink)}" style="display:inline-block;text-decoration:none;padding:.45rem .8rem;border-radius:8px">📱 Open in ntfy app</a>
+          <div class="hint" style="margin-top:.3rem">Open this page on your phone and tap that — fills in Server + Topic correctly by itself, no QR or typing needed. No QR scanner in your app? This is the one to use.</div></div>`:''}
+        <div class="hint" style="margin-bottom:.4rem">Or scan the QR code on the left with the ntfy app's Add subscription screen. Entering it by hand instead? The app wants <b>Server</b> and <b>Topic</b> as two separate fields — don't paste the combined link into the Server box, that's what causes a 404.</div>
         <div style="display:grid;grid-template-columns:auto 1fr auto;gap:.3rem .5rem;align-items:center;font-size:.78rem;margin-bottom:.4rem">
           <span class="hint" style="margin:0">Server</span>
           <code style="word-break:break-all">${esc(d.ntfy_server||'https://ntfy.sh')}</code>
