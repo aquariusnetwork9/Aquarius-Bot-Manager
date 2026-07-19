@@ -52,7 +52,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "4.0.0"
+__version__ = "4.0.1-test"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -1966,6 +1966,81 @@ class DeployJob:
 
 
 DEPLOY_JOB = DeployJob()
+
+
+# ---------------------------------------------------------------------------
+# plugin install ("Add Plugin" console-tab button)
+# ---------------------------------------------------------------------------
+# Both ZenithProxy and AquariusProxy already ship a native `plugin download <url>`
+# console command that downloads straight into plugins/, validates the jar's manifest,
+# and safely replaces a same-id plugin - verified identical in both forks' source. So
+# ABM does none of that itself; it just sends the command, watches the bot's own console
+# reply for its own success/failure embed text, and restarts on success (neither fork
+# hot-reloads - a restart is required either way).
+#
+# Keyed per-instance (not a single global job like DEPLOY_JOB) since installing a
+# plugin on one bot must not block installing a different plugin on another bot at the
+# same time.
+_PLUGIN_JOBS = {}
+
+_PLUGIN_INSTALL_OK = "Plugin Downloaded"
+_PLUGIN_INSTALL_FAIL = ("Invalid URL", "Download Failed", "Invalid Plugin Jar")
+_PLUGIN_INSTALL_TIMEOUT = 20   # seconds to wait for the bot's own console reply
+
+
+def install_plugin(cfg_path, name, url):
+    """Start a background job: send `plugin download <url>` to the bot's console, poll
+    its own log for the command's own success/failure reply, restart only on a detected
+    success. Returns immediately; poll the returned job via plugin_install_job(name)."""
+    url = (url or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("link must start with http:// or https://")
+    if "?" in url:
+        path_part = url.split("?", 1)[0]
+    else:
+        path_part = url
+    if not path_part.lower().endswith(".jar"):
+        raise ValueError("link must be a direct .jar download link (right-click the "
+                          "release asset itself and copy that link - not the repo or "
+                          "release page URL)")
+    cfg = load_config(cfg_path)
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError("no such instance")
+
+    job = _PLUGIN_JOBS.setdefault(name, DeployJob())
+
+    def target(log):
+        log(f"sending: plugin download {url}")
+        send_command(inst, f"plugin download {url}")
+        log(f"waiting up to {_PLUGIN_INSTALL_TIMEOUT}s for the bot's own console reply…")
+        deadline = time.time() + _PLUGIN_INSTALL_TIMEOUT
+        seen_upto = len(logs(inst, lines=400))
+        while time.time() < deadline:
+            time.sleep(1.5)
+            tail = logs(inst, lines=400)
+            new_text = tail[seen_upto:] if len(tail) >= seen_upto else tail
+            seen_upto = len(tail)
+            if _PLUGIN_INSTALL_OK in new_text:
+                log("✓ bot confirmed the plugin downloaded — restarting to load it")
+                restart(inst)
+                log("✓ restarted")
+                return
+            hit = next((f for f in _PLUGIN_INSTALL_FAIL if f in new_text), None)
+            if hit:
+                log(f"✗ bot reported \"{hit}\" — not restarting")
+                raise RuntimeError(f"plugin install failed: {hit}")
+        log("⚠ no confirmation seen in the bot's console within "
+            f"{_PLUGIN_INSTALL_TIMEOUT}s — check the console tab and restart manually "
+            "if the download actually succeeded")
+
+    job.start(name, target)
+
+
+def plugin_install_job(name):
+    job = _PLUGIN_JOBS.get(name)
+    return job.snapshot() if job else {"name": name, "status": "idle", "started": None,
+                                       "finished": None, "output": ""}
 
 
 def _resolve_repo(source, owner_repo=None):
@@ -7624,6 +7699,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/migrate/job":
             return self._json(MIGRATE_JOB.snapshot())
 
+        m = re.match(r"^/api/instances/([^/]+)/plugins/install/job$", path)
+        if m:
+            return self._json(plugin_install_job(urllib.parse.unquote(m.group(1))))
+
         # My Notifications: this identity's personal topic + every bot they can see with its
         # event checklist + current prefs. Reachable by owner/user/guest alike (see _classify_guest).
         if path == "/api/notify_prefs":
@@ -8543,6 +8622,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(rollback_reinstall(inst))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
+
+        # Add Plugin: send `plugin download <url>` to the bot's console, watch its own
+        # reply, restart on success — background job, owner-only (not in _inst_tier)
+        m = re.match(r"^/api/instances/([^/]+)/plugins/install$", path)
+        if m:
+            name = urllib.parse.unquote(m.group(1))
+            try:
+                p = json.loads(self._read_body() or b"{}")
+                install_plugin(self.cfg_path, name, p.get("url"))
+                return self._json({"ok": True})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
 
         # per-instance action
         m = re.match(r"^/api/instances/([^/]+)/(start|stop|restart)$", path)
@@ -10661,6 +10754,20 @@ body.tf-client #abmNodeBar{display:none}
       <button onclick="closeMigrate()">Close</button>
       <button class="warn" id="migRollBtn" style="display:none" onclick="rollbackMigrate()">Roll back</button>
       <button class="go" id="migBtn" onclick="startMigrate()">Migrate</button></div>
+  </div>
+</div>
+
+<div class="scrim" id="pluginScrim" onclick="closeAddPlugin(event)">
+  <div class="modal" style="width:min(560px,94vw)" onclick="event.stopPropagation()">
+    <div class="mhead">🧩 Add Plugin — <b id="pluginBotName">this bot</b></div>
+    <div class="hint" style="margin:-.3rem 0 .5rem">Sends AquariusProxy/ZenithProxy's own built-in <span style="font-family:var(--mono);font-size:.9em">plugin download</span> console command, which downloads the jar, validates it's a real plugin, and safely replaces an existing plugin with the same id. Neither fork supports hot-reload, so the bot restarts once the download is confirmed.</div>
+    <label>Direct <span style="font-family:var(--mono)">.jar</span> download link
+      <span class="hint">must be the exact release-asset link, not the repo or release page URL</span>
+      <input id="pluginUrl" placeholder="https://github.com/owner/repo/releases/download/v1.0/plugin.jar" autocomplete="off"></label>
+    <pre class="log" id="pluginLog" style="display:none;min-height:100px;max-height:30vh">…</pre>
+    <div class="mbar"><span class="msg" id="pluginMsg" style="flex:1;color:var(--dim)"></span>
+      <button onclick="closeAddPlugin()">Cancel</button>
+      <button class="go" id="pluginBtn" onclick="startAddPlugin()">Add</button></div>
   </div>
 </div>
 
@@ -12981,7 +13088,8 @@ function renderPresetBar(){
   const presets=(SETTINGS&&SETTINGS.console_presets)||[];
   const chips=presets.map((p,i)=>`<button class="chip" title="sends: ${esc(p.command)}" onclick="sendPreset(${i})">${esc(p.label)}</button>`).join('');
   const reinstall=`<button class="chip warn owner-only" title="Back up config.json and restart so this bot's first-run setup wizard runs again" onclick="reinstallBot(this)">⟲ Re-run installer</button>`;
-  bar.innerHTML=chips+reinstall;
+  const addPlugin=`<button class="chip owner-only" title="Download a plugin jar onto this bot and restart it" onclick="openAddPlugin()">🧩 Add Plugin</button>`;
+  bar.innerHTML=chips+reinstall+addPlugin;
   updateLogStyleHint();
 }
 function updateLogStyleHint(){
@@ -14520,6 +14628,41 @@ async function pollMigrate(){
     $('migMsg').textContent=j.status==='done'?'✓ done — watch the bot console':'✗ failed — see the log';
     $('migBtn').style.display='none'; $('migRollBtn').style.display='';   // offer rollback after any run
     refresh();
+  }
+}
+/* ---- Add Plugin (owner) ---- */
+let pluginTimer=null;
+function openAddPlugin(){
+  if(!CUR)return;
+  $('pluginBotName').textContent=CUR;
+  $('pluginUrl').value='';
+  $('pluginLog').style.display='none'; $('pluginLog').textContent='';
+  $('pluginMsg').textContent=''; $('pluginBtn').disabled=false;
+  $('pluginScrim').classList.add('open'); setTimeout(()=>$('pluginUrl').focus(),50);
+}
+function closeAddPlugin(e){ if(e&&e.target!==$('pluginScrim'))return; if(pluginTimer){clearInterval(pluginTimer);pluginTimer=null;} $('pluginScrim').classList.remove('open'); }
+async function startAddPlugin(){
+  if(!CUR)return;
+  const url=$('pluginUrl').value.trim();
+  if(!url){ $('pluginMsg').style.color='var(--crash)'; $('pluginMsg').textContent='paste a link first'; return; }
+  $('pluginMsg').style.color='var(--dim)'; $('pluginMsg').textContent='starting…'; $('pluginBtn').disabled=true;
+  const d=await api('/api/instances/'+encodeURIComponent(CUR)+'/plugins/install','POST',{url});
+  if(d.error){ $('pluginMsg').style.color='var(--crash)'; $('pluginMsg').textContent='✗ '+d.error; $('pluginBtn').disabled=false; return; }
+  $('pluginLog').style.display=''; $('pluginMsg').textContent='sending to the bot…';
+  if(pluginTimer)clearInterval(pluginTimer); pluginTimer=setInterval(pollAddPlugin,700); pollAddPlugin();
+}
+async function pollAddPlugin(){
+  if(!CUR)return;
+  const j=await api('/api/instances/'+encodeURIComponent(CUR)+'/plugins/install/job');
+  $('pluginLog').textContent=j.output||'…';
+  $('pluginLog').scrollTop=$('pluginLog').scrollHeight;
+  if(j.status==='done'||j.status==='error'){
+    clearInterval(pluginTimer); pluginTimer=null; $('pluginBtn').disabled=false;
+    const restarted=(j.output||'').includes('✓ restarted');
+    $('pluginMsg').style.color=(j.status==='error')?'var(--crash)':(restarted?'var(--dim)':'var(--warn)');
+    $('pluginMsg').textContent=j.status==='error'?'✗ install failed — see the log above'
+      :(restarted?'✓ plugin installed, bot restarted':'⚠ see the log above — may need a manual restart');
+    if(restarted){ setTimeout(loadLogs,600); refresh(); }
   }
 }
 let FBCWD=null, FBPARENT=null, FBEDIT=null;
