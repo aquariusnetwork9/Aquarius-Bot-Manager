@@ -32,6 +32,7 @@ import json
 import os
 import platform
 import posixpath
+import queue
 import random
 import re
 import secrets
@@ -51,7 +52,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test9"
+__version__ = "3.21.7-test10"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2503,6 +2504,7 @@ def get_settings(cfg):
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
         "schedules": s.get("schedules") or {"notify_webhook": "", "jobs": []},
         "notifications": notif,
+        "ntfy_stats": {**_NTFY_STATS, "queued": _NTFY_QUEUE.qsize()},
         "apprise_available": apprise_available(),
         "base_dir": _base_dir(cfg),
         "presets": THEME_PRESETS,
@@ -5598,24 +5600,84 @@ def reset_apprise_available():
     _APPRISE_AVAILABLE = None
 
 
+# Every ntfy POST in the app (fleet topic, personal fan-out, relay forwarding) funnels through
+# this one queue + single worker thread instead of firing straight from whichever thread produced
+# the event. That serialization is what actually matters: ntfy.sh's default limiter allows a burst
+# of 60 requests then only 1 per 10s - several events firing at once from different threads used to
+# send that many *concurrent* requests and could trip the limit outright (confirmed live: HTTP 429,
+# silently dropped, since sends used to swallow every exception). A single worker naturally paces
+# sends; on a 429 it retries once after backing off (Retry-After if ntfy sends one, else 10s to
+# match their replenish rate) before giving up and counting it as dropped.
+_NTFY_QUEUE = queue.Queue()
+_NTFY_STATS = {"sent": 0, "retried": 0, "dropped": 0}
+_NTFY_WORKER_LOCK = threading.Lock()
+_NTFY_WORKER_STARTED = False
+
+
+def _ntfy_post_once(server, topic, title, message, priority, tags):
+    body = {"topic": topic, "title": title, "message": message, "priority": priority}
+    if tags:
+        body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(server + "/", data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=8).read()
+
+
+def _ntfy_worker():
+    while True:
+        server, topic, title, message, priority, tags, attempt = _NTFY_QUEUE.get()
+        try:
+            _ntfy_post_once(server, topic, title, message, priority, tags)
+            _NTFY_STATS["sent"] += 1
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 1:
+                _NTFY_STATS["retried"] += 1
+                try:
+                    retry_after = max(1, int(e.headers.get("Retry-After", 10)))
+                except (TypeError, ValueError):
+                    retry_after = 10
+                # scheduled via a Timer, not time.sleep() here - this is the one and only worker
+                # thread, so blocking it would stall every other already-queued notification behind
+                # this retry too. The Timer re-enqueues after the backoff without holding up anyone else.
+                item = (server, topic, title, message, priority, tags, attempt + 1)
+                retry_timer = threading.Timer(retry_after, _NTFY_QUEUE.put, args=(item,))
+                retry_timer.daemon = True
+                retry_timer.start()
+            else:
+                _NTFY_STATS["dropped"] += 1
+                print(f"[ntfy] gave up on {server}/{topic} after {attempt + 1} attempt(s): HTTP {e.code}")
+        except Exception as e:
+            _NTFY_STATS["dropped"] += 1
+            print(f"[ntfy] send failed to {server}/{topic}: {e}")
+        finally:
+            _NTFY_QUEUE.task_done()
+            # floor between sends so a burst of many queued events can't itself trip the limiter
+            # even right after the retry backoff above
+            time.sleep(0.15)
+
+
+def _ntfy_ensure_worker():
+    global _NTFY_WORKER_STARTED
+    if _NTFY_WORKER_STARTED:
+        return
+    with _NTFY_WORKER_LOCK:
+        if not _NTFY_WORKER_STARTED:
+            threading.Thread(target=_ntfy_worker, daemon=True).start()
+            _NTFY_WORKER_STARTED = True
+
+
 def _ntfy_send_raw(server, topic, title, message, priority, tags):
-    """POST to one explicit server+topic, no enabled-flag gating - used both by _ntfy_send (the
-    fleet topic, gated below) and by personal-topic fan-out (never gated on the fleet's own
-    ntfy.enabled toggle, since an individual's opt-in is a separate decision)."""
+    """Queue one ntfy POST for the shared paced sender (_ntfy_worker) - no enabled-flag gating
+    here, used both by _ntfy_send (the fleet topic, gated below) and by personal-topic fan-out
+    (never gated on the fleet's own ntfy.enabled toggle, since an individual's opt-in is a separate
+    decision). Returns immediately; the actual HTTP call happens on the background worker."""
     server = (server or "").rstrip("/")
     topic = (topic or "").strip()
     if not server or not topic:
         return
-    try:
-        body = {"topic": topic, "title": title, "message": message, "priority": priority}
-        if tags:
-            body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(server + "/", data=data, method="POST",
-                                     headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=8).read()
-    except Exception:
-        pass
+    _ntfy_ensure_worker()
+    _NTFY_QUEUE.put((server, topic, title, message, priority, tags, 0))
 
 
 def _ntfy_send(ntfy_cfg, title, message, priority, tags):
@@ -10920,6 +10982,7 @@ body.tf-client #abmNodeBar{display:none}
         <div class="frow"><div class="flabel">Server</div><div class="fctrl"><input type="text" id="notNtfyServer" placeholder="https://ntfy.sh" oninput="renderSubscribeHelper()"></div></div>
         <div class="frow"><div class="flabel">Topic</div><div class="fctrl"><input type="text" id="notNtfyTopic" style="font-family:var(--mono)" oninput="renderSubscribeHelper()"></div></div>
         <div id="notSubscribe" style="display:flex;gap:.7rem;align-items:center;margin:.6rem 0"></div>
+        <div class="hint" id="notNtfyStats" style="margin-bottom:.4rem"></div>
         <div class="mbar"><span class="msg" id="notNtfyMsg" style="color:var(--dim);flex:1"></span>
           <button onclick="sendTestNotification('notNtfyMsg')">Send test</button>
           <button class="go" onclick="saveNtfy()">Save</button></div>
@@ -11941,6 +12004,11 @@ function renderNotifications(){
   $('notNtfyServer').value=(n.ntfy&&n.ntfy.server)||'https://ntfy.sh';
   $('notNtfyTopic').value=(n.ntfy&&n.ntfy.topic)||'';
   renderSubscribeHelper();
+  const st=SETTINGS.ntfy_stats||{sent:0,retried:0,dropped:0,queued:0};
+  $('notNtfyStats').textContent=`Since last restart: ${st.sent} sent`
+    +(st.retried?`, ${st.retried} rate-limited (retried)`:'')
+    +(st.dropped?`, ${st.dropped} dropped after retry`:'')
+    +(st.queued?`, ${st.queued} queued right now`:'');
   $('notEventRows').innerHTML=Object.keys(NOT_EVENT_LABELS).map(k=>{
     const e=(n.events&&n.events[k])||{enabled:true,priority:3,tags:''};
     return `<div class="frow"><div class="flabel">${NOT_EVENT_LABELS[k]}</div><div class="fctrl" style="display:flex;gap:.4rem;align-items:center">
