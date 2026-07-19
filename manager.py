@@ -52,7 +52,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test11"
+__version__ = "4.0.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -10979,7 +10979,7 @@ body.tf-client #abmNodeBar{display:none}
     </div>
 
     <div id="stNot" style="display:none">
-      <div class="hint" style="margin-bottom:.6rem">Push alerts for scheduled jobs, watchdog restarts, and a bot's process going offline/coming back — no Discord required. Per-job <b>Notify</b> toggles live in Automation.</div>
+      <div class="hint" style="margin-bottom:.6rem">Push alerts for scheduled jobs, watchdog restarts, a bot's process going offline/coming back, and 22 per-bot AquariusProxy events — no Discord account, server, or bot needed for any of it. Per-job <b>Notify</b> toggles live in Automation; per-person filtering lives in 🔔 My Notifications.</div>
 
       <div style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px;margin-bottom:.8rem">
         <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">ntfy <span class="hint" style="text-transform:none;letter-spacing:0">— no account, subscribe to a topic and go</span></div>
@@ -11012,7 +11012,7 @@ body.tf-client #abmNodeBar{display:none}
 
       <div style="padding:.6rem .7rem;border:1px solid var(--line);border-radius:10px">
         <div style="font-size:.85rem;color:var(--txt);font-weight:600;margin-bottom:.35rem">Legacy: Discord webhook</div>
-        <div class="hint" style="margin-bottom:.55rem">Optional — pinged alongside ntfy/Apprise when a job runs/fails or the watchdog restarts a bot.</div>
+        <div class="hint" style="margin-bottom:.55rem">Fully optional — ntfy already covers everything this used to be needed for, plus per-person filtering Discord never could. Only worth setting up if you already have a webhook and want it pinged too.</div>
         <input type="text" id="notDiscordHook" placeholder="https://discord.com/api/webhooks/…" style="width:100%;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:8px;padding:.5rem .6rem">
         <div class="mbar" style="margin-top:.6rem"><span class="msg" id="notDiscordMsg" style="color:var(--dim);flex:1"></span><button onclick="saveDiscordHook()">Save webhook</button></div>
       </div>
@@ -13891,7 +13891,7 @@ function schedDraw(){
         <div class="frow"><div class="flabel">Notify</div><div class="fctrl"><div class="tgl" id="njNotify" onclick="this.classList.toggle('on')"></div></div></div>
         <div class="mbar" style="margin-top:.6rem"><span class="msg" id="njMsg" style="color:var(--dim);flex:1"></span><button class="go" onclick="schedAdd()">+ Add job</button></div></div>
       <div class="panel"><h3>Notifications</h3>
-        <div class="hint" style="margin-bottom:.5rem">Jobs with <b>Notify</b> on ping ntfy / Apprise / Discord (whichever you've set up) when they run or the watchdog restarts a bot.</div>
+        <div class="hint" style="margin-bottom:.5rem">Jobs with <b>Notify</b> on ping ntfy (Apprise/Discord too, if you've also set those up) when they run or the watchdog restarts a bot.</div>
         <div class="row"><button onclick="openSettings();setTab('not')">⚙ Configure in Settings → Notifications</button></div>
         <div class="hint" style="margin-top:.9rem">Schedule examples: <code>every:30m</code>, <code>daily:04:00</code>, cron <code>0 */6 * * *</code> (every 6h). For resupply, use action <b>Send command</b> with <code>fly resupplyspares</code>.</div></div>
     </div>`;

@@ -46,7 +46,7 @@ The 3.x line turns the single-host manager into a **front-facing control plane w
 | **Fine-grained permissions** | Per user, control exactly **which modules** they may use and configure, whether they get the **free-form console**, and whether they may **start/stop/restart** — enforced server-side, not just hidden. |
 | **Multi-VPS controller** | Connect other boxes over SSH tunnels, switch into any box's dashboard in one tab, run fleet-wide bulk actions, and connect/provision/destroy DigitalOcean droplets. [Multi-VPS Controller →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Multi-VPS-Controller) |
 | **Automation scheduler** | Cron / interval / daily jobs + an on-crash auto-restart watchdog, this box or cross-box. |
-| **Notifications** | Push alerts via **ntfy** (no account needed) for jobs, watchdog restarts, and bot online/offline — plus optional Apprise fanout or a legacy Discord webhook. [Notifications →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Notifications) |
+| **Notifications** | Push alerts via **ntfy** (no account needed), self-hostable, for jobs/watchdog/bot online-offline plus 22 per-bot AquariusProxy events — with **🔔 My Notifications** letting each person pick their own alerts on one personal topic. Discord is fully optional/legacy. [Notifications →](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/wiki/Notifications) |
 
 ---
 
