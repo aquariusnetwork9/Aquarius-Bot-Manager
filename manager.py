@@ -52,7 +52,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test10"
+__version__ = "3.21.7-test11"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5619,8 +5619,13 @@ def _ntfy_post_once(server, topic, title, message, priority, tags):
     if tags:
         body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
     data = json.dumps(body).encode()
+    # Explicit User-Agent required, not cosmetic: Python's urllib default ("Python-urllib/3.x")
+    # is on Cloudflare's known-bad-signature list (error 1010) and gets hard-blocked by any
+    # Cloudflare-proxied ntfy server (confirmed live against a self-hosted instance) - a plain,
+    # identifiable UA string is all it takes to pass.
     req = urllib.request.Request(server + "/", data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": f"AquariusBotManager/{__version__}"})
     urllib.request.urlopen(req, timeout=8).read()
 
 
