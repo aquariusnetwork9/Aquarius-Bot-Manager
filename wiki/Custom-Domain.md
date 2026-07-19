@@ -43,6 +43,8 @@ In the **Cloudflare Zero Trust** dashboard (one-time, free):
    - **Service:** **HTTP** → **`127.0.0.1:8765`** (the manager's local port; change `8765` if you run a custom `ABM_PORT`).
 4. Save. Cloudflare **auto-creates the DNS record** (a proxied CNAME to the tunnel) — nothing to add in the DNS tab.
 
+> One tunnel can front more than one hostname/service — add another **Public Hostname** to this same tunnel later (e.g. `ntfy.example.com` → `127.0.0.1:2586` for a self-hosted [[Notifications#self-hosting-ntfy|ntfy instance]]) instead of creating a separate tunnel per service. Changes to a named tunnel's routes take effect within seconds, no restart needed on the box.
+
 ---
 
 ## Step 2 — turn on Public sharing on the controller
