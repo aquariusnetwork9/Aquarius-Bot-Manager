@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test8"
+__version__ = "3.21.7-test9"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -5671,6 +5671,22 @@ def _batch_flush(cfg, key):
     _discord_notify(hook, f"{title}\n{message}")
 
 
+def bot_display_name(inst):
+    """The bot's actual in-game Minecraft name if known (read from its cached auth profile),
+    falling back to its ABM instance name. Used to tag personal-topic alerts, since one person's
+    single personal topic can aggregate several bots at once - without this, "Connected" from two
+    different bots looks identical. Tolerant of a missing/corrupt/pre-login cache file - never
+    raises, matching the rest of the notification path."""
+    try:
+        with open(os.path.join(inst["dir"], "mc_auth_cache.json")) as f:
+            name = (json.load(f).get("minecraftProfile") or {}).get("name")
+        if name:
+            return name
+    except Exception:
+        pass
+    return inst.get("name") or "?"
+
+
 def notify_event(cfg, key, title, message, force=False, bot=None):
     """Fan-out for one fleet-level notification event to ntfy + Apprise + the legacy Discord
     webhook, per settings.notifications. key is one of DEFAULT_NOTIFICATIONS['events'] ('job',
@@ -5686,8 +5702,10 @@ def notify_event(cfg, key, title, message, force=False, bot=None):
     priority = int(ev.get("priority", 3))
     tags = ev.get("tags", "")
     if bot:
+        inst = cfg["by_name"].get(bot)
+        personal_title = f"[{bot_display_name(inst)}] {title}" if inst else title
         for _kind, _ident, topic in subscribers_for_bot(cfg, bot, "abm", key):
-            _ntfy_send_raw(notif["ntfy"]["server"], topic, title, message, priority, tags)
+            _ntfy_send_raw(notif["ntfy"]["server"], topic, personal_title, message, priority, tags)
     if not force and not ev.get("enabled", True):
         return
     if not force and notif["batching"]["enabled"] and priority <= 1:
@@ -5984,7 +6002,8 @@ def notify_prefs_bundle(cfg, princ):
         has_proxy = info.get("fork") == "AquariusProxy"
         cur = prefs["bots"].get(name) or _empty_bot_notify_prefs()
         sources = ["abm", "proxy"] if has_proxy else ["abm"]
-        bots.append({"name": name, "sources": sources, "prefs": {src: cur[src] for src in sources}})
+        bots.append({"name": name, "ign": bot_display_name(inst), "sources": sources,
+                     "prefs": {src: cur[src] for src in sources}})
     return {
         "personal_topic": topic,
         "ntfy_server": notif["ntfy"]["server"],
@@ -6329,8 +6348,10 @@ def _relay_notify_fanout(cfg_path, bot_name, relay, body):
     if evt:
         try:
             notif = _notifications_cfg(cfg)
+            inst = cfg["by_name"].get(bot_name)
+            personal_title = f"[{bot_display_name(inst)}] {title}" if inst else title
             for _kind, _ident, personal_topic in subscribers_for_bot(cfg, bot_name, "proxy", evt):
-                _ntfy_send_raw(notif["ntfy"]["server"], personal_topic, title, message, priority, tags)
+                _ntfy_send_raw(notif["ntfy"]["server"], personal_topic, personal_title, message, priority, tags)
         except Exception:
             pass
 
@@ -12118,7 +12139,7 @@ function renderMyNotificationsView(){
         background:${bg};border-left:3px solid ${stripe}">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:.6rem;flex-wrap:wrap;
           padding-bottom:.5rem;margin-bottom:.6rem;border-bottom:1px solid var(--line)">
-        <h3 style="margin:0;display:flex;align-items:center;gap:.45rem;font-size:.98rem">${esc(b.name)}</h3>
+        <h3 style="margin:0;display:flex;align-items:center;gap:.45rem;font-size:.98rem">${esc(b.name)}${(b.ign&&b.ign!==b.name)?` <span class="hint" style="font-weight:400">(${esc(b.ign)})</span>`:''}</h3>
         ${forkTag}
       </div>
       <select id="${selId}" data-notifsel style="width:100%;margin-bottom:.5rem" onchange="showNotifCategory('${selId}',this.value)">${options}</select>
