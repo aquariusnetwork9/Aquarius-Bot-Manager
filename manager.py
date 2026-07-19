@@ -51,7 +51,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "3.21.7-test6"
+__version__ = "3.21.7-test7"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -11942,7 +11942,16 @@ function renderSubscribeHelper(){
   // rendered client-side (vendored qrcodegen.js) rather than via a third-party image API -
   // the topic is the only secret on this channel, so sending it to an external service would leak it
   el.innerHTML=`<div>${qrSvg(url,90)}</div>
-    <div><div class="hint" style="margin-bottom:.3rem">Scan with the ntfy app, or subscribe to:</div>
+    <div><div class="hint" style="margin-bottom:.3rem">Easiest: Add subscription → Scan QR code. Entering by hand instead? Server and Topic are two separate fields in the app — don't paste the combined link into the Server box, that 404s:</div>
+      <div style="display:grid;grid-template-columns:auto 1fr auto;gap:.3rem .5rem;align-items:center;font-size:.78rem;margin-bottom:.4rem">
+        <span class="hint" style="margin:0">Server</span>
+        <code style="word-break:break-all">${esc(server)}</code>
+        <button onclick="copyText('${jsq(server)}',this)" style="flex:none">Copy</button>
+        <span class="hint" style="margin:0">Topic</span>
+        <code style="word-break:break-all">${esc(topic)}</code>
+        <button onclick="copyText('${jsq(topic)}',this)" style="flex:none">Copy</button>
+      </div>
+      <div class="hint" style="margin-bottom:.2rem">Full link (only for a "subscribe via URL" option):</div>
       <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
         <code style="font-size:.76rem;word-break:break-all">${esc(url)}</code>
         <button onclick="copyText('${jsq(url)}',this)" style="flex:none">Copy</button>
@@ -12103,14 +12112,23 @@ function renderMyNotificationsView(){
   el.innerHTML=`<div class="pagehd"><h1>🔔 My Notifications</h1><span class="sub">Pick what you personally want to hear about, per bot.</span></div>
     <div class="panel" style="margin-bottom:1.1rem;display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap">
       <div id="myNotifQr"></div>
-      <div style="flex:1;min-width:220px">
+      <div style="flex:1;min-width:260px">
         <div style="font-weight:700;margin-bottom:.3rem">Your personal alert channel</div>
-        <div class="hint" style="margin-bottom:.5rem">Scan this once with the ntfy app — it covers every bot below, now and anything you opt into later. No separate scan needed per bot.</div>
+        <div class="hint" style="margin-bottom:.6rem">Easiest: in the ntfy app, Add subscription → <b>Scan QR code</b>, point it at the code on the left. Fills in everything correctly by itself.</div>
+        <div class="hint" style="margin-bottom:.4rem">Entering it by hand instead? The app wants <b>Server</b> and <b>Topic</b> as two separate fields — don't paste the combined link into the Server box, that's what causes a 404.</div>
+        <div style="display:grid;grid-template-columns:auto 1fr auto;gap:.3rem .5rem;align-items:center;font-size:.78rem;margin-bottom:.4rem">
+          <span class="hint" style="margin:0">Server</span>
+          <code style="word-break:break-all">${esc(d.ntfy_server||'https://ntfy.sh')}</code>
+          <button onclick="copyText('${jsq(d.ntfy_server||'https://ntfy.sh')}',this)" style="flex:none">Copy</button>
+          <span class="hint" style="margin:0">Topic</span>
+          <code style="word-break:break-all">${esc(d.personal_topic||'')}</code>
+          <button onclick="copyText('${jsq(d.personal_topic||'')}',this)" style="flex:none">Copy</button>
+        </div>
+        <div class="hint" style="margin-bottom:.2rem">Full link (only for a "subscribe via URL" option, never the Server field):</div>
         <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
           <code style="font-size:.74rem;word-break:break-all">${esc(url)}</code>
           <button onclick="copyText('${jsq(url)}',this)" style="flex:none">Copy</button>
         </div>
-        <div class="hint" style="margin-top:.3rem">Use Copy or scan the QR rather than selecting the text by hand — a stray trailing space picked up from manual selection is enough to make ntfy 404 on the link.</div>
       </div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:.9rem">${rows}</div>
