@@ -52,7 +52,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "4.0.1-test"
+__version__ = "4.0.2-test"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -2146,6 +2146,68 @@ def place_aquarius_jar(directory, log):
     return tag
 
 
+MC_PORT_RANGE = (25600, 29999)   # randomized client-connect ports for new bots: clear of the
+                                 # viewer range (2998+), the web UI (8765) + node tunnels (8801+),
+                                 # and below Linux's ephemeral range (32768+)
+
+
+def _assigned_mc_ports(cfg):
+    """Every client-connect port already spoken for across instances (each bot's config.json
+    server.bind.port), so two bots on this box never fight over one."""
+    used = set()
+    for inst in cfg.get("instances", []):
+        path = os.path.join(inst.get("dir") or "", inst.get("config_file") or "config.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            bp = ((data.get("server") or {}).get("bind") or {}).get("port")
+            if bp:
+                used.add(int(bp))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return used
+
+
+def _random_free_mc_port(cfg):
+    """A random client-connect port for a new bot: not another bot's bind or viewer port and
+    nothing already listening on it."""
+    used = _assigned_mc_ports(cfg) | _assigned_viewer_ports(cfg)
+    lo, hi = MC_PORT_RANGE
+    for _ in range(200):
+        p = random.randint(lo, hi)
+        if p not in used and not _port_open(p):
+            return p
+    raise ValueError(f"no free port found in {lo}-{hi}")
+
+
+def seed_mc_port(directory, cfg, log):
+    """Randomize the port the Minecraft client connects to (server.bind.port) in a new bot's
+    config.json — the proxy's own default is 25565, so without this every fresh bot on a box
+    tries to bind the same port. An already-customized port is kept. Returns the port in effect."""
+    path = os.path.join(directory, "config.json")
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    bind = data.setdefault("server", {}).setdefault("bind", {})
+    cur = bind.get("port")
+    if isinstance(cur, int) and 1024 <= cur <= 65535 and cur != 25565 \
+            and cur not in _assigned_mc_ports(cfg) and not _port_open(cur):
+        log(f"client connect port kept at {cur} (already customized, verified free)")
+        return cur
+    port = _random_free_mc_port(cfg)
+    bind["port"] = port
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+    log(f"client connect port randomized -> {port} (proxy default 25565 collides between bots)")
+    return port
+
+
 def seed_viewer_config(directory, cfg, log, control=True):
     """Pre-enable the bot's native viewer (live map + control plane) in config.json on a free
     loopback port, so it's online from first boot. Creates a minimal config.json if absent (the
@@ -2212,6 +2274,14 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
                 pass
         log(f"launch command: {launch_cmd}")
         fresh = load_config(cfg_path)
+        # Randomize the client-connect port up front — the proxy's default 25565 collides as
+        # soon as a second bot shares the box (checked against every registered bot's config
+        # AND live listeners before assignment).
+        try:
+            seed_mc_port(directory, fresh, log)
+        except Exception as e:
+            log(f"[warn] could not randomize the client connect port ({e}); "
+                "the bot will bind the proxy default 25565")
         # AquariusProxy's launcher can't auto-fetch our fork (mirror is rfresh2-only), so place the
         # jar + pin the config here; otherwise the bot dies on first start with "jar not found".
         is_aquarius = (repo == DEPLOY_SOURCES["aquarius"])
