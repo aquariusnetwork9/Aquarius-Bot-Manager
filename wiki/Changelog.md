@@ -2,7 +2,11 @@
 
 Release history for Aquarius Bot Manager. Downloads are on the [Releases page](https://github.com/aquariusnetwork9/Aquarius-Bot-Manager/releases); the version is also shown in the dashboard header and via `abm --version`.
 
-## v3.21.3 — *latest*
+## v4.0.3-test — *latest*
+
+- **Webshare import now distinguishes Static Residential (ISP) plans from shared Datacenter plans.** A Webshare account can hold more than one plan at once, and the raw `/proxy/list/` API silently returns the shared datacenter pool if no plan is specified — no error, just the wrong IPs, which are exactly what anti-bot systems on most game servers flag. The **🌐 Proxies** dashboard's Import-from-Webshare panel gets a new **Plan type** card: toggle Static Residential / Datacenter / Custom plan ID, **Refresh plans** to pull the account's live plan list (id, subtype, proxy count, status) via Webshare's `/subscription/plan/` endpoint, and the matching active plan is auto-selected for both **Count** and **Import & assign**. New CLI: `abm webshare plans`.
+
+## v3.21.3
 
 - **Push notifications via ntfy, replacing Discord as the required alerting path.** A new **Settings → Notifications** tab: a generated, per-box ntfy topic (no account needed — scan the QR code or paste the topic into the app), per-event priority/tags for scheduled jobs, watchdog restarts, and a bot's process going offline/coming back, and an optional **Apprise** fanout (Telegram/Pushover/Slack/etc — installs on demand via a one-click button, never a hard dependency of the manager). The existing Discord webhook still works, now filed under "Legacy" in the same tab.
 - **Bots now notify on process offline/online even without a watchdog job configured.** Previously, crash detection only fired if you'd set up an `on_crash` watchdog job for that specific bot. The scheduler now diffs every instance's status each tick and fires the new offline/online events regardless.

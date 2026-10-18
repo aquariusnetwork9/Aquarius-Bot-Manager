@@ -51,8 +51,26 @@ If your proxies come from a [Webshare](https://www.webshare.io/) subscription, *
 
 **Steps:**
 1. Get your API token from the Webshare dashboard → **API**.
-2. Paste it into the token field. Pick the **auth model** (below). Optionally filter by **Countries** (e.g. `US,CA`) and **Valid only**.
+2. Paste it into the token field. Pick the **plan type** (below) and the **auth model**. Optionally filter by **Countries** (e.g. `US,CA`) and **Valid only**.
 3. **Count** previews how many would import (changes nothing). **Import & assign** writes them.
+
+### Plan type
+
+A Webshare account can hold more than one plan at once — commonly a large shared **Datacenter** plan (`default`) alongside a smaller, dedicated **Static Residential** plan (`isp`). This matters because `/proxy/list/` on Webshare's API **silently returns the datacenter plan by default** if no plan is specified — there's no error, you just get the wrong pool. Datacenter-range IPs are exactly what anti-bot systems on most game servers flag as hosting/VPN traffic, while static residential IPs look like a real home connection.
+
+The **Plan type** card above the import panel lets you choose explicitly instead of guessing:
+
+- **Static Residential** / **Datacenter** — click **Refresh plans** to pull your account's live plan list (via Webshare's `/subscription/plan/` endpoint); ABM auto-selects the matching active plan's id for you. The plan list below the toggles shows every plan on the account with its subtype, id, proxy count, and status, so you can confirm which one you're about to pull from.
+- **Custom plan ID** — type a plan id directly (useful if your account has more than one plan of the same subtype, or a plan Webshare doesn't label cleanly).
+
+Whichever is selected feeds the `plan_id` used by both **Count** and **Import & assign**.
+
+CLI:
+```bash
+abm webshare plans                 # list this account's plans with subtype/status/count
+abm webshare count  --plan-id 12220387
+abm webshare import --plan-id 12220387 --auth userpass
+```
 
 ### The two auth models
 
