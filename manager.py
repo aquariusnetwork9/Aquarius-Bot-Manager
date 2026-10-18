@@ -52,7 +52,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "4.0.2-test"
+__version__ = "4.0.3-test"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
@@ -868,6 +868,7 @@ def set_proxies_bulk(cfg, target_names, proxies, mode="roundrobin", do_restart=F
 # ---------------------------------------------------------------------------
 
 WEBSHARE_API = "https://proxy.webshare.io/api/v2/proxy/list/"
+WEBSHARE_PLAN_API = "https://proxy.webshare.io/api/v2/subscription/plan/"
 
 
 def _enc_token(t):
@@ -907,6 +908,51 @@ def get_proxy_pool(cfg):
 def save_proxy_pool(cfg, text):
     cfg["raw"].setdefault("settings", {})["proxy_pool"] = (text or "").strip()
     save_config(cfg)
+
+
+def webshare_list_plans(token):
+    """List every plan on this Webshare account → [{id, subtype, status, count, countries}].
+
+    A Webshare account can hold several plans at once — commonly a large shared
+    'default' (datacenter) plan plus a smaller 'isp' (static residential) one — and
+    a bare /proxy/list/ call silently returns the 'default' plan's proxies with no
+    error if plan_id is left out. Datacenter-range IPs are exactly what anti-bot
+    systems on game servers flag, so picking the wrong plan isn't cosmetic. This
+    lets the UI/CLI show both, labeled, instead of the operator guessing a plan_id."""
+    import urllib.request, urllib.error
+    if not token:
+        raise ValueError("no Webshare API token (pass --token, set WEBSHARE_TOKEN, or save one)")
+    req = urllib.request.Request(WEBSHARE_PLAN_API,
+                                  headers={"Authorization": f"Token {token}",
+                                           "User-Agent": "aquarius-bot-manager"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise ValueError("Webshare API rejected the token (401/403) — check the API key")
+        raise ValueError(f"Webshare API error {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        raise ValueError(f"could not reach Webshare API: {e.reason}")
+    out = []
+    for p in data.get("results", []):
+        out.append({"id": p.get("id"),
+                    "subtype": p.get("proxy_subtype"),
+                    "status": p.get("status"),
+                    "count": p.get("proxy_count"),
+                    "countries": p.get("proxy_countries") or {}})
+    return out
+
+
+# Webshare's own vocabulary for the two plan shapes this tool distinguishes, plus a
+# readable label per side — 'isp' is their static-residential product, everything else
+# (seen in practice: 'default') is a shared datacenter pool.
+WEBSHARE_RESIDENTIAL_SUBTYPE = "isp"
+WEBSHARE_PLAN_TYPE_LABELS = {"isp": "Static Residential", "default": "Datacenter"}
+
+
+def webshare_plan_label(subtype):
+    return WEBSHARE_PLAN_TYPE_LABELS.get(subtype, subtype or "unknown")
 
 
 def webshare_fetch(token, list_mode="direct", valid_only=True, countries=None,
@@ -8764,6 +8810,24 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError as e:
                 return self._json({"error": f"invalid request: {e}"}, 400)
 
+        # list this account's Webshare plans (static residential vs datacenter, etc.)
+        if path == "/api/proxies/webshare/plans":
+            try:
+                p = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError as e:
+                return self._json({"error": f"invalid request: {e}"}, 400)
+            token = _webshare_token(cfg, p.get("token"))
+            if p.get("save_token") and token:
+                save_webshare_token(cfg, token)
+            try:
+                plans = webshare_list_plans(token)
+                for pl in plans:
+                    pl["label"] = webshare_plan_label(pl["subtype"])
+                return self._json({"ok": True, "plans": plans,
+                                   "saved_token": bool(p.get("save_token") and token)})
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+
         # import proxies from a Webshare subscription via its API
         if path == "/api/proxies/webshare":
             try:
@@ -9232,8 +9296,9 @@ def main():
     p.add_argument("--lines", type=int, default=200, help="console lines to scan per bot")
 
     p = sub.add_parser("webshare", help="import proxies from a Webshare subscription via its API")
-    p.add_argument("action", choices=["import", "count"],
-                   help="'count' = fetch and report how many (no changes); 'import' = assign them")
+    p.add_argument("action", choices=["import", "count", "plans"],
+                   help="'plans' = list this account's plans (static residential vs datacenter); "
+                        "'count' = fetch and report how many (no changes); 'import' = assign them")
     p.add_argument("--token", default=None, help="Webshare API token (else WEBSHARE_TOKEN or saved)")
     p.add_argument("--auth", choices=["ip", "userpass"], default="userpass",
                    help="ip = host:port only (whitelist VPS in Webshare); userpass = per-proxy creds")
@@ -9504,7 +9569,17 @@ def main():
             save_webshare_token(cfg, token)
             print("saved Webshare token")
         try:
-            if args.action == "count":
+            if args.action == "plans":
+                plans = webshare_list_plans(token)
+                if not plans:
+                    print("no plans found on this account")
+                else:
+                    print(f"{'id':<12}{'subtype':<10}{'label':<20}{'status':<10}{'count':<8}")
+                    for pl in plans:
+                        print(f"{pl['id']:<12}{pl['subtype'] or '':<10}"
+                              f"{webshare_plan_label(pl['subtype']):<20}{pl['status'] or '':<10}"
+                              f"{pl['count']:<8}")
+            elif args.action == "count":
                 got = webshare_fetch(token, list_mode=args.list_mode,
                                      valid_only=not args.all_proxies, countries=countries or None,
                                      plan_id=args.plan_id)
@@ -10729,6 +10804,27 @@ body.tf-client #abmNodeBar{display:none}
           <button onclick="bulkSelectErrored(this)" title="select only bots with proxy errors">Errored</button>
           <button onclick="randomizeUnique(this)" title="Give every selected bot a fresh, unique IP from the pool">🎲 Randomize unique</button>
           <button class="go" onclick="applyBulkProxies(this)">Apply</button></div>
+      </div>
+    </div>
+
+    <div class="modcard" id="wsPlanCard" style="margin-bottom:.4rem">
+      <div class="mhd" onclick="document.getElementById('wsPlanCard').classList.toggle('open')">
+        <span class="caret">▶</span><span class="mtitle">Plan type</span>
+      </div>
+      <div class="mbody" style="gap:.6rem">
+        <div class="hint">Webshare accounts can hold more than one plan at once — commonly a large shared <b>Datacenter</b> pool plus a smaller <b>Static Residential</b> one. A bare proxy fetch silently returns the datacenter pool with no warning, and datacenter-range IPs are exactly what anti-bot systems on game servers flag. Pick which plan to pull from before importing.</div>
+        <div style="display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:.8rem">
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsplantype" value="isp" checked style="width:auto" onchange="wsPlanTypeChanged()"> Static Residential</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsplantype" value="default" style="width:auto" onchange="wsPlanTypeChanged()"> Datacenter</label>
+          <label style="flex-direction:row;align-items:center;gap:.35rem;color:var(--txt);font-weight:400"><input type="radio" name="wsplantype" value="custom" style="width:auto" onchange="wsPlanTypeChanged()"> Custom plan ID</label>
+        </div>
+        <div id="wsPlanCustomWrap" style="display:none">
+          <label style="color:var(--dim)">Plan ID
+            <input id="wsPlanCustomId" placeholder="e.g. 12220387" style="width:10rem;font-family:var(--mono);font-size:.76rem;background:#06090c;color:#cdd9e2;border:1px solid var(--line);border-radius:7px;padding:.4rem .5rem"></label>
+        </div>
+        <div class="mbar"><span class="msg" id="wsPlanMsg" style="color:var(--dim);flex:1"></span>
+          <button onclick="wsRefreshPlans(this)">Refresh plans</button></div>
+        <div id="wsPlanList" style="display:flex;flex-direction:column;gap:.3rem;font-size:.78rem"></div>
       </div>
     </div>
 
@@ -14414,7 +14510,7 @@ function dlMulti(os){
   $('connMsg').style.color='var(--dim)'; $('connMsg').textContent='downloading all-boxes launcher…';
   window.location=`/api/connection/multiscript?os=${os}&ip=${ip}&port=${CONN.port||8765}&user=${encodeURIComponent(CONN.user||'')}`;
 }
-function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); loadWebshareHint(); }
+function openProxies(){ $('proxScrim').classList.add('open'); loadProxies(); loadWebshareHint(); wsRefreshPlans(); }
 function closeProxies(e){ if(e&&e.target!==$('proxScrim'))return; $('proxScrim').classList.remove('open'); }
 async function loadProxies(){
   $('proxMsg').textContent='';
@@ -14490,10 +14586,63 @@ function updateBulkCount(){
   const t='('+BULKSEL.size+' selected)';
   $('bulkCount').textContent=t; if($('wsCount'))$('wsCount').textContent=t;
 }
+let WSPLANS=[];
+function wsPlanTypeChanged(){
+  const v=document.querySelector('input[name=wsplantype]:checked').value;
+  $('wsPlanCustomWrap').style.display = v==='custom' ? '' : 'none';
+  wsRenderPlanList();
+}
+function wsSelectedPlanSubtype(){
+  return document.querySelector('input[name=wsplantype]:checked').value;
+}
+/** The active plan of a subtype, preferring the largest when more than one qualifies
+    (mirrors the proven pick logic: active status first, then proxy count as the tie-break). */
+function wsBestPlan(subtype){
+  const active=WSPLANS.filter(p=>p.subtype===subtype && p.status==='active');
+  if(!active.length) return null;
+  return active.reduce((a,b)=> (b.count||0)>(a.count||0) ? b : a);
+}
+/** Resolve the plan_id to send with Count/Import, from the Plan type card's current selection. */
+function wsResolvePlanId(){
+  const v=wsSelectedPlanSubtype();
+  if(v==='custom') return $('wsPlanCustomId').value.trim()||null;
+  const hit=wsBestPlan(v);
+  return hit ? String(hit.id) : null;
+}
+function wsRenderPlanList(){
+  const v=wsSelectedPlanSubtype();
+  if(!WSPLANS.length){ $('wsPlanList').innerHTML=''; return; }
+  const best = v!=='custom' ? wsBestPlan(v) : null;
+  $('wsPlanList').innerHTML = WSPLANS.map(p=>{
+    const match = best && p.id===best.id;
+    return `<div style="padding:.3rem .5rem;border-radius:6px;border:1px solid var(--line);${match?'background:rgba(90,200,120,.08);border-color:var(--ok,#5ac878)':''}">`
+      + `${match?'✓ ':''}<b>${p.label}</b> <span class="hint">(${p.subtype})</span> — id ${p.id} — ${p.count} proxies — ${p.status}`
+      + `</div>`;
+  }).join('');
+}
+async function wsRefreshPlans(btn){
+  const token=$('wsToken').value.trim();
+  if(btn){ btn.disabled=true; }
+  $('wsPlanMsg').style.color='var(--dim)'; $('wsPlanMsg').textContent='loading plans…';
+  const d=await api('/api/proxies/webshare/plans','POST',{token});
+  if(btn){ btn.disabled=false; }
+  if(d.error){ $('wsPlanMsg').style.color='var(--crash)'; $('wsPlanMsg').textContent='✗ '+d.error; return; }
+  WSPLANS=d.plans||[];
+  $('wsPlanMsg').style.color='var(--dim)';
+  $('wsPlanMsg').textContent = WSPLANS.length ? `✓ ${WSPLANS.length} plan(s) found` : 'no plans found';
+  wsRenderPlanList();
+}
+const WS_PLAN_TYPE_LABELS={isp:'Static Residential', default:'Datacenter'};
 async function webshareCount(btn){
   const token=$('wsToken').value.trim();
+  const plan_id=wsResolvePlanId();
+  if(wsSelectedPlanSubtype()!=='custom' && !plan_id){
+    $('wsMsg').style.color='var(--crash)';
+    $('wsMsg').textContent='✗ no '+(WS_PLAN_TYPE_LABELS[wsSelectedPlanSubtype()]||wsSelectedPlanSubtype())+' plan found — click "Refresh plans" above';
+    return;
+  }
   $('wsMsg').style.color='var(--dim)'; $('wsMsg').textContent='checking…'; btn.disabled=true;
-  const d=await api('/api/proxies/webshare','POST',{token,count_only:true,
+  const d=await api('/api/proxies/webshare','POST',{token,count_only:true, plan_id,
     valid_only:$('wsValid').checked, countries:$('wsCountries').value.trim()});
   btn.disabled=false;
   if(d.error){ $('wsMsg').style.color='var(--crash)'; $('wsMsg').textContent='✗ '+d.error; return; }
@@ -14503,7 +14652,13 @@ async function webshareCount(btn){
 async function webshareImport(btn){
   const targets=[...BULKSEL];
   if(!targets.length){ $('wsMsg').style.color='var(--crash)'; $('wsMsg').textContent='select at least one target'; return; }
-  const body={ targets, token:$('wsToken').value.trim(),
+  const plan_id=wsResolvePlanId();
+  if(wsSelectedPlanSubtype()!=='custom' && !plan_id){
+    $('wsMsg').style.color='var(--crash)';
+    $('wsMsg').textContent='✗ no '+(WS_PLAN_TYPE_LABELS[wsSelectedPlanSubtype()]||wsSelectedPlanSubtype())+' plan found — click "Refresh plans" above';
+    return;
+  }
+  const body={ targets, token:$('wsToken').value.trim(), plan_id,
     auth:document.querySelector('input[name=wsauth]:checked').value,
     mode:document.querySelector('input[name=wsmode]:checked').value,
     valid_only:$('wsValid').checked, countries:$('wsCountries').value.trim(),
