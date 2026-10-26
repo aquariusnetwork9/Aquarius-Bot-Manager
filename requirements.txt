@@ -1,0 +1,19 @@
+# Only needed on Windows. The Linux implementation remains stdlib-only.
+#
+# Do NOT just `pip install -r requirements.txt` for this file -- PySide6
+# needs special handling to avoid pulling in an embedded Chromium browser.
+# Run `python install_windows_deps.py` instead, which installs exactly
+# these packages correctly. This file documents the set; see that script's
+# docstring for why a plain pip install of it won't work right.
+
+# platform_win.py: CPU/RSS monitoring and process enumeration for adoption.
+psutil>=5.9
+
+# gui_win.py: the native control-panel window (Essentials + Addons; the
+# PySide6 metapackage itself is installed separately, --no-deps -- see
+# install_windows_deps.py).
+PySide6-Essentials==6.12.0
+PySide6-Addons==6.12.0
+
+# tray_win.py: the system tray icon + menu.
+pystray>=0.19

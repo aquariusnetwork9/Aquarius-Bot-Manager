@@ -59,6 +59,16 @@ DEFAULT_CONFIG = (os.environ.get("ABM_CONFIG") or os.environ.get("ZP_CONFIG")
                   or os.path.join(SCRIPT_DIR, "instances.json"))
 SESSION_PREFIX = os.environ.get("ABM_PREFIX") or os.environ.get("ZP_PREFIX") or "abm_"
 
+# True on a native Windows host. Gates every OS-sensitive function below
+# (process supervision, monitoring, resource limits, system actions) between
+# this file's Linux/tmux implementation and platform_win.py's Windows one.
+# Everything else in this file (the HTTP server, web UI, CLI, order/routing
+# logic, limit config storage, and the SSH/remote-node path) is OS-agnostic
+# and untouched by this split.
+IS_WINDOWS = platform.system() == "Windows"
+if IS_WINDOWS:
+    import platform_win
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -66,6 +76,12 @@ SESSION_PREFIX = os.environ.get("ABM_PREFIX") or os.environ.get("ZP_PREFIX") or 
 def load_config(path):
     if not os.path.exists(path):
         die(f"config not found: {path}\nRun:  python3 manager.py discover <basedir>  to create one.")
+    if IS_WINDOWS:
+        # .pid/.log state files live next to instances.json (see
+        # platform_win.py's module docstring on why these need to be durable
+        # across separate CLI invocations, unlike Linux's tmux-backed sessions).
+        platform_win.set_state_dir(os.path.join(os.path.dirname(os.path.abspath(path)), ".abm-state"))
+        platform_win.set_config_path(os.path.abspath(path))
     with open(path) as f:
         data = json.load(f)
     insts = data.get("instances", [])
@@ -138,11 +154,15 @@ def pane_dead(s):
     return p.returncode == 0 and "1" in p.stdout.split()
 
 
-def instance_status(inst):
+def instance_status_linux(inst):
     s = session_name(inst)
     if not session_exists(s):
         return "stopped"
     return "crashed" if pane_dead(s) else "running"
+
+
+def instance_status(inst):
+    return platform_win.win_instance_status(inst) if IS_WINDOWS else instance_status_linux(inst)
 
 
 # instance name -> epoch of the last manager-initiated (re)start. Powers the brief
@@ -150,7 +170,7 @@ def instance_status(inst):
 _RESTART_FLAG = {}
 
 
-def start(inst):
+def start_linux(inst):
     s = session_name(inst)
     if session_exists(s):
         if pane_dead(s):
@@ -168,7 +188,13 @@ def start(inst):
     return "started" + note
 
 
-def stop(inst):
+def start(inst):
+    result = platform_win.win_start(inst) if IS_WINDOWS else start_linux(inst)
+    _RESTART_FLAG[inst.get("name")] = time.time()
+    return result
+
+
+def stop_linux(inst):
     s = session_name(inst)
     if not session_exists(s):
         return "not running"
@@ -185,13 +211,17 @@ def stop(inst):
     return "stopped"
 
 
+def stop(inst):
+    return platform_win.win_stop(inst) if IS_WINDOWS else stop_linux(inst)
+
+
 def restart(inst):
     stop(inst)
     time.sleep(0.5)
     return start(inst)
 
 
-def logs(inst, lines=300):
+def logs_linux(inst, lines=300):
     s = session_name(inst)
     if not session_exists(s):
         return "(not running)"
@@ -199,6 +229,10 @@ def logs(inst, lines=300):
     # discarding all formatting at capture time.
     p = tmux("capture-pane", "-t", s, "-p", "-e", "-J", "-S", f"-{int(lines)}")
     return p.stdout if p.returncode == 0 else f"(error reading logs: {p.stderr})"
+
+
+def logs(inst, lines=300):
+    return platform_win.win_logs(inst, lines) if IS_WINDOWS else logs_linux(inst, lines)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +303,7 @@ def _proc_tree_stats(root_pid):
     return total_j, total_rss * _PAGE_SIZE, len(seen)
 
 
-def instance_stats(inst):
+def instance_stats_linux(inst):
     """Live CPU%/RSS for a running instance, or None. CPU% is normalized to one
     core (100 = a full core; can exceed 100 up to cores*100), sampled between polls."""
     s = session_name(inst)
@@ -292,6 +326,32 @@ def instance_stats(inst):
         if dt > 0 and dj >= 0:
             cpu_pct = round(100.0 * dj / (dt * _CLK_TCK), 1)
     return {"pid": pid, "cpu_pct": cpu_pct, "rss": rss_bytes, "procs": nproc}
+
+
+def instance_stats_win(inst):
+    """Live CPU%/RSS for a running (or adopted) instance on Windows, via psutil.
+    Mirrors instance_stats_linux's contract and graceful-None-on-failure shape."""
+    pid = platform_win.win_pid_for(inst)
+    if not pid:
+        _CPU_SAMPLES.pop(inst.get("name"), None)
+        return None
+    key = inst.get("name")
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        procs = [p] + p.children(recursive=True)
+        rss_bytes = sum(c.memory_info().rss for c in procs if c.is_running())
+        cpu_pct = round(sum(c.cpu_percent(interval=None) for c in procs if c.is_running()), 1)
+        nproc = len(procs)
+    except (psutil.Error, OSError):
+        return None
+    now = time.time()
+    _CPU_SAMPLES[key] = now
+    return {"pid": pid, "cpu_pct": cpu_pct, "rss": rss_bytes, "procs": nproc}
+
+
+def instance_stats(inst):
+    return instance_stats_win(inst) if IS_WINDOWS else instance_stats_linux(inst)
 
 
 # tiny mtime cache so we don't re-parse launch_config.json on every poll
@@ -555,7 +615,7 @@ def connection_state(inst, status=None):
     return st                                  # offline or updating
 
 
-def send_command(inst, command):
+def send_command_linux(inst, command):
     """Type a command into the instance's live console (tmux pane stdin) and press Enter.
     An empty command is a bare Enter keypress — same as a regular terminal, this is how you
     accept a bracketed default in an interactive prompt (e.g. a launcher's first-run wizard).
@@ -572,6 +632,15 @@ def send_command(inst, command):
         tmux("send-keys", "-t", s, "-l", "--", command)
     tmux("send-keys", "-t", s, "Enter")
     return "sent"
+
+
+def send_command(inst, command):
+    """Type a command into the instance's live console and press Enter. See
+    send_command_linux/platform_win.win_send_command for the per-OS contract
+    (Windows: raises ValueError for adopted instances, which have no stdin pipe)."""
+    if IS_WINDOWS:
+        return platform_win.win_send_command(inst, command)
+    return send_command_linux(inst, command)
 
 
 def read_instance_config(inst):
@@ -1297,9 +1366,41 @@ def set_limits(cfg, name, memory=None, cpu=None):
     return inst.get("limits") or {}
 
 
+def set_env(cfg, name, key, value=None, clear_all=False):
+    """Set/clear one environment variable override for an instance's launch
+    (Windows only: see platform_win._merged_env, which replaces the implicit
+    .bashrc-sourcing env Linux's bash -lc login shell relies on). value=None
+    deletes that one key; clear_all=True drops every override. Returns the
+    resulting env dict."""
+    inst = cfg["by_name"].get(name)
+    if not inst:
+        raise ValueError(f"no such instance: {name}")
+    cur = dict(inst.get("env") or {})
+    if clear_all:
+        cur = {}
+    elif key is not None:
+        key = str(key).strip()
+        if not key:
+            raise ValueError("env key is required")
+        if value is None:
+            cur.pop(key, None)
+        else:
+            cur[key] = str(value)
+    if cur:
+        inst["env"] = cur
+    else:
+        inst.pop("env", None)
+    save_config(cfg)
+    return inst.get("env") or {}
+
+
 def _supports_cgroup_limits():
-    """True if `systemd-run --user --scope` can set resource controls here. Cached.
-    Probes once by running 'true' in a throwaway transient user scope."""
+    """True if resource limits can be enforced on this host: cgroups via
+    systemd-run on Linux (cached probe), or Windows Job Objects (always
+    available) on Windows. Note: on Windows this governs the memory cap only
+    — see platform_win._win_launch_command for the CPU-limit degrade note."""
+    if IS_WINDOWS:
+        return platform_win.job_objects_supported()
     global _CGROUP_OK
     if _CGROUP_OK is None:
         try:
@@ -1738,11 +1839,14 @@ def rename_instance(cfg, old, new, move_dir=True):
             inst["dir"] = new_dir
             moved = True
 
-    # rename the live/crashed tmux session so the bot stays managed under the new name
-    # (adopted instances pin an external session by name — leave that alone)
-    if not adopted and session_exists(old_session):
-        new_session = SESSION_PREFIX + re.sub(r"[^A-Za-z0-9_-]", "_", new)
-        tmux("rename-session", "-t", old_session, new_session)
+    # rename the live/crashed session so the bot stays managed under the new name
+    # (adopted instances pin an external session/process by name — leave that alone)
+    if not adopted:
+        if IS_WINDOWS:
+            platform_win.win_rename(old, new)
+        elif session_exists(old_session):
+            new_session = SESSION_PREFIX + re.sub(r"[^A-Za-z0-9_-]", "_", new)
+            tmux("rename-session", "-t", old_session, new_session)
 
     inst["name"] = new
     cfg["by_name"].pop(old, None)
@@ -1761,7 +1865,7 @@ def set_autostart(cfg, name, enabled):
     return inst["autostart"]
 
 
-SETTABLE_FIELDS = ("launch_cmd", "dir", "config_file", "stop_timeout")
+SETTABLE_FIELDS = ("launch_cmd", "dir", "config_file", "stop_timeout", "platform")
 
 
 def set_field(cfg, name, field, value):
@@ -1776,6 +1880,10 @@ def set_field(cfg, name, field, value):
         value = int(value)
     elif field == "dir":
         value = os.path.abspath(os.path.expanduser(str(value)))
+    elif field == "platform":
+        value = str(value).strip().lower()
+        if value not in ("linux", "windows"):
+            raise ValueError("platform must be 'linux' or 'windows'")
     else:
         value = str(value)
     for inst in targets:
@@ -1786,8 +1894,14 @@ def set_field(cfg, name, field, value):
 
 def boot(cfg):
     """Start every instance flagged autostart=true. Idempotent (skips running ones).
-    Intended to be run once at host boot via a systemd oneshot unit.
-    Returns a dict of name -> result."""
+    Intended to be run once at host boot via a systemd oneshot unit (Linux)
+    or inline at the top of `serve`'s startup path (Windows, which has no
+    oneshot idiom of its own). A master settings.bots_autostart_enabled
+    override (default True) can skip this pass entirely without touching any
+    instance's own autostart flag -- e.g. the tray app's "Start bots at
+    login" toggle. Returns a dict of name -> result."""
+    if not get_settings(cfg).get("bots_autostart_enabled", True):
+        return {}
     results = {}
     for inst in cfg["instances"]:
         if not inst.get("autostart"):
@@ -1844,10 +1958,12 @@ def list_tmux_sessions():
 
 
 def _looks_like_proxy(sess):
-    """Heuristic: is this tmux session likely an Aquarius/Zenith proxy? -> (bool, reason)."""
+    """Heuristic: is this session/process likely an Aquarius/Zenith proxy? -> (bool, reason).
+    On Linux, 'command' is just tmux's short pane_current_command, so _proc_args() fills in
+    the real argv; on Windows, scan_win() already puts the full cmdline in 'command'."""
     cmd = (sess.get("command") or "").lower()
     path = (sess.get("path") or "")
-    args = _proc_args(sess["pid"]).lower() if sess.get("pid") else ""
+    args = cmd if IS_WINDOWS else (_proc_args(sess["pid"]).lower() if sess.get("pid") else "")
     if any(k in path.lower() or k in args for k in ("aquarius", "zenith")):
         return True, "aquarius/zenith in path/args"
     if cmd == "java" or " -jar " in args or args.startswith("java"):
@@ -1858,10 +1974,12 @@ def _looks_like_proxy(sess):
 
 
 def managed_sessions(cfg):
+    if IS_WINDOWS:
+        return {str(i["adopted_pid"]) for i in cfg["instances"] if i.get("adopted_pid")}
     return {session_name(i) for i in cfg["instances"]}
 
 
-def scan(cfg):
+def scan_linux(cfg):
     """Return unmanaged tmux sessions, flagged by likelihood of being a proxy."""
     managed = managed_sessions(cfg)
     out = []
@@ -1882,26 +2000,42 @@ def scan(cfg):
     return out
 
 
-def adopt_session(cfg, session, name=None, launch_cmd=None, config_file=None,
-                  stop_keys=None, stop_timeout=None, autostart=False):
-    """Adopt an existing tmux session as a managed instance pinned to it."""
-    session = (session or "").strip()
-    if not session:
-        raise ValueError("session is required")
+def scan_win(cfg):
+    """Return unmanaged java.exe processes (via WMI/psutil), flagged by likelihood
+    of being a proxy. 'session' here is just str(pid) -- Windows has no session
+    concept, so the PID itself is the adoption handle (see adopt_session_win)."""
+    managed = managed_sessions(cfg)
+    out = []
+    for p in platform_win.list_candidate_processes():
+        session = str(p["pid"])
+        if session in managed:
+            continue
+        path = p.get("cwd") or ""
+        cmd = p.get("cmdline") or ""
+        likely, reason = _looks_like_proxy({"session": session, "path": path,
+                                             "command": cmd, "pid": p["pid"]})
+        out.append({
+            "session": session,
+            "path": path,
+            "command": cmd,
+            "likely_proxy": likely,
+            "reason": reason,
+            "suggested_launch": guess_launch_cmd(path) or cmd or "java -jar ZenithProxy.jar nogui",
+        })
+    out.sort(key=lambda x: (not x["likely_proxy"], x["session"]))
+    return out
+
+
+def scan(cfg):
+    return scan_win(cfg) if IS_WINDOWS else scan_linux(cfg)
+
+
+def adopt_session_linux(cfg, session, name, launch_cmd, config_file, stop_keys, stop_timeout, autostart):
     live = {s["session"]: s for s in list_tmux_sessions()}
     if session not in live:
         raise ValueError(f"no live tmux session named '{session}'")
-    if session in managed_sessions(cfg):
-        raise ValueError(f"session '{session}' is already managed")
-
-    name = (name or session).strip()
-    if not VALID_NAME.match(name):
-        raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
-    if name in cfg["by_name"]:
-        raise ValueError(f"instance name '{name}' already exists")
-
     path = live[session]["path"] or ""
-    inst = {
+    return {
         "name": name,
         "dir": os.path.abspath(path) if path else "",
         "launch_cmd": (launch_cmd or "").strip() or guess_launch_cmd(path) or "./launch.sh",
@@ -1911,6 +2045,59 @@ def adopt_session(cfg, session, name=None, launch_cmd=None, config_file=None,
         "session": session,
         "autostart": bool(autostart),
     }
+
+
+def adopt_session_win(cfg, session, name, launch_cmd, config_file, stop_keys, stop_timeout, autostart):
+    try:
+        pid = int(session)
+    except (TypeError, ValueError):
+        raise ValueError("session must be a PID on Windows")
+    candidates = {str(p["pid"]): p for p in platform_win.list_candidate_processes()}
+    live = candidates.get(session)
+    if not live:
+        raise ValueError(f"no live process with PID {pid}")
+    path = live.get("cwd") or ""
+    inst = {
+        "name": name,
+        "dir": os.path.abspath(path) if path else "",
+        "launch_cmd": (launch_cmd or "").strip() or live.get("cmdline") or "java -jar ZenithProxy.jar nogui",
+        "config_file": (config_file or "config.json").strip() or "config.json",
+        # stop_keys/stop_timeout are tmux-console concepts with no meaning for an
+        # adopted Windows process (no stdin pipe -- see platform_win.win_stop);
+        # kept in the dict only for config-shape consistency with Linux instances.
+        "stop_keys": stop_keys if stop_keys else ["C-c"],
+        "stop_timeout": int(stop_timeout) if stop_timeout else 15,
+        "adopted_pid": pid,
+        "autostart": bool(autostart),
+    }
+    platform_win.adopt(inst, pid)
+    return inst
+
+
+def adopt_session(cfg, session, name=None, launch_cmd=None, config_file=None,
+                  stop_keys=None, stop_timeout=None, autostart=False):
+    """Adopt an existing, unmanaged process as a managed instance pinned to it
+    (an existing tmux session on Linux, a bare PID on Windows -- see
+    scan_win/adopt_session_win)."""
+    session = (session or "").strip()
+    if not session:
+        raise ValueError("session is required")
+    if session in managed_sessions(cfg):
+        raise ValueError(f"session '{session}' is already managed")
+
+    name = (name or session).strip()
+    if not VALID_NAME.match(name):
+        raise ValueError("name may contain only letters, digits, '.', '_' and '-'")
+    if name in cfg["by_name"]:
+        raise ValueError(f"instance name '{name}' already exists")
+
+    if IS_WINDOWS:
+        inst = adopt_session_win(cfg, session, name, launch_cmd, config_file,
+                                  stop_keys, stop_timeout, autostart)
+    else:
+        inst = adopt_session_linux(cfg, session, name, launch_cmd, config_file,
+                                    stop_keys, stop_timeout, autostart)
+
     cfg["raw"].setdefault("instances", []).append(inst)
     cfg["instances"] = cfg["raw"]["instances"]
     cfg["by_name"][name] = inst
@@ -2645,6 +2832,11 @@ def get_settings(cfg):
         },
         "box_name": s.get("box_name") or "Controller",
         "system_actions_enabled": bool(s.get("system_actions_enabled", False)),
+        # Master override for boot()'s per-instance autostart pass (each
+        # instance keeps its own autostart flag; this can disable the whole
+        # pass without touching any of them). Defaults True so existing
+        # fleets keep booting instances the way they always have.
+        "bots_autostart_enabled": bool(s.get("bots_autostart_enabled", True)),
         "console_presets": presets if isinstance(presets, list) else DEFAULT_CONSOLE_PRESETS,
         "thresholds": {**DEFAULT_THRESHOLDS, **(s.get("thresholds") or {})},
         "schedules": s.get("schedules") or {"notify_webhook": "", "jobs": []},
@@ -2662,7 +2854,8 @@ def get_settings(cfg):
 
 
 def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=None,
-                  thresholds=None, ui=None, schedules=None, box_name=None, notifications=None):
+                  thresholds=None, ui=None, schedules=None, box_name=None, notifications=None,
+                  bots_autostart_enabled=None):
     s = cfg["raw"].setdefault("settings", {})
     if box_name is not None:
         s["box_name"] = clean_box_label(box_name, default="Controller")
@@ -2702,6 +2895,8 @@ def save_settings(cfg, theme=None, system_actions_enabled=None, console_presets=
             t["font"] = fk
     if system_actions_enabled is not None:
         s["system_actions_enabled"] = bool(system_actions_enabled)
+    if bots_autostart_enabled is not None:
+        s["bots_autostart_enabled"] = bool(bots_autostart_enabled)
     if console_presets is not None:
         if not isinstance(console_presets, list):
             raise ValueError("console_presets must be a list")
@@ -2796,13 +2991,7 @@ SYSTEM_COMMANDS = {
 SYSTEM_COMMANDS_OVERRIDE = {}  # for testing without touching the box
 
 
-def _sysinfo():
-    """Read-only snapshot of the host. Best-effort; missing pieces -> None."""
-    info = {}
-    try:
-        info["cpus"] = os.cpu_count()
-    except Exception:
-        info["cpus"] = None
+def _sysinfo_linux(info):
     try:
         mem = {}
         with open("/proc/meminfo") as f:
@@ -2840,6 +3029,43 @@ def _sysinfo():
     except Exception:
         pass
     info["tmux_sessions"] = len(list_tmux_sessions())
+
+
+def _sysinfo_win(info):
+    win = platform_win.win_sysinfo()
+    info["mem_total"] = win.get("mem_total")
+    info["mem_used"] = ((win["mem_total"] - win["mem_available"])
+                         if win.get("mem_total") and win.get("mem_available") else None)
+    info["disk_total"] = win.get("disk_total")
+    info["disk_used"] = ((win["disk_total"] - win["disk_free"])
+                          if win.get("disk_total") and win.get("disk_free") else None)
+    # No Windows equivalent of load average -- omit rather than approximate.
+    info["load"] = None
+    info["uptime_sec"] = None
+    try:
+        info["uptime_sec"] = int(time.time() - psutil_boot_time())
+    except Exception:
+        pass
+    info["os"] = win.get("os")
+    info["tmux_sessions"] = platform_win.live_session_count()
+
+
+def psutil_boot_time():
+    import psutil
+    return psutil.boot_time()
+
+
+def _sysinfo():
+    """Read-only snapshot of the host. Best-effort; missing pieces -> None."""
+    info = {}
+    try:
+        info["cpus"] = os.cpu_count()
+    except Exception:
+        info["cpus"] = None
+    if IS_WINDOWS:
+        _sysinfo_win(info)
+    else:
+        _sysinfo_linux(info)
     info["cgroup_limits"] = _supports_cgroup_limits()
     return info
 
@@ -2897,9 +3123,27 @@ class SystemJob:
 SYS_JOB = SystemJob()
 
 
+def run_system_action_win(action):
+    if action == "reboot":
+        cmd = SYSTEM_COMMANDS_OVERRIDE.get("reboot", platform_win.SYSTEM_COMMANDS_WIN["reboot"])
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True, "action": "reboot",
+                "note": "rebooting in ~5s; the manager goes down with the host"}
+    if action == "update":
+        cmd = SYSTEM_COMMANDS_OVERRIDE.get("update", platform_win.SYSTEM_COMMANDS_WIN["update"])
+        SYS_JOB.start("update", cmd)
+        return {"ok": True, "action": "update",
+                "note": "winget upgrade started; poll /api/system/job for output"}
+    # "pip" is an apt-specific action (installing python3-pip) with no Windows
+    # analog -- Windows already requires a real Python install to run this script.
+    raise ValueError(f"unknown system action for Windows: {action}")
+
+
 def run_system_action(cfg, action):
     if not get_settings(cfg)["system_actions_enabled"]:
         raise PermissionError("system actions are disabled (enable them in Settings)")
+    if IS_WINDOWS:
+        return run_system_action_win(action)
     if action == "reboot":
         cmd = SYSTEM_COMMANDS_OVERRIDE.get("reboot", ["sudo", "-n", "reboot"])
         delayed = ["sh", "-c", f"sleep 2; {' '.join(cmd)}"]
@@ -8262,7 +8506,8 @@ class Handler(BaseHTTPRequestHandler):
                                     ui=p.get("ui"),
                                     schedules=p.get("schedules"),
                                     box_name=p.get("box_name"),
-                                    notifications=p.get("notifications"))
+                                    notifications=p.get("notifications"),
+                                    bots_autostart_enabled=p.get("bots_autostart_enabled"))
                 if p.get("theme") is not None or p.get("ui") is not None:
                     propagate_appearance(out.get("theme"), out.get("ui"))
                 return self._json({"ok": True, "settings": out})
@@ -8996,6 +9241,15 @@ def serve(cfg_path, host, port):
     Handler.cfg_path = cfg_path
     Handler.bind_port = port
     cfg = load_config(cfg_path)  # validate early
+    if IS_WINDOWS:
+        # Windows has no systemd-oneshot-at-boot idiom (the Linux deployment
+        # runs `manager.py boot` as a separate unit before this one starts);
+        # inlined here instead, gated by the same bots_autostart_enabled
+        # override boot() already respects.
+        boot_results = boot(cfg)
+        if boot_results:
+            print(f"boot: autostarted {len(boot_results)} instance(s): "
+                  + ", ".join(f"{n} ({r})" for n, r in boot_results.items()))
     httpd = ThreadingHTTPServer((host, port), Handler)
     if auth_configured(cfg):
         auth = "ON (login required)"
@@ -9259,6 +9513,14 @@ def main():
     p.add_argument("--cpu", default=None, help="CPU cap as percent of one core, e.g. 200 (0 to clear)")
     p.add_argument("--clear", action="store_true", help="remove all limits")
 
+    p = sub.add_parser("env", help="view/set/clear an instance's launch environment variables (Windows only)")
+    p.add_argument("name")
+    p.add_argument("--set", dest="set_kv", default=None, metavar="KEY=VALUE",
+                    help="set one environment variable for the launch")
+    p.add_argument("--unset", dest="unset_key", default=None, metavar="KEY",
+                    help="remove one environment variable")
+    p.add_argument("--clear", action="store_true", help="remove all environment variable overrides")
+
     p = sub.add_parser("files", help="list files under the allowed roots (jailed)")
     p.add_argument("path", nargs="?", default=None, help="directory to list (default: first root)")
 
@@ -9275,11 +9537,11 @@ def main():
                    help="don't enable the live map / control plane by default (AquariusProxy only)")
 
     p = sub.add_parser("adopt")
-    p.add_argument("session", help="existing tmux session name")
-    p.add_argument("--name", default=None, help="instance name (default: session name)")
+    p.add_argument("session", help="existing tmux session name (Linux) or PID (Windows)")
+    p.add_argument("--name", default=None, help="instance name (default: session name/PID)")
     p.add_argument("--launch-cmd", default=None)
     p.add_argument("--config-file", default=None)
-    p.add_argument("--stop-keys", default=None, help="comma-separated tmux keys")
+    p.add_argument("--stop-keys", default=None, help="comma-separated tmux keys (Linux only)")
     p.add_argument("--stop-timeout", type=int, default=None)
     p.add_argument("--autostart", action="store_true", help="launch on `boot`")
 
@@ -9545,6 +9807,23 @@ def main():
             die(str(e))
         enf = "" if _supports_cgroup_limits() or not res else "   (NOTE: not enforced here — see README)"
         print(f"{args.name}: " + (", ".join(f"{k}={v}" for k, v in res.items()) if res else "no limits") + enf)
+    elif args.cmd == "env":
+        inst = cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}")
+        try:
+            if args.clear:
+                res = set_env(cfg, args.name, None, clear_all=True)
+            elif args.unset_key:
+                res = set_env(cfg, args.name, args.unset_key, value=None)
+            elif args.set_kv:
+                if "=" not in args.set_kv:
+                    die("--set expects KEY=VALUE")
+                k, v = args.set_kv.split("=", 1)
+                res = set_env(cfg, args.name, k, value=v)
+            else:
+                res = inst.get("env") or {}
+        except ValueError as e:
+            die(str(e))
+        print(f"{args.name}: " + (", ".join(f"{k}={v}" for k, v in res.items()) if res else "no env overrides"))
     elif args.cmd == "files":
         try:
             d = fs_list(cfg, args.path or "")

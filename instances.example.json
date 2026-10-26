@@ -17,6 +17,16 @@
       "stop_keys": ["stop", "Enter"],
       "stop_timeout": 20,
       "session": "zenith-tpa-helper"
+    },
+    {
+      "name": "windows-local-bot1",
+      "_comment": "Windows-only example. dir/launch_cmd use Windows paths/commands; stop_keys and session are tmux-only concepts and are ignored here. env (optional) sets explicit environment variables for the launch, replacing the login-shell env Linux's bash -lc sources implicitly. platform is reserved for a future per-instance override and isn't read anywhere yet -- the manager dispatches by host OS, not per instance.",
+      "dir": "C:\\bots\\windows-local-bot1",
+      "launch_cmd": "java -jar ZenithProxy.jar nogui",
+      "config_file": "config.json",
+      "platform": "windows",
+      "env": {"JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-25.0.4.101-hotspot"},
+      "autostart": false
     }
   ],
   "settings": {
