@@ -70,6 +70,31 @@ CONTROL_TIMEOUT_SEC = 5
 
 kernel32 = ctypes.windll.kernel32
 
+
+def _helper_launch_args():
+    """Argv prefix that runs this file's _helper mode as a subprocess.
+    Unfrozen (plain `python manager.py ...`): sys.executable IS a real
+    interpreter and __file__ IS this real .py file, so `[sys.executable,
+    __file__]` works exactly as it always has.
+    Frozen (PyInstaller): sys.executable is the frozen exe itself (not a
+    real interpreter) and there's no standalone platform_win.py file to
+    hand it -- the exe's own build bundles a minimal real Python runtime
+    plus a copy of this script under a 'pyrt/' subdirectory next to the
+    exe for exactly this purpose (see docs/windows-exe-build.md), and this
+    returns a path into THAT bundle instead."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+        bundled_python = os.path.join(base, "pyrt", "python.exe")
+        bundled_script = os.path.join(base, "pyrt", "platform_win.py")
+        if not os.path.exists(bundled_python) or not os.path.exists(bundled_script):
+            raise RuntimeError(
+                f"frozen build is missing its bundled helper runtime "
+                f"(expected {bundled_python} and {bundled_script} -- "
+                f"see docs/windows-exe-build.md's manager.exe build step)")
+        return [bundled_python, bundled_script]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
 # Where state files (<name>.pid, <name>.log) live, and the instances.json
 # path itself -- both set once by manager.py's load_config() at startup,
 # since platform_win.py has no config object of its own and win_start() needs
@@ -263,7 +288,10 @@ def _win_start_locked(inst):
 
     if not _CONFIG_PATH:
         return "error: internal: config path not set (platform_win.set_config_path was never called)"
-    helper_args = [sys.executable, os.path.abspath(__file__), "_helper", name, _CONFIG_PATH]
+    try:
+        helper_args = _helper_launch_args() + ["_helper", name, _CONFIG_PATH]
+    except RuntimeError as e:
+        return f"error: {e}"
     if mem_bytes:
         helper_args += ["--mem-limit", str(int(mem_bytes))]
 

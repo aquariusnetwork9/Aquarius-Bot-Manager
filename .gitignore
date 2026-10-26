@@ -10,3 +10,10 @@ nodes.json
 # Python
 __pycache__/
 *.py[cod]
+
+# Windows exe build output (built by build_windows_exes.ps1; see that
+# script's docstring for how to reproduce it -- not checked in since it's
+# large, machine-specific, and trivially rebuildable)
+/build/
+/dist/
+*.spec
