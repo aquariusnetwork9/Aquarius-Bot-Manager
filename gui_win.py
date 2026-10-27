@@ -24,10 +24,11 @@ import sys
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QRadioButton, QSplitter, QVBoxLayout, QWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget, QWizard,
+    QWizardPage,
 )
 
 from client_win import ApiClient, ApiError, AuthError
@@ -180,6 +181,135 @@ class LoginDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# First-run wizard -- shown instead of LoginDialog when the manager has never
+# had a login configured (client.auth_status()["needs_setup"] is True). Four
+# pages: welcome, set login, Java check, done. Replaces the web dashboard's
+# own "Welcome" setup page for anyone going through the native GUI -- that
+# web page still exists and still works for someone who opens the browser
+# directly instead, but the GUI never shows it or embeds it.
+# ---------------------------------------------------------------------------
+
+class _WelcomePage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+        self.setTitle("Welcome")
+        label = QLabel(
+            "Aquarius Bot Manager supervises your AquariusProxy / ZenithProxy "
+            "bot instances: start, stop, monitor, and configure them from this "
+            "window instead of a terminal.\n\n"
+            "This is a one-time setup -- just a login and a quick Java check."
+        )
+        label.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label)
+
+
+class _LoginSetupPage(QWizardPage):
+    def __init__(self, client):
+        super().__init__()
+        self.client = client
+        self.setTitle("Create a login")
+        self.setSubTitle("This protects the manager's web API and this control panel.")
+
+        self.user_edit = QLineEdit()
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.confirm_edit = QLineEdit()
+        self.confirm_edit.setEchoMode(QLineEdit.Password)
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff6b6b;")
+        self.error_label.setWordWrap(True)
+        self._done = False
+
+        form = QFormLayout()
+        form.addRow("Username", self.user_edit)
+        form.addRow("Password", self.pass_edit)
+        form.addRow("Confirm password", self.confirm_edit)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.error_label)
+
+    def validatePage(self):
+        if self._done:
+            return True  # setup already succeeded; Back-then-Next shouldn't resubmit
+        if self.pass_edit.text() != self.confirm_edit.text():
+            self.error_label.setText("passwords do not match")
+            return False
+        try:
+            self.client.setup(self.user_edit.text().strip(), self.pass_edit.text())
+        except ApiError as e:
+            self.error_label.setText(str(e))  # e.g. the server's own "password must be at least 6 characters"
+            return False
+        self._done = True
+        return True
+
+
+class _JavaCheckPage(QWizardPage):
+    def __init__(self, client):
+        super().__init__()
+        self.client = client
+        self.setTitle("Java")
+        self.status_label = QLabel("Checking for Java...")
+        self.status_label.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status_label)
+        self._done = False
+        self._checking = False
+
+    def initializePage(self):
+        if self._done or self._checking:
+            return
+        self._checking = True
+        self.wizard().button(QWizard.NextButton).setEnabled(False)
+
+        def on_success(result):
+            self._checking = False
+            self._done = True
+            self.wizard().button(QWizard.NextButton).setEnabled(True)
+            if result.get("java_found"):
+                self.status_label.setText("Java found -- ready to run bot instances.")
+            else:
+                self.status_label.setText(
+                    "Java could not be installed automatically. You can install a JRE "
+                    "yourself later; the manager will check again the next time it starts."
+                )
+
+        def on_error(message):
+            self._checking = False
+            self._done = True
+            self.wizard().button(QWizard.NextButton).setEnabled(True)
+            self.status_label.setText(f"Could not reach the manager to check Java: {message}")
+
+        run_async(self, self.client.java_setup, on_success=on_success, on_error=on_error)
+
+    def isComplete(self):
+        return not self._checking
+
+
+class _DonePage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+        self.setTitle("All set")
+        label = QLabel("Setup is complete. Click Finish to open the control panel.")
+        label.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label)
+
+
+class FirstRunWizard(QWizard):
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Aquarius Bot Manager -- First-Run Setup")
+        self.setWizardStyle(QWizard.ClassicStyle)  # matches the app's Win10-era "Windows" QStyle, not Aero/Modern
+        self.setOption(QWizard.NoCancelButton, False)
+        self.addPage(_WelcomePage())
+        self.addPage(_LoginSetupPage(client))
+        self.addPage(_JavaCheckPage(client))
+        self.addPage(_DonePage())
+
+
+# ---------------------------------------------------------------------------
 # Startup & Login dialog (Tools -> Startup & login…)
 # ---------------------------------------------------------------------------
 
@@ -282,6 +412,156 @@ class RenameDialog(QDialog):
             self.accept()
         except ApiError as e:
             self.error_label.setText(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Add Bot dialog -- the empty-sidebar "Add a bot" button and the always-
+# present sidebar button once at least one bot exists (see MainWindow).
+# ---------------------------------------------------------------------------
+
+class AddBotDialog(QDialog):
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.setWindowTitle("Add a bot")
+        self.setModal(True)
+
+        self.name_edit = QLineEdit()
+        self.dir_edit = QLineEdit()
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._on_browse)
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(self.dir_edit)
+        dir_row.addWidget(browse_btn)
+        self.launch_cmd_edit = QLineEdit("java -jar ZenithProxy.jar nogui")
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff6b6b;")
+        self.error_label.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Name", self.name_edit)
+        form.addRow("Folder", dir_row)
+        form.addRow("Launch command", self.launch_cmd_edit)
+
+        hint = QLabel("Name: letters, digits, '.', '_' and '-' only. Folder "
+                       "is where the bot's own jar/config already lives.")
+        hint.setStyleSheet("color: #7c8c86; font-size: 11px;")
+        hint.setWordWrap(True)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_add)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(hint)
+        layout.addWidget(self.error_label)
+        layout.addWidget(buttons)
+
+    def _on_browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Select the bot's folder")
+        if d:
+            self.dir_edit.setText(d)
+
+    def _on_add(self):
+        try:
+            self.client.add_instance(
+                self.name_edit.text().strip(),
+                self.dir_edit.text().strip(),
+                self.launch_cmd_edit.text().strip(),
+            )
+            self.accept()
+        except ApiError as e:
+            self.error_label.setText(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Install (deploy) dialog -- fetches the REAL official ZenithProxy/
+# AquariusProxy launcher release and registers it, as opposed to AddBotDialog
+# above (which just points at a bot that already exists on disk). Only one
+# deploy can run at a time server-side (DeployJob is a singleton in
+# manager.py) -- the dialog polls and shows live output rather than
+# fire-and-forget, since a download+extract can take a real amount of time.
+#
+# AquariusProxy isn't Windows-ported yet (confirmed with the user) -- its
+# button is shown, disabled, with a tooltip explaining why, rather than
+# hidden outright, so it's visible as "coming later" not just missing.
+# deploy_proxy() in manager.py also hard-rejects it server-side regardless
+# of what this dialog allows, so this is a UX nicety, not the real guard.
+# ---------------------------------------------------------------------------
+
+class DeployBotDialog(QDialog):
+    POLL_MS = 1000
+
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.setWindowTitle("Install a bot")
+        self.setModal(True)
+        self.resize(480, 360)
+
+        self.name_edit = QLineEdit()
+        form = QFormLayout()
+        form.addRow("Name", self.name_edit)
+
+        self.zenith_btn = QPushButton("Install ZenithProxy")
+        self.zenith_btn.clicked.connect(lambda: self._on_install("zenith"))
+        self.aquarius_btn = QPushButton("Install AquariusProxy")
+        self.aquarius_btn.setEnabled(False)
+        self.aquarius_btn.setToolTip("AquariusProxy isn't available on Windows yet -- use ZenithProxy for now.")
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.zenith_btn)
+        source_row.addWidget(self.aquarius_btn)
+
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setPlaceholderText("Pick a bot to install -- this downloads the real official "
+                                        "release and sets it up automatically.")
+
+        self.close_btn = QDialogButtonBox(QDialogButtonBox.Close)
+        self.close_btn.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(source_row)
+        layout.addWidget(self.output)
+        layout.addWidget(self.close_btn)
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self._poll_job)
+
+    def _on_install(self, source):
+        name = self.name_edit.text().strip()
+        if not name:
+            self.output.setPlainText("Enter a name first.")
+            return
+        self.zenith_btn.setEnabled(False)
+        self.aquarius_btn.setEnabled(False)
+        self.output.setPlainText("Starting install…")
+
+        def on_success(_result):
+            self.poll_timer.start(self.POLL_MS)
+
+        def on_error(message):
+            self.output.setPlainText(f"Could not start install: {message}")
+            self.zenith_btn.setEnabled(True)
+
+        run_async(self, lambda: self.client.deploy(name, None, source),
+                  on_success=on_success, on_error=on_error)
+
+    def _poll_job(self):
+        run_async(self, self.client.deploy_job, on_success=self._apply_job, on_error=lambda m: None)
+
+    def _apply_job(self, job):
+        self.output.setPlainText(job.get("output") or "")
+        self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum())
+        if job.get("status") in ("done", "error"):
+            self.poll_timer.stop()
+            self.zenith_btn.setEnabled(True)
+
+    def reject(self):
+        self.poll_timer.stop()
+        super().reject()
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +786,7 @@ class PoppedOutWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, client):
+    def __init__(self, client, start_polling=True):
         super().__init__()
         self.client = client
         self.setWindowTitle("Aquarius Bot Manager")
@@ -520,8 +800,18 @@ class MainWindow(QMainWindow):
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll)
-        self.poll_timer.start(POLL_INTERVAL_MS)
-        self._poll()
+        if start_polling:
+            self.poll_timer.start(POLL_INTERVAL_MS)
+            self._poll()
+        # start_polling=False: main() uses this when a first-run wizard is
+        # about to run modally first. _poll() fires a background QThread
+        # (run_async) whose finished signal can land at any later point and
+        # touch self.sidebar -- racing against the wizard's own modal
+        # exec() on the main thread caused an intermittent segfault deep in
+        # Qt6Core.dll (confirmed: same exe, ~50% crash rate across repeated
+        # runs, no code differences between runs -- a real Qt cross-widget
+        # threading race, not a one-off). main() starts polling explicitly
+        # once it's actually safe to.
 
     # ---- menu bar ----
 
@@ -586,22 +876,76 @@ class MainWindow(QMainWindow):
         self.sidebar.setFixedWidth(170)
         self.sidebar.currentItemChanged.connect(self._on_sidebar_selection)
 
+        # Persistent "+ Add bot" / "+ Install" buttons below the list,
+        # visible once at least one bot exists -- see _apply_poll_result,
+        # which hides these and shows the bigger empty-state buttons
+        # instead when there are none yet, rather than showing both at once.
+        self.sidebar_add_btn = QPushButton("+ Add bot")
+        self.sidebar_add_btn.clicked.connect(self._on_add_bot)
+        self.sidebar_add_btn.hide()
+        self.sidebar_install_btn = QPushButton("+ Install")
+        self.sidebar_install_btn.clicked.connect(self._on_install_bot)
+        self.sidebar_install_btn.hide()
+
+        sidebar_col = QVBoxLayout()
+        sidebar_col.setContentsMargins(0, 0, 0, 0)
+        sidebar_col.addWidget(self.sidebar)
+        sidebar_col.addWidget(self.sidebar_install_btn)
+        sidebar_col.addWidget(self.sidebar_add_btn)
+        sidebar_widget = QWidget()
+        sidebar_widget.setLayout(sidebar_col)
+        sidebar_widget.setFixedWidth(170)
+
         self.detail_container = QVBoxLayout()
         self.current_detail = None
+
+        # Two different empty states: no bots registered at all (big
+        # centered CTA) vs. bots exist but nothing is selected (plain
+        # text) -- see _apply_poll_result for which one's current.
         self._empty_label = QLabel("Select a bot")
         self._empty_label.setAlignment(Qt.AlignCenter)
         self._empty_label.setStyleSheet("color: #7c8c86;")
         self.detail_container.addWidget(self._empty_label)
 
+        self._no_bots_label = QLabel("No bots yet")
+        self._no_bots_label.setAlignment(Qt.AlignCenter)
+        self._no_bots_label.setStyleSheet("color: #7c8c86; font-size: 13px;")
+        self._no_bots_install_btn = QPushButton("Install a bot")
+        self._no_bots_install_btn.clicked.connect(self._on_install_bot)
+        self._no_bots_add_btn = QPushButton("Add an existing bot")
+        self._no_bots_add_btn.clicked.connect(self._on_add_bot)
+        no_bots_btn_row = QHBoxLayout()
+        no_bots_btn_row.addWidget(self._no_bots_install_btn)
+        no_bots_btn_row.addWidget(self._no_bots_add_btn)
+        no_bots_col = QVBoxLayout()
+        no_bots_col.addStretch()
+        no_bots_col.addWidget(self._no_bots_label)
+        no_bots_col.addLayout(no_bots_btn_row)
+        no_bots_col.addStretch()
+        self._no_bots_widget = QWidget()
+        self._no_bots_widget.setLayout(no_bots_col)
+        self._no_bots_widget.hide()
+        self.detail_container.addWidget(self._no_bots_widget)
+
         detail_widget = QWidget()
         detail_widget.setLayout(self.detail_container)
 
         splitter = QSplitter()
-        splitter.addWidget(self.sidebar)
+        splitter.addWidget(sidebar_widget)
         splitter.addWidget(detail_widget)
         splitter.setStretchFactor(1, 1)
 
         self.setCentralWidget(splitter)
+
+    def _on_add_bot(self):
+        dlg = AddBotDialog(self.client, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            self._poll()
+
+    def _on_install_bot(self):
+        dlg = DeployBotDialog(self.client, parent=self)
+        dlg.exec()
+        self._poll()  # a successful install registers an instance even though the dialog has no "accept" state
 
     def _on_sidebar_selection(self, current, previous):
         if self.current_detail is not None:
@@ -611,9 +955,14 @@ class MainWindow(QMainWindow):
         self._empty_label.hide()
 
         if current is None:
-            self._empty_label.show()
+            if self.sidebar.count() == 0:
+                self._no_bots_widget.show()
+            else:
+                self._empty_label.show()
             self._set_instance_menu(None)
             return
+
+        self._no_bots_widget.hide()
 
         name = current.data(Qt.UserRole)
         self._set_instance_menu(name)
@@ -671,6 +1020,16 @@ class MainWindow(QMainWindow):
         if select_item is not None:
             self.sidebar.setCurrentItem(select_item)
         self.sidebar.blockSignals(False)
+
+        self.sidebar_add_btn.setVisible(bool(instances))
+        self.sidebar_install_btn.setVisible(bool(instances))
+        # blockSignals() above means currentItemChanged didn't fire for
+        # this refresh even when the list went from empty to non-empty (or
+        # back) -- re-sync the empty-state widgets explicitly rather than
+        # rely on a selection-change signal that won't come.
+        if self.sidebar.currentItem() is None:
+            self._empty_label.setVisible(bool(instances))
+            self._no_bots_widget.setVisible(not instances)
 
         if self.current_detail is not None and self.current_detail.instance_name in by_name:
             self.current_detail.update_from(by_name[self.current_detail.instance_name])
@@ -799,17 +1158,36 @@ def main():
     _apply_dark_palette(app)
 
     client = ApiClient()
-    win = MainWindow(client)
 
     try:
         status = client.auth_status()
+        needs_setup = bool(status.get("needs_setup"))
         needs_login = status.get("required") and not status.get("authed")
     except ApiError:
-        needs_login = False  # server unreachable; let the main poll loop surface that
+        needs_setup = needs_login = False  # server unreachable; let the main poll loop surface that
 
-    if needs_login:
-        win.poll_timer.stop()
-        win._prompt_login()
+    # start_polling=False when a modal dialog (wizard or login) is about to
+    # run first: MainWindow's own __init__ otherwise fires a background
+    # QThread (via _poll()/run_async) whose completion can land mid-dialog
+    # and touch self.sidebar from off the main thread -- confirmed as a
+    # real, intermittent (~50% of runs) segfault inside Qt6Core.dll, not a
+    # one-off. Poll only starts once nothing else is about to run modally.
+    win = MainWindow(client, start_polling=not (needs_setup or needs_login))
+
+    if needs_setup:
+        # No parent=win here either: win exists but hasn't been shown yet
+        # at this point, and parenting a QWizard to an unshown top-level
+        # window was a second, separate contributor to the same crash
+        # signature (confirmed via a source/frozen-exe bisect). An
+        # unparented top-level QWizard behaves identically since it's shown
+        # modally via exec().
+        wizard = FirstRunWizard(client)
+        if wizard.exec() != QDialog.Accepted:
+            sys.exit(0)  # user closed the wizard without finishing -- nothing to run yet
+        win.poll_timer.start(POLL_INTERVAL_MS)
+        win._poll()
+    elif needs_login:
+        win._prompt_login()  # starts win.poll_timer itself on success (see _prompt_login)
 
     win.show()
     sys.exit(app.exec())

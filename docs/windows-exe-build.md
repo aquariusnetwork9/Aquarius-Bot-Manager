@@ -1,13 +1,16 @@
 # Building native Windows .exe files
 
-`build_windows_exes.ps1` builds three standalone executables with
+`build_windows_exes.ps1` builds two standalone executables with
 PyInstaller, each wrapping one of the Windows-native entry points:
 
 | Exe | Entry point | Mode | Needs a console? |
 |---|---|---|---|
 | `AquariusManager.exe` | `manager.py` | `--onefile` | Yes (CLI/service) |
 | `AquariusControlPanel.exe` | `gui_win.py` | `--onedir` | No |
-| `AquariusTray.exe` | `tray_win.py` | `--onefile` | No |
+
+(`tray_win.py` is still in the repo and can be run from source, but it's
+not packaged/distributed as `AquariusTray.exe` anymore — see issue #4
+below for why.)
 
 Run it from the repo root, with the project's Windows dependencies already
 installed in your Python environment (see `install_windows_deps.py`):
@@ -59,16 +62,47 @@ full diagnosis of each.
    with no config set and watching it look for `instances.json` inside a
    `_MEI...` path. Always pass `--config <path>` (or set `ABM_CONFIG`)
    when running the exe directly; `install_windows_service.ps1` already
-   does this for the NSSM-managed service.
+   does this for the NSSM-managed service. (`manager.py`'s `load_config()`
+   also self-initializes an empty `instances.json` on Windows if the path
+   doesn't exist at all, so a fresh install never needs this run manually —
+   see its own IS_WINDOWS branch.)
+
+4. **Unsigned PyInstaller exes get flagged as malware by Windows Defender.**
+   `AquariusTray.exe` was quarantined as `Trojan:Win32/Bearfoos.A!ml` — a
+   documented ML-heuristic false positive (confirmed via research: PyInstaller's
+   own docs name "antivirus false positives from the wide-spread use of
+   pre-compiled bootloaders" as an explicit, official reason to compile a
+   custom bootloader; a near-identical real case,
+   [microsoft/apm#487](https://github.com/microsoft/apm/issues/487), hit the
+   same detection family one letter off — `Bearfoos.B!ml`). Real, documented,
+   zero-cost mitigations applied here:
+   - **`--version-file`** on both remaining exes (`version_manager.txt`,
+     `version_controlpanel.txt`) embeds real company/product/version PE
+     metadata — an ML classifier has nothing to weigh against the generic
+     packed-exe shape when this is totally absent; this was the #1 fix in
+     the `microsoft/apm` case above.
+   - **UPX disabled** (confirmed not in use on this build machine — UPX
+     compression is independently documented, via a controlled SANS ISC
+     test, to trigger AV false positives on its own; if a future build
+     environment has UPX on PATH, pass `--noupx` explicitly rather than
+     letting PyInstaller auto-enable it).
+   - **`AquariusTray.exe` was dropped from the distributed product
+     entirely** rather than chasing the false positive further — it was a
+     "nice to have," not core functionality, and removing one of three exes
+     also shrinks the overall AV-scrutiny surface of the installer.
+   - **Not yet done, real fix if this resurfaces**: Authenticode code
+     signing (e.g. SSL.com's ~$129/yr Individual Validated tier, or Azure
+     Artifact Signing's ~$10/mo cloud-signing option) is the one mitigation
+     every source converges on as actually reliable — the free measures
+     above reduce risk, they don't eliminate it.
 
 ## Verifying a build
 
 A quick end-to-end check after building:
 
 ```powershell
-# Tray + control panel should both launch and stay running (check with
-# Get-Process after a few seconds — no crash, no silent exit).
-Start-Process .\dist\AquariusTray.exe
+# Control panel should launch and stay running (check with Get-Process
+# after a few seconds — no crash, no silent exit).
 Start-Process .\dist\AquariusControlPanel\AquariusControlPanel.exe
 
 # Manager: full lifecycle against a real config.

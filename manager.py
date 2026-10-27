@@ -75,7 +75,19 @@ if IS_WINDOWS:
 
 def load_config(path):
     if not os.path.exists(path):
-        die(f"config not found: {path}\nRun:  python3 manager.py discover <basedir>  to create one.")
+        if IS_WINDOWS:
+            # Self-initializing on Windows: an installed service/exe has no
+            # terminal for a user to run `discover` in first, and the whole
+            # point of the installer is a config-free first launch. The
+            # app's own normal first-save pass (see every *.example.json's
+            # settings shape) fills in theme/notification/etc. defaults the
+            # first time anything actually saves — this just needs to be
+            # valid JSON load_config can parse, not a fully-populated file.
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({"instances": [], "settings": {}}, f, indent=2)
+        else:
+            die(f"config not found: {path}\nRun:  python3 manager.py discover <basedir>  to create one.")
     if IS_WINDOWS:
         # .pid/.log state files live next to instances.json (see
         # platform_win.py's module docstring on why these need to be durable
@@ -1680,9 +1692,19 @@ def guess_launch_cmd(d):
     """Best guess at a launch command for a directory, or None."""
     if not os.path.isdir(d):
         return None
-    for cand in ("launch", "launch.sh", "start.sh", "run.sh", "start", "run"):
-        if os.path.exists(os.path.join(d, cand)):
-            return f"./{cand}"
+    if IS_WINDOWS:
+        # Windows launcher releases (launcher-v3, -windows-python-amd64.zip)
+        # ship a self-bootstrapping launch.bat -- it downloads its own
+        # Python runtime and installs requirements.txt on first run, no
+        # manual setup needed. No "./" prefix (not a Linux-style relative-
+        # path convention) and no shell-script candidates, which would
+        # never exist in a Windows launcher release.
+        if os.path.exists(os.path.join(d, "launch.bat")):
+            return "launch.bat"
+    else:
+        for cand in ("launch", "launch.sh", "start.sh", "run.sh", "start", "run"):
+            if os.path.exists(os.path.join(d, cand)):
+                return f"./{cand}"
     try:
         jars = [f for f in os.listdir(d) if f.endswith(".jar")]
     except OSError:
@@ -2242,6 +2264,8 @@ def _resolve_repo(source, owner_repo=None):
 
 
 def _detect_platform():
+    if IS_WINDOWS:
+        return "windows-python", "amd64"
     m = platform.machine().lower()
     arch = "aarch64" if m in ("aarch64", "arm64") else "amd64"
     osname = "alpine" if os.path.exists("/etc/alpine-release") else "linux"
@@ -2249,7 +2273,14 @@ def _detect_platform():
 
 
 def _launcher_asset(repo, osname, arch, log):
-    """Find the launcher zip for this platform in <repo>@launcher-v3. Returns (name, url)."""
+    """Find the launcher zip for this platform in <repo>@launcher-v3. Returns (name, url).
+    Windows gets its own asset naming (-launcher-windows-python-amd64.zip, a
+    self-bootstrapping launch.bat rather than a shell script) with NO
+    linux-fallback match -- a Linux launcher silently "succeeding" to
+    download on Windows would register a non-functional ./launch.sh
+    launch_cmd (confirmed: this was the actual bug before this fix, found
+    by inspecting what _launcher_asset's old fallback suffix would have
+    matched on this OS)."""
     import urllib.request
     api = f"https://api.github.com/repos/{repo}/releases/tags/launcher-v3"
     log(f"querying {api}")
@@ -2258,7 +2289,9 @@ def _launcher_asset(repo, osname, arch, log):
     with urllib.request.urlopen(req, timeout=20) as r:
         data = json.loads(r.read().decode())
     assets = data.get("assets", [])
-    for suffix in (f"-launcher-{osname}-{arch}.zip", f"-launcher-linux-{arch}.zip"):
+    suffixes = (f"-launcher-{osname}-{arch}.zip",) if osname == "windows-python" else (
+        f"-launcher-{osname}-{arch}.zip", f"-launcher-linux-{arch}.zip")
+    for suffix in suffixes:
         for a in assets:
             if a.get("name", "").endswith(suffix):
                 return a["name"], a["browser_download_url"]
@@ -2432,6 +2465,14 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
     if name in cfg["by_name"]:
         raise ValueError(f"a bot named '{name}' already exists")
     repo = _resolve_repo(source, owner_repo)
+    if IS_WINDOWS and repo == DEPLOY_SOURCES["aquarius"]:
+        # AquariusProxy itself isn't Windows-ported yet (confirmed with the
+        # user) -- its launcher zip exists under the same windows-python
+        # naming convention as ZenithProxy's, but deploying it here would
+        # fetch a launcher for bot software that doesn't actually run on
+        # this OS. Fail loudly and early rather than let it download,
+        # extract, and silently produce a non-functional bot.
+        raise ValueError("AquariusProxy isn't available on Windows yet -- deploy ZenithProxy instead")
     directory = os.path.abspath(os.path.expanduser(
         directory.strip() if directory and directory.strip() else os.path.join(_base_dir(cfg), name)))
     clean_lim = _clean_limits(limits)
@@ -2452,7 +2493,7 @@ def deploy_proxy(cfg_path, name, directory, source, owner_repo=None, limits=None
         with zipfile.ZipFile(zpath) as z:
             z.extractall(directory)
         os.remove(zpath)
-        launch_cmd = guess_launch_cmd(directory) or "./launch"
+        launch_cmd = guess_launch_cmd(directory) or ("launch.bat" if IS_WINDOWS else "./launch")
         base = launch_cmd[2:] if launch_cmd.startswith("./") else None
         if base and os.path.isfile(os.path.join(directory, base)):
             try:
@@ -8156,6 +8197,19 @@ class Handler(BaseHTTPRequestHandler):
             save_config(cfg)
             return self._json({"ok": True})
 
+        # Windows first-run wizard's Java-check step: runs platform_win.ensure_java()
+        # (installs a JRE via winget if none is found) and reports the result. A POST
+        # because it can have a real side effect (an install), unlike a plain status
+        # read -- the GUI wizard calls this once from a worker thread (see
+        # client_win.ApiClient.java_setup / gui_win.py's run_async) so a slow winget
+        # install never blocks its own UI thread, same reasoning as every other
+        # long-running call in gui_win.py.
+        if path == "/api/java_setup":
+            if not IS_WINDOWS:
+                return self._json({"error": "Windows-only"}, 400)
+            ok = platform_win.ensure_java()
+            return self._json({"ok": ok, "java_found": bool(shutil.which("java"))})
+
         # login is the one POST reachable without a session
         if path == "/api/login":
             ip = self._client_ip()
@@ -9242,6 +9296,7 @@ def serve(cfg_path, host, port):
     Handler.bind_port = port
     cfg = load_config(cfg_path)  # validate early
     if IS_WINDOWS:
+        platform_win.ensure_java()
         # Windows has no systemd-oneshot-at-boot idiom (the Linux deployment
         # runs `manager.py boot` as a separate unit before this one starts);
         # inlined here instead, gated by the same bots_autostart_enabled
@@ -9553,6 +9608,10 @@ def main():
 
     sub.add_parser("boot", help="start all autostart instances (run at host boot)")
 
+    sub.add_parser("sweep", help="(Windows only) stop every bot found running under "
+                    ".abm-state/, including ones no longer in instances.json -- for full "
+                    "teardown, not routine restarts")
+
     sub.add_parser("sysinfo")
 
     p = sub.add_parser("setpassword", help="set the web UI login (username + password)")
@@ -9614,6 +9673,17 @@ def main():
         action = {"start": start, "stop": stop, "restart": restart}[args.cmd]
         for i in targets(cfg, args.name):
             print(f"{i['name']}: {action(i)}")
+    elif args.cmd == "sweep":
+        if not IS_WINDOWS:
+            die("sweep is Windows-only -- on Linux, `stop all` plus `tmux list-sessions` "
+                "already accounts for everything (see list_tmux_sessions()).")
+        known = {i["name"] for i in cfg["instances"]}
+        found = platform_win.win_sweep(known)
+        if not found:
+            print("sweep: nothing was running outside normal shutdown")
+        for name, result, known_flag in found:
+            tag = "" if known_flag else "  [not in instances.json]"
+            print(f"{name}: {result}{tag}")
     elif args.cmd == "logs":
         print(logs(cfg["by_name"].get(args.name) or die(f"no such instance: {args.name}"), args.lines))
     elif args.cmd == "send":

@@ -1,0 +1,39 @@
+# UTF-8
+#
+# PyInstaller --version-file resource for AquariusManager.exe. Embeds real
+# PE version metadata (company/product/description/version) into the exe
+# header -- an ML-heuristic antivirus classifier has nothing to weigh
+# against the generic PyInstaller-bootloader shape when this is absent.
+# Confirmed via research this session as the #1 fix in a near-identical
+# real-world Windows Defender false-positive case (microsoft/apm#487,
+# Trojan:Win32/Bearfoos.B!ml -- one letter off from what AquariusTray.exe
+# was flagged as here).
+
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'aquariusnetwork9'),
+        StringStruct(u'FileDescription', u'Aquarius Bot Manager -- fleet manager service'),
+        StringStruct(u'FileVersion', u'1.0.0.0'),
+        StringStruct(u'InternalName', u'AquariusManager'),
+        StringStruct(u'LegalCopyright', u'aquariusnetwork9'),
+        StringStruct(u'OriginalFilename', u'AquariusManager.exe'),
+        StringStruct(u'ProductName', u'Aquarius Bot Manager'),
+        StringStruct(u'ProductVersion', u'1.0.0.0')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)

@@ -113,15 +113,17 @@ class ApiClient:
         prompting for login, to skip the prompt entirely if auth is off."""
         return self.get("/api/authstatus")
 
-    def login(self, username, password):
-        """Raises ApiError on bad credentials. On success, persists the
-        session cookie so future ApiClient instances (a later tray/GUI
-        launch) start already logged in."""
+    def _request_with_cookie(self, path, body):
+        """Shared by login()/setup() -- both are POSTs that return a fresh
+        session cookie on success, unlike every other endpoint which relies
+        on the cookie _request() already sends. http.client's response
+        object is the only way to read Set-Cookie, so this bypasses
+        _request()/post() rather than extending them for this one case."""
         conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
         try:
-            payload = json.dumps({"username": username, "password": password}).encode()
+            payload = json.dumps(body).encode()
             headers = {"Content-Type": "application/json", "Content-Length": str(len(payload))}
-            conn.request("POST", "/api/login", body=payload, headers=headers)
+            conn.request("POST", path, body=payload, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()
             data = json.loads(raw) if raw else {}
@@ -135,12 +137,39 @@ class ApiClient:
                     token = part[len("abm_session="):]
                     break
             if not token:
-                raise ApiError("login succeeded but no session cookie was returned")
+                raise ApiError(f"{path} succeeded but no session cookie was returned")
             self._token = token
             self._save_session(token)
             return data
         finally:
             conn.close()
+
+    def login(self, username, password):
+        """Raises ApiError on bad credentials. On success, persists the
+        session cookie so future ApiClient instances (a later tray/GUI
+        launch) start already logged in."""
+        return self._request_with_cookie("/api/login", {"username": username, "password": password})
+
+    def setup(self, username, password):
+        """First-run only -- raises ApiError (409) if a login is already
+        configured, or on the server's own validation failure (e.g. password
+        too short). On success, logs the new admin in immediately, same as
+        login()."""
+        return self._request_with_cookie("/api/setup", {"username": username, "password": password})
+
+    def setup_skip(self):
+        """Dismisses the setup wizard without creating a login -- the
+        'run open on localhost' choice. No session cookie returned (no
+        login happened), so this goes through the normal post() path."""
+        return self.post("/api/setup/skip")
+
+    def java_setup(self):
+        """First-run wizard's Java-check step. Blocking -- can run a real
+        winget install server-side -- so the caller must run this off its
+        own UI thread (see gui_win.py's run_async). Returns
+        {"ok", "java_found"}; "ok" is False only if an install was
+        attempted and failed (see platform_win.ensure_java())."""
+        return self.post("/api/java_setup", timeout=300)
 
     def logout(self):
         self._clear_session()
@@ -149,6 +178,24 @@ class ApiClient:
 
     def list_instances(self):
         return self.get("/api/instances").get("instances", [])
+
+    def add_instance(self, name, directory, launch_cmd):
+        """Raises ApiError on bad input (empty name/dir, invalid name chars,
+        duplicate name) -- see manager.py's add_instance() for the exact
+        validation, reused as-is server-side rather than duplicated here."""
+        return self.post("/api/instances/add", {"name": name, "dir": directory, "launch_cmd": launch_cmd})
+
+    def deploy(self, name, directory, source):
+        """Starts a background install of the real official ZenithProxy/
+        AquariusProxy launcher (downloads the actual release, extracts it,
+        registers the instance) -- see manager.py's deploy_proxy(). Returns
+        immediately; poll deploy_job() for progress. Only one deploy can run
+        at a time server-side -- raises ApiError if one's already running."""
+        return self.post("/api/deploy", {"name": name, "dir": directory, "source": source})
+
+    def deploy_job(self):
+        """{"name","status":"idle|running|done|error","started","finished","output"}"""
+        return self.get("/api/deploy/job")
 
     def start(self, name):
         return self.post(f"/api/instances/{urllib.parse.quote(name)}/start")

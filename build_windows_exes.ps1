@@ -1,8 +1,13 @@
 <#
-Builds all three native Windows .exe deliverables with PyInstaller:
+Builds the two native Windows .exe deliverables with PyInstaller:
   - AquariusManager.exe       (manager.py -- CLI/service, console app)
   - AquariusControlPanel.exe  (gui_win.py -- the native control panel)
-  - AquariusTray.exe          (tray_win.py -- the tray icon)
+
+(tray_win.py/AquariusTray.exe was dropped -- it was the one component that
+got Defender-quarantined as a false positive, "nice to have" per the user,
+not worth the AV friction. tray_win.py itself still exists in the repo for
+anyone who wants to run it unpackaged from source; it's just not part of
+the installed/distributed product anymore.)
 
 Three real issues this script works around, found and confirmed while
 building these by hand (see each section's comment for how each was
@@ -72,18 +77,17 @@ $python = Resolve-RealPython
 Write-Host "Using Python: $python"
 
 # ---------------------------------------------------------------------------
-# 1. Tray icon -- simplest build, no Qt, no known DLL issues.
-# ---------------------------------------------------------------------------
-Write-Host "`n=== Building AquariusTray.exe ==="
-& $python -m PyInstaller --onefile --windowed --name AquariusTray --distpath $DistPath -y tray_win.py
-
-# ---------------------------------------------------------------------------
-# 2. Control panel -- onedir (see issue #1 above for why), then strip the
+# 1. Control panel -- onedir (see issue #1 above for why), then strip the
 #    stale top-level VCRUNTIME140 copies so the loader resolves the correct
-#    PySide6-local ones.
+#    PySide6-local ones. --version-file embeds real PE metadata
+#    (company/product/version) -- an unsigned PyInstaller exe with NO
+#    identifying metadata is exactly the shape antivirus ML heuristics key
+#    on; this was the #1 fix in a near-identical real false-positive case
+#    (see version_controlpanel.txt's own comment for the citation).
 # ---------------------------------------------------------------------------
 Write-Host "`n=== Building AquariusControlPanel.exe ==="
-& $python -m PyInstaller --onedir --windowed --name AquariusControlPanel --distpath $DistPath -y gui_win.py
+& $python -m PyInstaller --onedir --windowed --name AquariusControlPanel --distpath $DistPath `
+    --version-file version_controlpanel.txt -y gui_win.py
 
 $internalDir = Join-Path $DistPath "AquariusControlPanel\_internal"
 foreach ($dll in @("VCRUNTIME140.dll", "VCRUNTIME140_1.dll")) {
@@ -95,11 +99,13 @@ foreach ($dll in @("VCRUNTIME140.dll", "VCRUNTIME140_1.dll")) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Manager -- onefile (fine here; no PySide6 involved), plus the bundled
+# 2. Manager -- onefile (fine here; no PySide6 involved), plus the bundled
 #    pyrt/ runtime so its own _helper subprocess launch works when frozen.
+#    --version-file, same reasoning as AquariusControlPanel.exe above.
 # ---------------------------------------------------------------------------
 Write-Host "`n=== Building AquariusManager.exe ==="
-& $python -m PyInstaller --onefile --console --name AquariusManager --distpath $DistPath -y manager.py
+& $python -m PyInstaller --onefile --console --name AquariusManager --distpath $DistPath `
+    --version-file version_manager.txt -y manager.py
 
 $pyrtDir = Join-Path $DistPath "pyrt"
 if (-not (Test-Path (Join-Path $pyrtDir "python.exe"))) {
@@ -129,7 +135,6 @@ if (-not (Test-Path (Join-Path $pyrtDir "python.exe"))) {
 Copy-Item (Join-Path $PSScriptRoot "platform_win.py") (Join-Path $pyrtDir "platform_win.py") -Force
 
 Write-Host "`n=== Build complete ==="
-Write-Host "AquariusTray.exe:          $(Join-Path $DistPath 'AquariusTray.exe')"
 Write-Host "AquariusControlPanel.exe:  $(Join-Path $DistPath 'AquariusControlPanel\AquariusControlPanel.exe')"
 Write-Host "AquariusManager.exe:       $(Join-Path $DistPath 'AquariusManager.exe')  (needs pyrt/ alongside it)"
 Write-Host "`nAlways pass --config <path to instances.json> when running AquariusManager.exe (see issue #3's comment above)."

@@ -41,7 +41,8 @@ python install_windows_deps.py          # psutil, PySide6 (two-step, see below),
 python gui_win.py                        # native control panel (standalone)
 python tray_win.py                       # tray icon (standalone)
 .\install_windows_service.ps1 -BootMode Always   # or WaitForLogin — registers the NSSM service
-.\build_windows_exes.ps1                 # builds AquariusManager/ControlPanel/Tray.exe via PyInstaller
+.\build_windows_exes.ps1                 # builds AquariusManager/ControlPanel.exe via PyInstaller
+.\installer.iss                          # Inno Setup script -> AquariusBotManagerSetup.exe (one-click installer)
 ```
 
 ## Architecture
@@ -99,11 +100,16 @@ racing each other into two independent helper processes for the same bot
 name — this was a real bug, not a defensive guess; don't remove it without
 rereading why it's there.
 
-`gui_win.py` (native PySide6 control panel) and `tray_win.py` (tray icon)
-are separate processes from the manager itself — they're pure HTTP clients
-of the manager's own local API (`client_win.py` is the shared client),
-using the manager's existing session-cookie login, never embedding or
-reusing the web dashboard's HTML. Every network call in `gui_win.py` runs
+`gui_win.py` (native PySide6 control panel) is a separate process from the
+manager itself — a pure HTTP client of the manager's own local API
+(`client_win.py` is the shared client), using the manager's existing
+session-cookie login, never embedding or reusing the web dashboard's HTML.
+`tray_win.py` (tray icon) uses the same client but is **not packaged into
+the installed product** — it got Defender-quarantined as a false positive
+(`Trojan:Win32/Bearfoos.A!ml`, see `docs/windows-exe-build.md` issue #4)
+and was dropped since it was "nice to have," not core; it still exists and
+runs fine from source for anyone who wants it. Every network call in
+`gui_win.py` runs
 off the Qt main thread via `run_async`/`_Worker` — `stop`/`restart` can
 legitimately block for the instance's full `stop_timeout` (up to ~30s), and
 an earlier version without this froze the whole window for that long.

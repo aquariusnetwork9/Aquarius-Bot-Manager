@@ -440,6 +440,31 @@ def live_session_count():
     return sum(1 for name in names if _is_alive(_read_pid_file(name)))
 
 
+def win_sweep(known_names):
+    """Stop every live helper+bot pair found on disk under .abm-state/, not
+    just the ones in the current instances.json (known_names). For full box
+    teardown or cleaning up after a deleted/renamed instance whose pid file
+    was never reached by a normal `stop` -- the one gap a config-driven
+    `stop all` can't cover, since it only ever walks cfg["instances"].
+    Reuses win_stop() exactly as every other caller does (same timeout
+    default, same force-kill-on-no-reply fallback) rather than a second kill
+    path. Returns a list of (name, result, known) tuples."""
+    d = _state_dir()
+    try:
+        names = [f[:-4] for f in os.listdir(d) if f.endswith(".pid")]
+    except OSError:
+        return []
+    results = []
+    for name in names:
+        pidinfo = _read_pid_file(name)
+        if not _is_alive(pidinfo):
+            _remove_pid_file(name)
+            continue
+        result = win_stop({"name": name})
+        results.append((name, result, name in known_names))
+    return results
+
+
 def win_pid_for(inst):
     """Live PID of the actual bot process (not the helper) for stats/monitoring,
     or None. Works regardless of which process started it."""
@@ -644,6 +669,69 @@ SYSTEM_COMMANDS_WIN = {
                "--accept-source-agreements", "--accept-package-agreements"],
     "reboot": ["shutdown", "/r", "/t", "5"],
 }
+
+# Package id for the JRE auto-installed by ensure_java() below when no `java`
+# is found on PATH. A JRE (not JDK) is deliberately enough -- bot instances
+# only ever run `java -jar ...`, never compile anything.
+JAVA_WINGET_ID = "EclipseAdoptium.Temurin.21.JRE"
+
+_java_checked = False
+
+
+def ensure_java():
+    """Called once at serve() startup, before boot()'s autostart pass runs
+    (which is the first thing that would actually try to exec `java -jar
+    ...` per-instance and fail quietly on a Java-less box). If `java` isn't
+    already on PATH, silently installs a JRE via winget and waits for it to
+    finish before returning, so boot()'s very first start() call has a
+    working `java` to find. Best-effort: a user with bots that need a
+    specific Java version already sets JAVA_HOME/env per-instance (see
+    instances.example.json) and this never overrides that -- it only fills
+    the gap where there's no java ANYWHERE yet. Returns True if java is
+    available on return (either already was, or install succeeded), False if
+    the install was attempted and failed (caller should surface this loudly,
+    not retry silently)."""
+    global _java_checked
+    if _java_checked:
+        return True
+    _java_checked = True
+    if shutil.which("java"):
+        return True
+    print(f"No Java found on PATH -- installing {JAVA_WINGET_ID} via winget "
+          "(one-time; bot instances need a JRE to run their jars)...")
+    try:
+        r = subprocess.run(
+            ["winget", "install", "--id", JAVA_WINGET_ID, "-e", "--silent",
+             "--accept-source-agreements", "--accept-package-agreements"],
+            capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"Java auto-install failed to run winget: {e}")
+        return False
+    if r.returncode != 0:
+        print(f"Java auto-install failed (winget exit {r.returncode}): "
+              f"{r.stderr.strip() or r.stdout.strip()}")
+        return False
+    # winget's own installer updates the machine PATH, but THIS process's
+    # already-loaded os.environ["PATH"] won't see it without a re-read -- the
+    # JRE installs to a stable, versioned location, so append it directly
+    # rather than spawning a new process just to inherit a fresh PATH.
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    adoptium_dir = os.path.join(program_files, "Eclipse Adoptium")
+    try:
+        candidates = [d for d in os.listdir(adoptium_dir)
+                      if d.lower().startswith("jdk-21")]
+    except OSError:
+        candidates = []
+    if candidates:
+        bin_dir = os.path.join(adoptium_dir, candidates[0], "bin")
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    if not shutil.which("java"):
+        print("Java install reported success but `java` still isn't "
+              "reachable -- a shell restart may be needed for PATH to take "
+              "effect.")
+        return False
+    print("Java installed successfully.")
+    return True
 
 
 # ---------------------------------------------------------------------------
